@@ -25,6 +25,8 @@ jobs:
           cache: true
       - name: Check installer syntax
         run: bash -n install.sh
+      - name: Test interactive installer
+        run: python3 scripts/test-installer.py
       - name: Run tests with race detector
         run: make test
 
@@ -84,8 +86,17 @@ jobs:
           tar --exclude='.git' --exclude='./dist' -czf dist/source-with-kernels.tar.gz .
           cd dist
           sha256sum xboard-node-linux-* xbctl-linux-* install.sh LICENSE THIRD_PARTY_NOTICES.md licenses.tar.gz source-with-kernels.tar.gz > SHA256SUMS.txt
+      - name: Select release notes
+        id: notes
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if [ -f "docs/releases/${VERSION}.md" ]; then
+            echo "path=docs/releases/${VERSION}.md" >> "$GITHUB_OUTPUT"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}

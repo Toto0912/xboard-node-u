@@ -27,7 +27,7 @@ DEFAULT_ACTION="install"
 DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
-RELEASE_REPOSITORY="${XBOARD_NODE_REPOSITORY:-}"
+RELEASE_REPOSITORY="${XBOARD_NODE_REPOSITORY:-Toto0912/xboard-node-u}"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -45,6 +45,8 @@ RUNTIME_GOGC=""
 BINARY_SOURCE=""
 CLI_BINARY_SOURCE=""
 FORCE_RECONFIGURE=0
+INTERACTIVE=0
+MODE_GIVEN=0
 PURGE=0
 YES=0
 ARCH=""
@@ -184,6 +186,7 @@ usage() {
     --machine-id      Machine ID
 
   OPTIONAL:
+    --interactive       Ask for mode, kernel, panel and credentials in the terminal
     --node-type, -T     Explicit node type for node mode
     --kernel, -k        singbox or xray (default: singbox)
     --version           Release version or latest (default: latest)
@@ -197,9 +200,10 @@ usage() {
     --yes, -y           Non-interactive confirmation for destructive operations
 
   ENVIRONMENT:
-    XBOARD_NODE_REPOSITORY  GitHub owner/repository for downloads (no upstream fallback)
+    XBOARD_NODE_REPOSITORY  Download repository (default: Toto0912/xboard-node-u)
 
   EXAMPLES:
+    sudo bash install.sh --interactive
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --node-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh upgrade
@@ -218,6 +222,7 @@ parse_args() {
                 ;;
             --mode)
                 MODE="$2"
+                MODE_GIVEN=1
                 shift 2
                 ;;
             --panel|-a|--api)
@@ -272,6 +277,10 @@ parse_args() {
                 FORCE_RECONFIGURE=1
                 shift
                 ;;
+            --interactive)
+                INTERACTIVE=1
+                shift
+                ;;
             --purge)
                 PURGE=1
                 shift
@@ -318,6 +327,79 @@ parse_args() {
             exit 1
             ;;
     esac
+}
+
+read_terminal() {
+    local target_name="$1" prompt_text="$2" default_value="${3:-}" hide_value="${4:-0}" answer_value
+    if [ "$hide_value" -eq 1 ]; then
+        IFS= read -r -s -p "$prompt_text" answer_value </dev/tty || return 1
+        printf '\n' >/dev/tty
+    else
+        IFS= read -r -p "$prompt_text" answer_value </dev/tty || return 1
+    fi
+    printf -v "$target_name" '%s' "${answer_value:-$default_value}"
+}
+
+configure_interactively() {
+    if ! { true </dev/tty; } 2>/dev/null; then
+        log_error "Interactive installation requires a terminal; use --panel, --token and --node-id/--machine-id for unattended installation"
+        return 1
+    fi
+
+    printf '\n=== xboard-node-u 安装向导 ===\n' >/dev/tty
+    local mode_choice kernel_choice target_id
+    if [ "$MODE_GIVEN" -eq 0 ] && [ -z "$MACHINE_ID" ] && [ -z "$NODE_ID" ]; then
+        while true; do
+            read_terminal mode_choice '部署模式：1) 机器模式  2) 单节点模式 [1]: ' '1'
+            case "$mode_choice" in
+                1|machine) MODE=machine; break ;;
+                2|node) MODE=node; break ;;
+                *) printf '请输入 1 或 2。\n' >/dev/tty ;;
+            esac
+        done
+    fi
+
+    local kernel_default=1
+    [ "$KERNEL_TYPE" != xray ] || kernel_default=2
+    while true; do
+        read_terminal kernel_choice "选择内核：1) sing-box  2) Xray [${kernel_default}]: " "$kernel_default"
+        case "$kernel_choice" in
+            1|singbox) KERNEL_TYPE=singbox; break ;;
+            2|xray) KERNEL_TYPE=xray; break ;;
+            *) printf '请输入 1 或 2。\n' >/dev/tty ;;
+        esac
+    done
+
+    while [ -z "$PANEL_URL" ]; do
+        read_terminal PANEL_URL '面板地址（https://panel.example.com）: '
+        if ! [[ "$PANEL_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+            printf '请输入以 http:// 或 https:// 开头的面板地址。\n' >/dev/tty
+            PANEL_URL=''
+        fi
+    done
+
+    if [ "$MODE" = machine ]; then
+        target_id="$MACHINE_ID"
+    else
+        target_id="$NODE_ID"
+    fi
+    while ! [[ "$target_id" =~ ^[1-9][0-9]*$ ]]; do
+        if [ "$MODE" = machine ]; then
+            read_terminal target_id '机器 ID: '
+        else
+            read_terminal target_id '节点 ID: '
+        fi
+    done
+    if [ "$MODE" = machine ]; then MACHINE_ID="$target_id"; else NODE_ID="$target_id"; fi
+
+    while [ -z "$TOKEN" ]; do
+        if [ "$MODE" = machine ]; then
+            read_terminal TOKEN '机器令牌（输入不显示）: ' '' 1
+        else
+            read_terminal TOKEN '面板通信密钥（输入不显示）: ' '' 1
+        fi
+    done
+    printf '\n配置已填写，开始下载安装并创建 systemd 服务。\n\n' >/dev/tty
 }
 
 check_root() {
@@ -838,6 +920,9 @@ main() {
     detect_arch
     detect_os
     ensure_systemd
+    if [ "$ACTION" = install ] && [ "$INTERACTIVE" -eq 1 ]; then
+        configure_interactively
+    fi
     install_dependencies
 
     case "$ACTION" in
@@ -858,4 +943,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" = "$0" ]]; then
+    main "$@"
+fi

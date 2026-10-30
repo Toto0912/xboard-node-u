@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.27-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -18,7 +18,10 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -ldflags "-s -w \
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w \
     -X main.version=${VERSION} \
     -X main.commit=${COMMIT} \
     -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

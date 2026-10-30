@@ -24,7 +24,11 @@ Linux amd64/arm64 的 xboard-node 和 xbctl 均编译成功，GitHub 工作流�
 首次上传后的 Linux race 检查发现 sing-vmess/VMess、sing-quic/TUIC 的用户表并发访问，
 以及 Xray Hysteria 会话关闭状态的竞争。现通过固定提交的传输依赖补丁和 Xray 补丁修复，
 修复后本地全项目回归通过；Linux 并发复验和构建以 GitHub Actions 对应提交的结果为准。
+提交 f330f5c 已在 GitHub 通过完整 Linux race 测试以及 amd64/arm64 构建。
 这次上传补充修复尚未更新到此前的测试 VPS，公网访问确认对应前一部署版本。
+
+v1.0.0 安装流程增加了本机 Ubuntu 的伪终端测试，验证脚本 stdin 来自管道时仍能通过
+/dev/tty 输入机器/节点配置、选择内核、隐藏密钥并重试无效输入，测试不执行真实安装。
 
 ## 边界
 

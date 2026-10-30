@@ -18,11 +18,11 @@ git push -u origin main
 
 ## 创建版本
 
-建议首次使用预发布标签，例如：
+首个正式版为 v1.0.0。发布后续正式版时，例如：
 
 ```sh
-git tag v0.1.0-beta.1
-git push origin v0.1.0-beta.1
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
 `v*` 标签通过测试和构建后会创建 GitHub Release，包含：
@@ -33,7 +33,7 @@ git push origin v0.1.0-beta.1
 - source-with-kernels.tar.gz（节点、两套内核和已修补传输依赖的源码）
 - SHA256SUMS.txt（上述附件的 SHA256）
 
-含连字符的标签标记为预发布，不占用稳定版 latest。仅有预发布时，请给安装器和 xbctl 指定 `--version v0.1.0-beta.1`。
+含连字符的标签（如 v1.1.0-beta.1）标记为预发布，不占用稳定版 latest。安装预发布版时请显式指定 `--version`。
 发布后核对附件和 Actions 日志，再用于正式部署。
 
 标签也构建 ghcr.io/toto0912/xboard-node-u:标签 的 amd64/arm64 镜像；仓库名自动转小写。稳定标签额外更新 latest，预发布不更新 latest。
@@ -41,18 +41,18 @@ git push origin v0.1.0-beta.1
 
 ## 安装与更新的仓库选择
 
-安装器支持本地文件，也支持从显式指定的仓库下载：
+安装器默认从本仓库下载，提供一行命令启动的交互向导，见 [安装说明](INSTALL.md)。也可以指定参数：
 
 ```sh
-sudo env XBOARD_NODE_REPOSITORY=Toto0912/xboard-node-u bash install.sh \
+sudo bash install.sh \
   --mode machine --panel https://panel.example.com \
   --token 'YOUR_MACHINE_TOKEN' --machine-id 1 --kernel xray \
-  --version v0.1.0-beta.1
+  --version v1.0.0
 ```
 
-GitHub 工作流设置 REPOSITORY 为 github.repository，嵌入 xbctl 二进制。发布后的 `sudo xbctl upgrade --version v0.1.0-beta.1` 因此使用自己的仓库。
+GitHub 工作流设置 REPOSITORY 为 github.repository，嵌入 xbctl 二进制。发布后的 `sudo xbctl upgrade` 因此使用自己的仓库。
 可用 `sudo env XBOARD_NODE_REPOSITORY=Toto0912/xboard-node-u xbctl upgrade --version TAG` 覆盖地址。
-用安装器升级且需要联网下载时也必须设置该环境变量，不会从配置文件自动读取仓库。
+安装脚本默认使用 Toto0912/xboard-node-u；自己 fork 的脚本需用该环境变量覆盖下载仓库。
 
 未指定仓库的本地构建需要显式提供该环境变量；不会回落到原作者仓库。原项目模块路径与来源链接保留，不是发布地址。
 
