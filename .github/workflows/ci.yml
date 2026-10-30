@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check installer syntax
+        run: bash -n install.sh
+      - name: Run tests with race detector
+        run: make test
+
+  build:
+    name: Linux build
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "${{ matrix.arch }}" = amd64 ]; then
+            make build-linux
+          else
+            make build-linux-arm64
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            xboard-node-linux-${{ matrix.arch }}
+            xbctl-linux-${{ matrix.arch }}
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Package matching source and licenses
+        run: |
+          make prepare
+          cp install.sh LICENSE THIRD_PARTY_NOTICES.md dist/
+          tar -czf dist/licenses.tar.gz licenses
+          tar --exclude='.git' --exclude='./dist' -czf dist/source-with-kernels.tar.gz .
+          cd dist
+          sha256sum xboard-node-linux-* xbctl-linux-* install.sh LICENSE THIRD_PARTY_NOTICES.md licenses.tar.gz source-with-kernels.tar.gz > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          files: dist/*
+
+  docker:
+    name: Tagged Docker image
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select image tags
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}"
+          {
+            echo 'tags<<END_TAGS'
+            echo "${image}:${VERSION}"
+            if [[ "$VERSION" != *-* ]]; then
+              echo "${image}:latest"
+            fi
+            echo 'END_TAGS'
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.image.outputs.tags }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}

@@ -1,0 +1,19 @@
+# Local loopback example. Replace the example UUID before use.
+# Configure an appropriate listener and transport/TLS before exposing a service.
+kernel:
+  type: xray
+  config_dir: ./data/standalone
+standalone:
+  enabled: true
+  node:
+    protocol: vless
+    listen_ip: 127.0.0.1
+    server_port: 20446
+    network: tcp
+    tls: 0
+  users:
+    - id: 1
+      uuid: 00000000-0000-4000-8000-000000000001
+log:
+  level: info
+health_port: 0

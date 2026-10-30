@@ -1,0 +1,574 @@
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index cae9735..ceafa6f 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/features/bandwidth"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/outbound"
+ 	"github.com/xtls/xray-core/features/policy"
+@@ -93,21 +94,22 @@ func (r *cachedReader) Interrupt() {
+ 
+ // DefaultDispatcher is a default implementation of Dispatcher.
+ type DefaultDispatcher struct {
+-	ohm    outbound.Manager
+-	router routing.Router
+-	policy policy.Manager
+-	stats  stats.Manager
+-	fdns   dns.FakeDNSEngine
++	ohm       outbound.Manager
++	router    routing.Router
++	policy    policy.Manager
++	stats     stats.Manager
++	bandwidth bandwidth.Manager
++	fdns      dns.FakeDNSEngine
+ }
+ 
+ func init() {
+ 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+ 		d := new(DefaultDispatcher)
+-		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager, dc dns.Client) error {
++		if err := core.RequireFeatures(ctx, func(om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager, bm bandwidth.Manager, dc dns.Client) error {
+ 			core.OptionalFeatures(ctx, func(fdns dns.FakeDNSEngine) {
+ 				d.fdns = fdns
+ 			})
+-			return d.Init(config.(*Config), om, router, pm, sm)
++			return d.Init(config.(*Config), om, router, pm, sm, bm)
+ 		}); err != nil {
+ 			return nil, err
+ 		}
+@@ -116,11 +118,12 @@ func init() {
+ }
+ 
+ // Init initializes DefaultDispatcher.
+-func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager) error {
++func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router routing.Router, pm policy.Manager, sm stats.Manager, bm bandwidth.Manager) error {
+ 	d.ohm = om
+ 	d.router = router
+ 	d.policy = pm
+ 	d.stats = sm
++	d.bandwidth = bm
+ 	return nil
+ }
+ 
+@@ -169,6 +172,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 				}
+ 			}
+ 		}
++		inboundLink.Writer = applyBandwidthLimit(ctx, inboundLink.Writer, d.bandwidth, user)
+ 		if p.Stats.UserDownlink {
+ 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
+ 			if c, _ := d.stats.GetOrRegisterCounter(name); c != nil {
+@@ -178,6 +182,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 				}
+ 			}
+ 		}
++		outboundLink.Writer = applyBandwidthLimit(ctx, outboundLink.Writer, d.bandwidth, user)
+ 
+ 		if p.Stats.UserOnline {
+ 			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
+@@ -196,6 +201,10 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
+ 
+ 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+ 
++	var bandwidthManager bandwidth.Manager
++	if feat := core.MustFromContext(ctx).GetFeature(bandwidth.ManagerType()); feat != nil {
++		bandwidthManager, _ = feat.(bandwidth.Manager)
++	}
+ 	if user != nil && len(user.Email) > 0 {
+ 		p := policyManager.ForLevel(user.Level)
+ 		if p.Stats.UserUplink {
+@@ -213,6 +222,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
+ 				}
+ 			}
+ 		}
++		link.Writer = applyBandwidthLimit(ctx, link.Writer, bandwidthManager, user)
+ 		if p.Stats.UserOnline {
+ 			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
+ 		}
+@@ -263,6 +273,13 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
+ 	return false
+ }
+ 
++func applyBandwidthLimit(ctx context.Context, writer buf.Writer, limiter bandwidth.Manager, user *protocol.MemoryUser) buf.Writer {
++	if limiter == nil || user == nil || user.Email == "" {
++		return writer
++	}
++	return &RateLimitWriter{Writer: writer, Manager: limiter, User: user.Email, Context: ctx}
++}
++
+ // Dispatch implements routing.Dispatcher.
+ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
+ 	if !destination.IsValid() {
+diff --git a/app/dispatcher/ratelimit.go b/app/dispatcher/ratelimit.go
+new file mode 100644
+index 0000000..2d4a826
+--- /dev/null
++++ b/app/dispatcher/ratelimit.go
+@@ -0,0 +1,48 @@
++package dispatcher
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/features/bandwidth"
++	"golang.org/x/time/rate"
++)
++
++type RateLimitWriter struct {
++	Writer  buf.Writer
++	Limiter *rate.Limiter
++	Context context.Context
++	Manager bandwidth.Manager
++	User    string
++}
++
++func (w *RateLimitWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	limiter := w.Limiter
++	if w.Manager != nil {
++		limiter = w.Manager.GetUserLimiter(w.User)
++	}
++	if limiter != nil {
++		ctx := w.Context
++		if ctx == nil {
++			ctx = context.Background()
++		}
++		remaining := int(mb.Len())
++		for remaining > 0 {
++			n := min(remaining, limiter.Burst())
++			if n <= 0 {
++				buf.ReleaseMulti(mb)
++				return context.Canceled
++			}
++			if err := limiter.WaitN(ctx, n); err != nil {
++				buf.ReleaseMulti(mb)
++				return err
++			}
++			remaining -= n
++		}
++	}
++	return w.Writer.WriteMultiBuffer(mb)
++}
++
++func (w *RateLimitWriter) Close() error { return common.Close(w.Writer) }
++func (w *RateLimitWriter) Interrupt()   { common.Interrupt(w.Writer) }
+diff --git a/app/dispatcher/ratelimit_test.go b/app/dispatcher/ratelimit_test.go
+new file mode 100644
+index 0000000..781670e
+--- /dev/null
++++ b/app/dispatcher/ratelimit_test.go
+@@ -0,0 +1,108 @@
++package dispatcher
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/core"
++	bandwidthfeat "github.com/xtls/xray-core/features/bandwidth"
++	featurepolicy "github.com/xtls/xray-core/features/policy"
++	featurestats "github.com/xtls/xray-core/features/stats"
++	"github.com/xtls/xray-core/transport"
++	"golang.org/x/time/rate"
++)
++
++type stubWriter struct{ calls int }
++
++func TestRateLimitLargeBatchAndLiveUpdate(t *testing.T) {
++	bm := bandwidthfeat.New()
++	dest := &stubWriter{}
++	ctx, cancel := context.WithCancel(context.Background())
++	w := applyBandwidthLimit(ctx, dest, bm, &protocol.MemoryUser{Email: "live"})
++	buffer := func() buf.MultiBuffer { b := buf.New(); b.Extend(16); return buf.MultiBuffer{b} }
++	if err := w.WriteMultiBuffer(buffer()); err != nil {
++		t.Fatal(err)
++	}
++	bm.SetUserLimiter("live", rate.NewLimiter(100000, 4))
++	if err := w.WriteMultiBuffer(buffer()); err != nil {
++		t.Fatalf("batch exceeding burst: %v", err)
++	}
++	if dest.calls != 2 {
++		t.Fatal("writer not reached")
++	}
++	cancel()
++	bm.SetUserLimiter("live", rate.NewLimiter(1, 1))
++	if err := w.WriteMultiBuffer(buffer()); err == nil {
++		t.Fatal("existing writer ignored new limit")
++	}
++	bm.Reset()
++	if err := w.WriteMultiBuffer(buffer()); err != nil {
++		t.Fatal("removed limit remained active", err)
++	}
++
++}
++func (w *stubWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	w.calls++
++	buf.ReleaseMulti(mb)
++	return nil
++}
++func (w *stubWriter) Close() error { return nil }
++func (w *stubWriter) Interrupt()   {}
++
++type stubReader struct{}
++
++func (stubReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, nil }
++func (stubReader) Interrupt()                                {}
++
++func TestApplyBandwidthLimitWrapsWriterOnly(t *testing.T) {
++	bm := bandwidthfeat.New()
++	bm.SetUserLimit("user@example.com", 1024)
++	writer := &stubWriter{}
++	reader := stubReader{}
++	user := &protocol.MemoryUser{Email: "user@example.com"}
++	wrapped := applyBandwidthLimit(context.Background(), writer, bm, user)
++	if _, ok := wrapped.(*RateLimitWriter); !ok {
++		t.Fatal("expected writer to be wrapped by RateLimitWriter")
++	}
++	if _, ok := any(reader).(stubReader); !ok {
++		t.Fatal("reader type unexpectedly changed")
++	}
++}
++
++func TestWrapLinkUsesBandwidthFeature(t *testing.T) {
++	inst := new(core.Instance)
++	bm := bandwidthfeat.New()
++	bm.SetUserLimit("user@example.com", 1024)
++	if err := inst.AddFeature(bm); err != nil {
++		t.Fatalf("AddFeature(bandwidth) error = %v", err)
++	}
++	ctx := context.WithValue(context.Background(), core.XrayKey(1), inst)
++	ctx = session.ContextWithInbound(ctx, &session.Inbound{User: &protocol.MemoryUser{Email: "user@example.com"}, Source: net.TCPDestination(net.IPAddress([]byte{127, 0, 0, 1}), 1234)})
++	link := &transport.Link{Reader: &buf.TimeoutWrapperReader{Reader: stubReader{}}, Writer: &stubWriter{}}
++	_ = WrapLink(ctx, featurepolicy.DefaultManager{}, featurestats.NoopManager{}, link)
++	if _, ok := link.Writer.(*RateLimitWriter); !ok {
++		t.Fatal("expected WrapLink to wrap writer with bandwidth limiter")
++	}
++	if _, ok := link.Reader.(*buf.TimeoutWrapperReader); !ok {
++		t.Fatal("expected reader wrapper to remain TimeoutWrapperReader")
++	}
++}
++
++func TestRateLimitWriterRespectsCanceledContext(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	w := &RateLimitWriter{
++		Writer:  &stubWriter{},
++		Limiter: rate.NewLimiter(1, 1),
++		Context: ctx,
++	}
++	b := buf.New()
++	b.Extend(2)
++	if err := w.WriteMultiBuffer(buf.MultiBuffer{b}); err == nil {
++		t.Fatal("expected canceled context to abort wait")
++	}
++}
+diff --git a/common/buf/io.go b/common/buf/io.go
+index 6b35052..d54a628 100644
+--- a/common/buf/io.go
++++ b/common/buf/io.go
+@@ -5,6 +5,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"os"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -34,9 +35,22 @@ type TimeoutWrapperReader struct {
+ 	mb   MultiBuffer
+ 	err  error
+ 	done chan struct{}
++
++	mu         sync.Mutex
++	forcedErr  error
++	hasForced  bool
+ }
+ 
+ func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
++	r.mu.Lock()
++	if r.hasForced {
++		err := r.forcedErr
++		r.hasForced = false
++		r.forcedErr = nil
++		r.mu.Unlock()
++		return nil, err
++	}
++	r.mu.Unlock()
+ 	if r.done != nil {
+ 		<-r.done
+ 		r.done = nil
+@@ -52,7 +66,34 @@ func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
+ 	return r.mb, r.err
+ }
+ 
++func (r *TimeoutWrapperReader) ReturnAnError(err error) {
++	r.mu.Lock()
++	r.forcedErr = err
++	r.hasForced = true
++	r.mu.Unlock()
++}
++
++func (r *TimeoutWrapperReader) Recover() (err error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.hasForced {
++		err = r.forcedErr
++		r.hasForced = false
++		r.forcedErr = nil
++	}
++	return
++}
++
+ func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
++	r.mu.Lock()
++	if r.hasForced {
++		err := r.forcedErr
++		r.hasForced = false
++		r.forcedErr = nil
++		r.mu.Unlock()
++		return nil, err
++	}
++	r.mu.Unlock()
+ 	if r.done == nil {
+ 		r.done = make(chan struct{})
+ 		go func() {
+diff --git a/common/mux/session.go b/common/mux/session.go
+index 53bc535..5157de5 100644
+--- a/common/mux/session.go
++++ b/common/mux/session.go
+@@ -186,11 +186,20 @@ func (s *Session) Close(locked bool) error {
+ 		common.Close(s.output)
+ 	} else {
+ 		// Stop existing handle(), then trigger writer.Close().
+-		// Note that s.output may be dispatcher.SizeStatWriter.
+-		s.input.(*pipe.Reader).ReturnAnError(io.EOF)
+-		runtime.Gosched()
+-		// If the error set by ReturnAnError still exists, clear it.
+-		s.input.(*pipe.Reader).Recover()
++		// Note that s.output may be dispatcher.SizeStatWriter or the input may be
++		// a timeout/stat wrapper over the original pipe reader.
++		switch input := s.input.(type) {
++		case *pipe.Reader:
++			input.ReturnAnError(io.EOF)
++			runtime.Gosched()
++			input.Recover()
++		case interface{ ReturnAnError(error); Recover() error }:
++			input.ReturnAnError(io.EOF)
++			runtime.Gosched()
++			input.Recover()
++		default:
++			common.Interrupt(s.input)
++		}
+ 		XUDPManager.Lock()
+ 		if s.XUDP.Status == Active {
+ 			s.XUDP.Expire = time.Now().Add(time.Minute)
+diff --git a/common/mux/session_internal_test.go b/common/mux/session_internal_test.go
+new file mode 100644
+index 0000000..b485168
+--- /dev/null
++++ b/common/mux/session_internal_test.go
+@@ -0,0 +1,23 @@
++package mux
++
++import (
++	"io"
++	"testing"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/transport/pipe"
++)
++
++func TestSessionCloseXUDPWithTimeoutWrapperReader(t *testing.T) {
++	r, _ := pipe.New(pipe.WithoutSizeLimit())
++	wrapped := &buf.TimeoutWrapperReader{Reader: r}
++	m := NewSessionManager()
++	s := &Session{ID: 1, parent: m, input: wrapped, XUDP: &XUDP{Status: Active}}
++	m.Add(s)
++	if err := s.Close(false); err != nil {
++		t.Fatalf("Close() error = %v", err)
++	}
++	if err := wrapped.Recover(); err != nil && err != io.EOF {
++		t.Fatalf("Recover() error = %v, want EOF or nil", err)
++	}
++}
+diff --git a/common/type.go b/common/type.go
+index d3de166..eecb0f3 100644
+--- a/common/type.go
++++ b/common/type.go
+@@ -23,6 +23,17 @@ func RegisterConfig(config interface{}, configCreator ConfigCreator) error {
+ }
+ 
+ // CreateObject creates an object by its config. The config type must be registered through RegisterConfig().
++// ReplaceConfigCreator decorates a factory during package initialization only.
++func ReplaceConfigCreator(config interface{}, creator ConfigCreator) (ConfigCreator, error) {
++	key := reflect.TypeOf(config)
++	previous, found := typeCreatorRegistry[key]
++	if !found || creator == nil {
++		return nil, errors.New("cannot replace config creator")
++	}
++	typeCreatorRegistry[key] = creator
++	return previous, nil
++}
++
+ func CreateObject(ctx context.Context, config interface{}) (interface{}, error) {
+ 	configType := reflect.TypeOf(config)
+ 	creator, found := typeCreatorRegistry[configType]
+diff --git a/core/xray.go b/core/xray.go
+index 794ce8f..d82659b 100644
+--- a/core/xray.go
++++ b/core/xray.go
+@@ -17,6 +17,7 @@ import (
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/routing"
+ 	"github.com/xtls/xray-core/features/stats"
++	"github.com/xtls/xray-core/features/bandwidth"
+ 	"github.com/xtls/xray-core/transport/internet"
+ )
+ 
+@@ -219,6 +220,7 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+ 		{policy.ManagerType(), policy.DefaultManager{}},
+ 		{routing.RouterType(), routing.DefaultRouter{}},
+ 		{stats.ManagerType(), stats.NoopManager{}},
++		{bandwidth.ManagerType(), bandwidth.New()},
+ 	}
+ 
+ 	for _, f := range essentialFeatures {
+diff --git a/features/bandwidth/bandwidth.go b/features/bandwidth/bandwidth.go
+new file mode 100644
+index 0000000..b4e737a
+--- /dev/null
++++ b/features/bandwidth/bandwidth.go
+@@ -0,0 +1,70 @@
++package bandwidth
++
++import (
++	"sync"
++
++	"github.com/xtls/xray-core/features"
++	"golang.org/x/time/rate"
++)
++
++type Manager interface {
++	features.Feature
++	SetUserLimit(email string, bytesPerSec int64)
++	SetUserLimiter(email string, limiter *rate.Limiter)
++	GetUserLimiter(email string) *rate.Limiter
++	Reset()
++}
++
++func ManagerType() interface{} {
++	return (*Manager)(nil)
++}
++
++type Instance struct {
++	mu       sync.RWMutex
++	limiters map[string]*rate.Limiter
++}
++
++func New() *Instance {
++	return &Instance{limiters: make(map[string]*rate.Limiter)}
++}
++
++func (*Instance) Type() interface{} { return ManagerType() }
++func (*Instance) Start() error      { return nil }
++func (*Instance) Close() error      { return nil }
++
++func (m *Instance) SetUserLimit(email string, bytesPerSec int64) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if bytesPerSec <= 0 {
++		delete(m.limiters, email)
++		return
++	}
++	if lim, ok := m.limiters[email]; ok {
++		lim.SetLimit(rate.Limit(bytesPerSec))
++		lim.SetBurst(int(bytesPerSec))
++		return
++	}
++	m.limiters[email] = rate.NewLimiter(rate.Limit(bytesPerSec), int(bytesPerSec))
++}
++
++func (m *Instance) SetUserLimiter(email string, limiter *rate.Limiter) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if limiter == nil {
++		delete(m.limiters, email)
++		return
++	}
++	m.limiters[email] = limiter
++}
++
++func (m *Instance) GetUserLimiter(email string) *rate.Limiter {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++	return m.limiters[email]
++}
++
++func (m *Instance) Reset() {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.limiters = make(map[string]*rate.Limiter)
++}
+diff --git a/features/bandwidth/bandwidth_test.go b/features/bandwidth/bandwidth_test.go
+new file mode 100644
+index 0000000..a5ecf30
+--- /dev/null
++++ b/features/bandwidth/bandwidth_test.go
+@@ -0,0 +1,36 @@
++package bandwidth
++
++import (
++	"testing"
++
++	"golang.org/x/time/rate"
++)
++
++func TestInstanceSetGetReset(t *testing.T) {
++	m := New()
++	if got := m.GetUserLimiter("user@example.com"); got != nil {
++		t.Fatal("expected nil limiter before set")
++	}
++	m.SetUserLimit("user@example.com", 1024)
++	if got := m.GetUserLimiter("user@example.com"); got == nil {
++		t.Fatal("expected limiter after set")
++	}
++	m.SetUserLimit("user@example.com", 0)
++	if got := m.GetUserLimiter("user@example.com"); got != nil {
++		t.Fatal("expected limiter removal on zero speed")
++	}
++	m.SetUserLimit("user@example.com", 2048)
++	m.Reset()
++	if got := m.GetUserLimiter("user@example.com"); got != nil {
++		t.Fatal("expected reset to clear limiters")
++	}
++}
++
++func TestInstanceSetUserLimiter(t *testing.T) {
++	m := New()
++	lim := rate.NewLimiter(123, 123)
++	m.SetUserLimiter("user@example.com", lim)
++	if got := m.GetUserLimiter("user@example.com"); got != lim {
++		t.Fatal("expected shared limiter to be preserved")
++	}
++}
+diff --git a/go.mod b/go.mod
+index edd3020..7c26c34 100644
+--- a/go.mod
++++ b/go.mod
+@@ -29,6 +29,7 @@ require (
+ 	golang.org/x/net v0.61.0
+ 	golang.org/x/sync v0.24.0
+ 	golang.org/x/sys v0.49.0
++	golang.org/x/time v0.14.0
+ 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
+ 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
+ 	golang.zx2c4.com/wireguard/windows v1.1.1

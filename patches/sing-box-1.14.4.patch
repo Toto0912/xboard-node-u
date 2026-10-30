@@ -1,0 +1,1533 @@
+diff --git a/adapter/inbound.go b/adapter/inbound.go
+index 3027f1eb..06f6f6cb 100644
+--- a/adapter/inbound.go
++++ b/adapter/inbound.go
+@@ -22,6 +22,16 @@ type Inbound interface {
+ 	Tag() string
+ }
+ 
++type UpdatableInbound[T any] interface {
++	Inbound
++	UpdateUsers(users []T) error
++}
++
++type UpdatableShadowsocksInbound interface {
++	Inbound
++	UpdateUsersByOptions(users []option.ShadowsocksUser) error
++}
++
+ type TCPInjectableInbound interface {
+ 	Inbound
+ 	ConnectionHandler
+diff --git a/constant/proxy.go b/constant/proxy.go
+index d42e5d92..a013a372 100644
+--- a/constant/proxy.go
++++ b/constant/proxy.go
+@@ -1,5 +1,7 @@
+ package constant
+ 
++const TypeMieru = "mieru"
++
+ const (
+ 	TypeTun                = "tun"
+ 	TypeRedirect           = "redirect"
+@@ -100,6 +102,8 @@ func ProxyDisplayName(proxyType string) string {
+ 		return "TUIC"
+ 	case TypeHysteria2:
+ 		return "Hysteria2"
++	case TypeMieru:
++		return "Mieru"
+ 	case TypeAnyTLS:
+ 		return "AnyTLS"
+ 	case TypeOpenConnect:
+diff --git a/constant/version.go b/constant/version.go
+index 5a816a73..29a7fcca 100644
+--- a/constant/version.go
++++ b/constant/version.go
+@@ -1,3 +1,3 @@
+ package constant
+ 
+-var Version = "unknown"
++var Version = "1.14.4-xboard.1"
+diff --git a/go.mod b/go.mod
+index 8d74d59a..721d3fda 100644
+--- a/go.mod
++++ b/go.mod
+@@ -102,6 +102,7 @@ require (
+ 	github.com/dgryski/go-camellia v0.0.0-20191119043421-69a8a13fb23d // indirect
+ 	github.com/dgryski/go-metro v0.0.0-20180109044635-280f6062b5bc // indirect
+ 	github.com/ebitengine/purego v0.10.0 // indirect
++	github.com/enfein/mieru/v3 v3.29.0
+ 	github.com/florianl/go-nfqueue/v2 v2.1.0 // indirect
+ 	github.com/fsnotify/fsnotify v1.9.0 // indirect
+ 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
+diff --git a/include/registry.go b/include/registry.go
+index 9bb9220c..4d6172a7 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/direct"
+ 	"github.com/sagernet/sing-box/protocol/group"
+ 	"github.com/sagernet/sing-box/protocol/http"
++	"github.com/sagernet/sing-box/protocol/mieru"
+ 	"github.com/sagernet/sing-box/protocol/mixed"
+ 	"github.com/sagernet/sing-box/protocol/naive"
+ 	"github.com/sagernet/sing-box/protocol/redirect"
+@@ -69,6 +70,7 @@ func InboundRegistry() *inbound.Registry {
+ 	shadowtls.RegisterInbound(registry)
+ 	vless.RegisterInbound(registry)
+ 	anytls.RegisterInbound(registry)
++	mieru.RegisterInbound(registry)
+ 
+ 	registerQUICInbounds(registry)
+ 	registerCloudflaredInbound(registry)
+@@ -100,6 +102,7 @@ func OutboundRegistry() *outbound.Registry {
+ 	shadowtls.RegisterOutbound(registry)
+ 	vless.RegisterOutbound(registry)
+ 	anytls.RegisterOutbound(registry)
++	mieru.RegisterOutbound(registry)
+ 
+ 	registerQUICOutbounds(registry)
+ 	registerStubForRemovedOutbounds(registry)
+diff --git a/option/mieru.go b/option/mieru.go
+new file mode 100644
+index 00000000..a9ca4d11
+--- /dev/null
++++ b/option/mieru.go
+@@ -0,0 +1,26 @@
++package option
++
++import "github.com/sagernet/sing/common/json/badoption"
++
++type MieruOutboundOptions struct {
++	DialerOptions
++	ServerOptions
++	ServerPortRanges badoption.Listable[string] `json:"server_ports,omitempty"`
++	Transport        string                     `json:"transport,omitempty"`
++	UserName         string                     `json:"username,omitempty"`
++	Password         string                     `json:"password,omitempty"`
++	Multiplexing     string                     `json:"multiplexing,omitempty"`
++	TrafficPattern   string                     `json:"traffic_pattern,omitempty"`
++}
++
++type MieruInboundOptions struct {
++	ListenOptions
++	Users          []MieruUser `json:"users,omitempty"`
++	Transport      string      `json:"transport,omitempty"`
++	TrafficPattern string      `json:"traffic_pattern,omitempty"`
++}
++
++type MieruUser struct {
++	Name     string `json:"name,omitempty"`
++	Password string `json:"password,omitempty"`
++}
+diff --git a/protocol/anytls/user.go b/protocol/anytls/user.go
+new file mode 100644
+index 00000000..67d10e8b
+--- /dev/null
++++ b/protocol/anytls/user.go
+@@ -0,0 +1,14 @@
++package anytls
++
++import (
++	anytls "github.com/anytls/sing-anytls"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *Inbound) UpdateUsers(users []option.AnyTLSUser) error {
++	h.service.UpdateUsers(common.Map(users, func(it option.AnyTLSUser) anytls.User {
++		return (anytls.User)(it)
++	}))
++	return nil
++}
+diff --git a/protocol/http/inbound.go b/protocol/http/inbound.go
+index 6e0c3ebd..861365a3 100644
+--- a/protocol/http/inbound.go
++++ b/protocol/http/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	std_bufio "bufio"
+ 	"context"
+ 	"net"
++	"sync/atomic"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -31,16 +32,15 @@ type Inbound struct {
+ 	router        adapter.ConnectionRouterEx
+ 	logger        log.ContextLogger
+ 	listener      *listener.Listener
+-	authenticator *auth.Authenticator
++	authenticator atomic.Pointer[auth.Authenticator]
+ 	tlsConfig     tls.ServerConfig
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPMixedInboundOptions) (adapter.Inbound, error) {
+ 	inbound := &Inbound{
+-		Adapter:       inbound.NewAdapter(C.TypeHTTP, tag),
+-		router:        uot.NewRouter(router, logger),
+-		logger:        logger,
+-		authenticator: auth.NewAuthenticator(options.Users),
++		Adapter: inbound.NewAdapter(C.TypeHTTP, tag),
++		router:  uot.NewRouter(router, logger),
++		logger:  logger,
+ 	}
+ 	if options.TLS != nil {
+ 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
+@@ -63,6 +63,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		SetSystemProxy:    options.SetSystemProxy,
+ 		SystemProxySOCKS:  false,
+ 	})
++	inbound.authenticator.Store(auth.NewAuthenticator(options.Users))
+ 	return inbound, nil
+ }
+ 
+@@ -95,7 +96,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 		}
+ 		conn = tlsConn
+ 	}
+-	err := http.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
++	err := http.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator.Load(), adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+diff --git a/protocol/http/user.go b/protocol/http/user.go
+new file mode 100644
+index 00000000..ece5afd0
+--- /dev/null
++++ b/protocol/http/user.go
+@@ -0,0 +1,14 @@
++package http
++
++import (
++	"github.com/sagernet/sing/common/auth"
++)
++
++func (h *Inbound) UpdateUsers(users []auth.User) error {
++	next := auth.NewAuthenticator(users)
++	if next == nil {
++		next = &auth.Authenticator{}
++	}
++	h.authenticator.Store(next)
++	return nil
++}
+diff --git a/protocol/hysteria2/inbound.go b/protocol/hysteria2/inbound.go
+index 8fd73329..3c1982cc 100644
+--- a/protocol/hysteria2/inbound.go
++++ b/protocol/hysteria2/inbound.go
+@@ -41,7 +41,7 @@ type Inbound struct {
+ 	logger       log.ContextLogger
+ 	listener     *listener.Listener
+ 	tlsConfig    tls.ServerConfig
+-	service      *hysteria2.Service[int]
++	service      *hysteria2.Service[string]
+ 	userNameList []string
+ }
+ 
+@@ -180,7 +180,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 			}
+ 		}
+ 	}
+-	hysteriaService, err := hysteria2.NewService[int](hysteria2.ServiceOptions{
++	hysteriaService, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
+ 		Context:            ctx,
+ 		Logger:             logger,
+ 		BrutalDebug:        options.BrutalDebug,
+@@ -210,11 +210,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	userList := make([]int, 0, len(options.Users))
++	userList := make([]string, 0, len(options.Users))
+ 	userNameList := make([]string, 0, len(options.Users))
+ 	userPasswordList := make([]string, 0, len(options.Users))
+-	for index, user := range options.Users {
+-		userList = append(userList, index)
++	for _, user := range options.Users {
++		userList = append(userList, user.Name)
+ 		userNameList = append(userNameList, user.Name)
+ 		userPasswordList = append(userPasswordList, user.Password)
+ 	}
+@@ -236,8 +236,8 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userID, _ := auth.UserFromContext[string](ctx)
++	if userName := userID; userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+ 	} else {
+@@ -258,8 +258,8 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userID, _ := auth.UserFromContext[string](ctx)
++	if userName := userID; userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
+ 	} else {
+diff --git a/protocol/hysteria2/user.go b/protocol/hysteria2/user.go
+new file mode 100644
+index 00000000..f4d7d2ba
+--- /dev/null
++++ b/protocol/hysteria2/user.go
+@@ -0,0 +1,19 @@
++package hysteria2
++
++import (
++	"github.com/sagernet/sing-box/option"
++)
++
++func (h *Inbound) UpdateUsers(users []option.Hysteria2User) error {
++	userList := make([]string, 0, len(users))
++	userNameList := make([]string, 0, len(users))
++	userPasswordList := make([]string, 0, len(users))
++	for _, user := range users {
++		userList = append(userList, user.Name)
++		userNameList = append(userNameList, user.Name)
++		userPasswordList = append(userPasswordList, user.Password)
++	}
++	h.service.UpdateUsers(userList, userPasswordList)
++	h.userNameList = userNameList
++	return nil
++}
+diff --git a/protocol/mieru/inbound.go b/protocol/mieru/inbound.go
+new file mode 100644
+index 00000000..594a87db
+--- /dev/null
++++ b/protocol/mieru/inbound.go
+@@ -0,0 +1,334 @@
++package mieru
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"sync"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/common/listener"
++	"github.com/sagernet/sing-box/common/uot"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	"github.com/sagernet/sing/common/buf"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mierucommon "github.com/enfein/mieru/v3/apis/common"
++	mieruconstant "github.com/enfein/mieru/v3/apis/constant"
++	mierumodel "github.com/enfein/mieru/v3/apis/model"
++	mieruserver "github.com/enfein/mieru/v3/apis/server"
++	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
++	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
++	"google.golang.org/protobuf/proto"
++)
++
++func RegisterInbound(registry *inbound.Registry) {
++	inbound.Register[option.MieruInboundOptions](registry, C.TypeMieru, NewInbound)
++}
++
++type Inbound struct {
++	inbound.Adapter
++	ctx       context.Context
++	router    adapter.ConnectionRouterEx
++	logger    log.ContextLogger
++	listener  *listener.Listener
++	server    mieruserver.Server
++	userNames []string
++
++	mu sync.Mutex
++}
++
++func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MieruInboundOptions) (adapter.Inbound, error) {
++	config, userNames, err := buildMieruServerConfig(ctx, options)
++	if err != nil {
++		return nil, fmt.Errorf("failed to build mieru server config: %w", err)
++	}
++
++	s := mieruserver.NewServer()
++	if err := s.Store(config); err != nil {
++		return nil, fmt.Errorf("failed to store mieru server config: %w", err)
++	}
++
++	inboundInstance := &Inbound{
++		Adapter:   inbound.NewAdapter(C.TypeMieru, tag),
++		ctx:       ctx,
++		router:    uot.NewRouter(router, logger),
++		logger:    logger,
++		server:    s,
++		userNames: userNames,
++	}
++	inboundInstance.listener = listener.New(listener.Options{
++		Context: ctx,
++		Logger:  logger,
++		Network: []string{N.NetworkTCP, N.NetworkUDP},
++		Listen:  options.ListenOptions,
++	})
++
++	return inboundInstance, nil
++}
++
++func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	if stage != adapter.StartStateStart {
++		return nil
++	}
++
++	h.mu.Lock()
++	defer h.mu.Unlock()
++
++	if err := h.server.Start(); err != nil {
++		return fmt.Errorf("failed to start mieru server: %w", err)
++	}
++
++	h.logger.Info("mieru server is started")
++	scope.Add(h.Close)
++	go h.acceptLoop()
++	return nil
++}
++
++func (h *Inbound) Close() error {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++
++	if h.server.IsRunning() {
++		return h.server.Stop()
++	}
++	return nil
++}
++
++func (h *Inbound) acceptLoop() {
++	for {
++		conn, request, err := h.server.Accept()
++		if err != nil {
++			if !h.server.IsRunning() {
++				return
++			}
++			h.logger.Debug("failed to accept mieru connection: ", err)
++			continue
++		}
++		go h.handleConnection(conn, request)
++	}
++}
++
++func (h *Inbound) handleConnection(conn net.Conn, request *mierumodel.Request) {
++	ctx := log.ContextWithNewID(h.ctx)
++
++	// Send fake SOCKS5 response back to proxy client.
++	resp := &mierumodel.Response{
++		Reply: mieruconstant.Socks5ReplySuccess,
++		BindAddr: mierumodel.AddrSpec{
++			IP:   net.IPv4zero,
++			Port: 0,
++		},
++	}
++	if err := resp.WriteToSocks5(conn); err != nil {
++		conn.Close()
++		h.logger.DebugContext(ctx, "failed to write mieru response: ", err)
++		return
++	}
++
++	// Build metadata.
++	var metadata adapter.InboundContext
++	metadata.Inbound = h.Tag()
++	metadata.InboundType = h.Type()
++	//nolint:staticcheck
++	metadata.InboundDetour = h.listener.ListenOptions().Detour
++	metadata.UDPDisableDomainUnmapping = h.listener.ListenOptions().UDPDisableDomainUnmapping
++
++	// Parse source address.
++	if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
++		metadata.Source = M.SocksaddrFromNet(remoteAddr)
++	}
++
++	// Parse destination from request.
++	if request.DstAddr.FQDN != "" {
++		metadata.Destination = M.Socksaddr{
++			Fqdn: request.DstAddr.FQDN,
++			Port: uint16(request.DstAddr.Port),
++		}
++	} else if request.DstAddr.IP != nil {
++		addr, _ := netip.AddrFromSlice(request.DstAddr.IP)
++		metadata.Destination = M.Socksaddr{
++			Addr: addr.Unmap(),
++			Port: uint16(request.DstAddr.Port),
++		}
++	}
++
++	// Get username from connection.
++	if userCtx, ok := conn.(mierucommon.UserContext); ok {
++		metadata.User = userCtx.UserName()
++	}
++
++	// Handle request.
++	switch request.Command {
++	case mieruconstant.Socks5ConnectCmd:
++		h.logger.InfoContext(ctx, "inbound TCP connection from ", metadata.Source, " to ", metadata.Destination)
++		if metadata.User != "" {
++			h.logger.InfoContext(ctx, "[", metadata.User, "] inbound TCP connection")
++		}
++		h.router.RouteConnectionEx(ctx, conn, metadata, nil)
++	case mieruconstant.Socks5UDPAssociateCmd:
++		h.logger.InfoContext(ctx, "inbound UDP connection from ", metadata.Source, " to ", metadata.Destination)
++		if metadata.User != "" {
++			h.logger.InfoContext(ctx, "[", metadata.User, "] inbound UDP connection")
++		}
++		h.handleUDP(ctx, conn, metadata)
++	default:
++		conn.Close()
++		h.logger.WarnContext(ctx, "unsupported mieru command: ", request.Command)
++	}
++}
++
++func (h *Inbound) handleUDP(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) {
++	pc := mierucommon.NewPacketOverStreamTunnel(conn)
++	packetConn := &mieruPacketConn{
++		PacketConn:  pc,
++		destination: metadata.Destination,
++	}
++	h.router.RoutePacketConnectionEx(ctx, packetConn, metadata, nil)
++}
++
++// mieruPacketConn wraps mieru's PacketConn to implement N.PacketConn
++type mieruPacketConn struct {
++	net.PacketConn
++	destination M.Socksaddr
++}
++
++var _ N.PacketConn = (*mieruPacketConn)(nil)
++
++// ReadPacket parses the SOCKS5 UDP header and returns the destination address.
++func (c *mieruPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
++	n, _, err := c.PacketConn.ReadFrom(buffer.FreeBytes())
++	if err != nil {
++		return M.Socksaddr{}, err
++	}
++	buffer.Truncate(n)
++	if buffer.Len() < 3 {
++		return M.Socksaddr{}, io.ErrShortBuffer
++	}
++
++	// Skip RSV (2 bytes) and FRAG (1 byte).
++	buffer.Advance(3)
++
++	var addr mierumodel.AddrSpec
++	if err := addr.ReadFromSocks5(buffer); err != nil {
++		return M.Socksaddr{}, err
++	}
++	if addr.FQDN != "" {
++		destination = M.Socksaddr{
++			Fqdn: addr.FQDN,
++			Port: uint16(addr.Port),
++		}
++	} else if addr.IP != nil {
++		netAddr, _ := netip.AddrFromSlice(addr.IP)
++		destination = M.Socksaddr{
++			Addr: netAddr.Unmap(),
++			Port: uint16(addr.Port),
++		}
++	}
++	return destination, nil
++}
++
++// WritePacket writes the SOCKS5 UDP header and the payload.
++func (c *mieruPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
++	header := buf.NewSize(3 + M.MaxSocksaddrLength)
++	defer header.Release()
++
++	// RSV (2 bytes) + FRAG (1 byte)
++	common.Must(header.WriteZeroN(3))
++
++	var addr mierumodel.AddrSpec
++	if destination.IsFqdn() {
++		addr.FQDN = destination.Fqdn
++	} else {
++		addr.IP = destination.Addr.AsSlice()
++	}
++	addr.Port = int(destination.Port)
++	if err := addr.WriteToSocks5(header); err != nil {
++		return err
++	}
++
++	packet := buf.NewSize(header.Len() + buffer.Len())
++	defer packet.Release()
++	common.Must1(packet.Write(header.Bytes()))
++	common.Must1(packet.Write(buffer.Bytes()))
++	_, err := c.PacketConn.WriteTo(packet.Bytes(), nil)
++	return err
++}
++
++func buildMieruServerConfig(_ context.Context, options option.MieruInboundOptions) (*mieruserver.ServerConfig, []string, error) {
++	if err := validateMieruInboundOptions(options); err != nil {
++		return nil, nil, fmt.Errorf("failed to validate mieru options: %w", err)
++	}
++
++	var transportProtocol *mierupb.TransportProtocol
++	switch options.Transport {
++	case "TCP":
++		transportProtocol = mierupb.TransportProtocol_TCP.Enum()
++	case "UDP":
++		transportProtocol = mierupb.TransportProtocol_UDP.Enum()
++	}
++
++	if options.ListenOptions.ListenPort == 0 {
++		return nil, nil, E.New("listen_port must be set")
++	}
++	portBindings := []*mierupb.PortBinding{
++		{
++			Port:     proto.Int32(int32(options.ListenOptions.ListenPort)),
++			Protocol: transportProtocol,
++		},
++	}
++
++	var users []*mierupb.User
++	var userNames []string
++	for _, user := range options.Users {
++		users = append(users, &mierupb.User{
++			Name:     proto.String(user.Name),
++			Password: proto.String(user.Password),
++		})
++		userNames = append(userNames, user.Name)
++	}
++	var trafficPattern *mierupb.TrafficPattern
++	trafficPattern, _ = mierutp.Decode(options.TrafficPattern)
++	return &mieruserver.ServerConfig{
++		Config: &mierupb.ServerConfig{
++			PortBindings:   portBindings,
++			Users:          users,
++			TrafficPattern: trafficPattern,
++		},
++	}, userNames, nil
++}
++
++func validateMieruInboundOptions(options option.MieruInboundOptions) error {
++	if options.Transport != "TCP" && options.Transport != "UDP" {
++		return E.New("transport must be TCP or UDP")
++	}
++	if len(options.Users) == 0 {
++		return E.New("users is empty")
++	}
++	for _, user := range options.Users {
++		if user.Name == "" {
++			return E.New("username is empty")
++		}
++		if user.Password == "" {
++			return E.New("password is empty")
++		}
++	}
++	if options.TrafficPattern != "" {
++		trafficPattern, err := mierutp.Decode(options.TrafficPattern)
++		if err != nil {
++			return fmt.Errorf("failed to decode traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++		if err := mierutp.Validate(trafficPattern); err != nil {
++			return fmt.Errorf("invalid traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++	}
++	return nil
++}
+diff --git a/protocol/mieru/outbound.go b/protocol/mieru/outbound.go
+new file mode 100644
+index 00000000..f58b4c48
+--- /dev/null
++++ b/protocol/mieru/outbound.go
+@@ -0,0 +1,284 @@
++package mieru
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"os"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/dialer"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	mieruclient "github.com/enfein/mieru/v3/apis/client"
++	mierucommon "github.com/enfein/mieru/v3/apis/common"
++	mierumodel "github.com/enfein/mieru/v3/apis/model"
++	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
++	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
++	"google.golang.org/protobuf/proto"
++)
++
++type Outbound struct {
++	outbound.Adapter
++	dialer N.Dialer
++	logger log.ContextLogger
++	client mieruclient.Client
++}
++
++func RegisterOutbound(registry *outbound.Registry) {
++	outbound.Register(registry, C.TypeMieru, NewOutbound)
++}
++
++func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MieruOutboundOptions) (adapter.Outbound, error) {
++	outboundDialer, err := dialer.New(ctx, options.DialerOptions, M.IsDomainName(options.Server))
++	if err != nil {
++		return nil, err
++	}
++
++	config, err := buildMieruClientConfig(options, mieruDialer{dialer: outboundDialer})
++	if err != nil {
++		return nil, fmt.Errorf("failed to build mieru client config: %w", err)
++	}
++	c := mieruclient.NewClient()
++	if err := c.Store(config); err != nil {
++		return nil, fmt.Errorf("failed to store mieru client config: %w", err)
++	}
++	if err := c.Start(); err != nil {
++		return nil, fmt.Errorf("failed to start mieru client: %w", err)
++	}
++	logger.InfoContext(ctx, "mieru client is started")
++
++	return &Outbound{
++		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeMieru, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
++		dialer:  outboundDialer,
++		logger:  logger,
++		client:  c,
++	}, nil
++}
++
++func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	ctx, metadata := adapter.ExtendContext(ctx)
++	metadata.Outbound = o.Tag()
++	metadata.Destination = destination
++	switch N.NetworkName(network) {
++	case N.NetworkTCP:
++		o.logger.InfoContext(ctx, "outbound connection to ", destination)
++		d, err := socksAddrToNetAddrSpec(destination, "tcp")
++		if err != nil {
++			return nil, E.Cause(err, "failed to convert destination address")
++		}
++		return o.client.DialContext(ctx, d)
++	case N.NetworkUDP:
++		o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
++		d, err := socksAddrToNetAddrSpec(destination, "udp")
++		if err != nil {
++			return nil, E.Cause(err, "failed to convert destination address")
++		}
++		streamConn, err := o.client.DialContext(ctx, d)
++		if err != nil {
++			return nil, err
++		}
++		return &streamer{
++			PacketConn: mierucommon.NewUDPAssociateWrapper(mierucommon.NewPacketOverStreamTunnel(streamConn)),
++			Remote:     destination,
++		}, nil
++	default:
++		return nil, os.ErrInvalid
++	}
++}
++
++func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	ctx, metadata := adapter.ExtendContext(ctx)
++	metadata.Outbound = o.Tag()
++	metadata.Destination = destination
++	o.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
++	d, err := socksAddrToNetAddrSpec(destination, "udp")
++	if err != nil {
++		return nil, E.Cause(err, "failed to convert destination address")
++	}
++	streamConn, err := o.client.DialContext(ctx, d)
++	if err != nil {
++		return nil, err
++	}
++	return mierucommon.NewUDPAssociateWrapper(mierucommon.NewPacketOverStreamTunnel(streamConn)), nil
++}
++
++func (o *Outbound) Close() error {
++	return common.Close(o.client)
++}
++
++func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	if stage == adapter.StartStateStart {
++		scope.Add(o.Close)
++	}
++	return nil
++}
++
++// mieruDialer is an adapter to mieru dialer interface.
++type mieruDialer struct {
++	dialer N.Dialer
++}
++
++func (md mieruDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	addr := M.ParseSocksaddr(address)
++	return md.dialer.DialContext(ctx, network, addr)
++}
++
++func (md mieruDialer) ListenPacket(ctx context.Context, network, laddr, raddr string) (net.PacketConn, error) {
++	addr := M.ParseSocksaddr(raddr)
++	return md.dialer.ListenPacket(ctx, addr)
++}
++
++var (
++	_ mierucommon.Dialer       = (*mieruDialer)(nil)
++	_ mierucommon.PacketDialer = (*mieruDialer)(nil)
++)
++
++// streamer converts a net.PacketConn to a net.Conn.
++type streamer struct {
++	net.PacketConn
++	Remote net.Addr
++}
++
++var _ net.Conn = (*streamer)(nil)
++
++func (s *streamer) Read(b []byte) (n int, err error) {
++	n, _, err = s.PacketConn.ReadFrom(b)
++	return
++}
++
++func (s *streamer) Write(b []byte) (n int, err error) {
++	return s.WriteTo(b, s.Remote)
++}
++
++func (s *streamer) RemoteAddr() net.Addr {
++	return s.Remote
++}
++
++// socksAddrToNetAddrSpec converts a Socksaddr object to NetAddrSpec, and overrides the network.
++func socksAddrToNetAddrSpec(sa M.Socksaddr, network string) (mierumodel.NetAddrSpec, error) {
++	var nas mierumodel.NetAddrSpec
++	if err := nas.From(sa); err != nil {
++		return nas, err
++	}
++	nas.Net = network
++	return nas, nil
++}
++
++func buildMieruClientConfig(options option.MieruOutboundOptions, dialer mieruDialer) (*mieruclient.ClientConfig, error) {
++	if err := validateMieruOptions(options); err != nil {
++		return nil, fmt.Errorf("failed to validate mieru options: %w", err)
++	}
++
++	var transportProtocol *mierupb.TransportProtocol
++	switch options.Transport {
++	case "TCP":
++		transportProtocol = mierupb.TransportProtocol_TCP.Enum()
++	case "UDP":
++		transportProtocol = mierupb.TransportProtocol_UDP.Enum()
++	}
++	server := &mierupb.ServerEndpoint{}
++	if options.ServerPort != 0 {
++		server.PortBindings = append(server.PortBindings, &mierupb.PortBinding{
++			Port:     proto.Int32(int32(options.ServerPort)),
++			Protocol: transportProtocol,
++		})
++	}
++	for _, pr := range options.ServerPortRanges {
++		server.PortBindings = append(server.PortBindings, &mierupb.PortBinding{
++			PortRange: proto.String(pr),
++			Protocol:  transportProtocol,
++		})
++	}
++	if M.IsDomainName(options.Server) {
++		server.DomainName = proto.String(options.Server)
++	} else {
++		server.IpAddress = proto.String(options.Server)
++	}
++	config := &mieruclient.ClientConfig{
++		Profile: &mierupb.ClientProfile{
++			ProfileName: proto.String("sing-box"),
++			User: &mierupb.User{
++				Name:     proto.String(options.UserName),
++				Password: proto.String(options.Password),
++			},
++			Servers: []*mierupb.ServerEndpoint{server},
++		},
++		Dialer:       dialer,
++		PacketDialer: dialer,
++		DNSConfig: &mierucommon.ClientDNSConfig{
++			BypassDialerDNS: true,
++		},
++	}
++	if multiplexing, ok := mierupb.MultiplexingLevel_value[options.Multiplexing]; ok {
++		config.Profile.Multiplexing = &mierupb.MultiplexingConfig{
++			Level: mierupb.MultiplexingLevel(multiplexing).Enum(),
++		}
++	}
++	if options.TrafficPattern != "" {
++		trafficPattern, _ := mierutp.Decode(options.TrafficPattern)
++		config.Profile.TrafficPattern = trafficPattern
++	}
++	return config, nil
++}
++
++func validateMieruOptions(options option.MieruOutboundOptions) error {
++	if options.Server == "" {
++		return fmt.Errorf("server is empty")
++	}
++	if options.ServerPort == 0 && len(options.ServerPortRanges) == 0 {
++		return fmt.Errorf("either server_port or server_ports must be set")
++	}
++	for _, pr := range options.ServerPortRanges {
++		begin, end, err := beginAndEndPortFromPortRange(pr)
++		if err != nil {
++			return fmt.Errorf("invalid server_ports format")
++		}
++		if begin < 1 || begin > 65535 {
++			return fmt.Errorf("begin port must be between 1 and 65535")
++		}
++		if end < 1 || end > 65535 {
++			return fmt.Errorf("end port must be between 1 and 65535")
++		}
++		if begin > end {
++			return fmt.Errorf("begin port must be less than or equal to end port")
++		}
++	}
++	if options.Transport != "TCP" && options.Transport != "UDP" {
++		return fmt.Errorf("transport must be TCP or UDP")
++	}
++	if options.UserName == "" {
++		return fmt.Errorf("username is empty")
++	}
++	if options.Password == "" {
++		return fmt.Errorf("password is empty")
++	}
++	if options.Multiplexing != "" {
++		if _, ok := mierupb.MultiplexingLevel_value[options.Multiplexing]; !ok {
++			return fmt.Errorf("invalid multiplexing level: %s", options.Multiplexing)
++		}
++	}
++	if options.TrafficPattern != "" {
++		trafficPattern, err := mierutp.Decode(options.TrafficPattern)
++		if err != nil {
++			return fmt.Errorf("failed to decode traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++		if err := mierutp.Validate(trafficPattern); err != nil {
++			return fmt.Errorf("invalid traffic pattern %q: %w", options.TrafficPattern, err)
++		}
++	}
++	return nil
++}
++
++func beginAndEndPortFromPortRange(portRange string) (int, int, error) {
++	var begin, end int
++	_, err := fmt.Sscanf(portRange, "%d-%d", &begin, &end)
++	return begin, end, err
++}
+diff --git a/protocol/naive/inbound.go b/protocol/naive/inbound.go
+index d19cc642..4e105ac8 100644
+--- a/protocol/naive/inbound.go
++++ b/protocol/naive/inbound.go
+@@ -6,6 +6,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"sync/atomic"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -49,7 +50,7 @@ type Inbound struct {
+ 	listener         *listener.Listener
+ 	network          []string
+ 	networkIsDefault bool
+-	authenticator    *auth.Authenticator
++	authenticator    atomic.Pointer[auth.Authenticator]
+ 	tlsConfig        tls.ServerConfig
+ 	httpServer       *http.Server
+ }
+@@ -68,7 +69,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		}),
+ 		networkIsDefault: options.Network == "",
+ 		network:          options.Network.Build(),
+-		authenticator:    auth.NewAuthenticator(options.Users),
+ 	}
+ 	if common.Contains(inbound.network, N.NetworkUDP) {
+ 		if options.TLS == nil || !options.TLS.Enabled {
+@@ -85,6 +85,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		}
+ 		inbound.tlsConfig = tlsConfig
+ 	}
++	inbound.authenticator.Store(auth.NewAuthenticator(options.Users))
+ 	return inbound, nil
+ }
+ 
+@@ -157,7 +158,7 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+ 	}
+ 	userName, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
+ 	if authOk {
+-		authOk = n.authenticator.Verify(userName, password)
++		authOk = n.authenticator.Load().Verify(userName, password)
+ 	}
+ 	if !authOk {
+ 		rejectHTTP(writer, http.StatusProxyAuthRequired)
+diff --git a/protocol/naive/user.go b/protocol/naive/user.go
+new file mode 100644
+index 00000000..8a4b83e2
+--- /dev/null
++++ b/protocol/naive/user.go
+@@ -0,0 +1,14 @@
++package naive
++
++import (
++	"github.com/sagernet/sing/common/auth"
++)
++
++func (n *Inbound) UpdateUsers(users []auth.User) error {
++	next := auth.NewAuthenticator(users)
++	if next == nil {
++		next = &auth.Authenticator{}
++	}
++	n.authenticator.Store(next)
++	return nil
++}
+diff --git a/protocol/shadowsocks/inbound_multi.go b/protocol/shadowsocks/inbound_multi.go
+index 8742e417..cf09aa64 100644
+--- a/protocol/shadowsocks/inbound_multi.go
++++ b/protocol/shadowsocks/inbound_multi.go
+@@ -40,7 +40,7 @@ type MultiInbound struct {
+ 	router      adapter.ConnectionRouterEx
+ 	logger      logger.ContextLogger
+ 	listener    *listener.Listener
+-	service     shadowsocks.MultiService[int]
++	service     shadowsocks.MultiService[string]
+ 	usersAccess sync.RWMutex
+ 	users       []option.ShadowsocksUser
+ 	tracker     adapter.SSMTracker
+@@ -64,9 +64,9 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
+ 	} else {
+ 		udpTimeout = C.UDPTimeout
+ 	}
+-	var service shadowsocks.MultiService[int]
++	var service shadowsocks.MultiService[string]
+ 	if common.Contains(shadowaead_2022.List, options.Method) {
+-		service, err = shadowaead_2022.NewMultiServiceWithPassword[int](
++		service, err = shadowaead_2022.NewMultiServiceWithPassword[string](
+ 			options.Method,
+ 			options.Password,
+ 			int64(udpTimeout.Seconds()),
+@@ -74,7 +74,7 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
+ 			ntp.TimeFuncFromContext(ctx),
+ 		)
+ 	} else if common.Contains(shadowaead.List, options.Method) {
+-		service, err = shadowaead.NewMultiService[int](
++		service, err = shadowaead.NewMultiService[string](
+ 			options.Method,
+ 			int64(udpTimeout.Seconds()),
+ 			adapter.NewLegacyUpstreamHandler(adapter.InboundContext{}, inbound.newConnection, inbound.newPacketConnection, inbound),
+@@ -86,8 +86,11 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
+ 		return nil, err
+ 	}
+ 	if len(options.Users) > 0 {
+-		err = service.UpdateUsersWithPasswords(common.MapIndexed(options.Users, func(index int, user option.ShadowsocksUser) int {
+-			return index
++		err = service.UpdateUsersWithPasswords(common.MapIndexed(options.Users, func(index int, user option.ShadowsocksUser) string {
++			if user.Name != "" {
++				return user.Name
++			}
++			return F.ToString(index)
+ 		}), common.Map(options.Users, func(user option.ShadowsocksUser) string {
+ 			return user.Password
+ 		}))
+@@ -128,9 +131,7 @@ func (h *MultiInbound) SetTracker(tracker adapter.SSMTracker) {
+ func (h *MultiInbound) UpdateUsers(users []string, uPSKs []string) error {
+ 	h.usersAccess.Lock()
+ 	defer h.usersAccess.Unlock()
+-	err := h.service.UpdateUsersWithPasswords(common.MapIndexed(users, func(index int, user string) int {
+-		return index
+-	}), uPSKs)
++	err := h.service.UpdateUsersWithPasswords(users, uPSKs)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -173,11 +174,11 @@ func (h *MultiInbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
+ }
+ 
+ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		return os.ErrInvalid
+ 	}
+-	user := h.userName(userIndex)
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -196,11 +197,11 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
+ }
+ 
+ func (h *MultiInbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		return os.ErrInvalid
+ 	}
+-	user := h.userName(userIndex)
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/shadowsocks/user.go b/protocol/shadowsocks/user.go
+new file mode 100644
+index 00000000..1e132e73
+--- /dev/null
++++ b/protocol/shadowsocks/user.go
+@@ -0,0 +1,10 @@
++package shadowsocks
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++)
++
++func (h *MultiInbound) UpdateUsersByOptions(users []option.ShadowsocksUser) error {
++	return h.UpdateUsers(common.Map(users, func(u option.ShadowsocksUser) string { return u.Name }), common.Map(users, func(u option.ShadowsocksUser) string { return u.Password }))
++}
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+index b37fa9c9..1190ceb1 100644
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	std_bufio "bufio"
+ 	"context"
+ 	"net"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -32,7 +33,7 @@ type Inbound struct {
+ 	router        adapter.ConnectionRouterEx
+ 	logger        logger.ContextLogger
+ 	listener      *listener.Listener
+-	authenticator *auth.Authenticator
++	authenticator atomic.Pointer[auth.Authenticator]
+ 	udpTimeout    time.Duration
+ }
+ 
+@@ -44,11 +45,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		udpTimeout = C.UDPTimeout
+ 	}
+ 	inbound := &Inbound{
+-		Adapter:       inbound.NewAdapter(C.TypeSOCKS, tag),
+-		router:        uot.NewRouter(router, logger),
+-		logger:        logger,
+-		authenticator: auth.NewAuthenticator(options.Users),
+-		udpTimeout:    udpTimeout,
++		Adapter:    inbound.NewAdapter(C.TypeSOCKS, tag),
++		router:     uot.NewRouter(router, logger),
++		logger:     logger,
++		udpTimeout: udpTimeout,
+ 	}
+ 	inbound.listener = listener.New(listener.Options{
+ 		Context:           ctx,
+@@ -57,6 +57,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		Listen:            options.ListenOptions,
+ 		ConnectionHandler: inbound,
+ 	})
++	inbound.authenticator.Store(auth.NewAuthenticator(options.Users))
+ 	return inbound, nil
+ }
+ 
+@@ -73,7 +74,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ }
+ 
+ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
++	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator.Load(), adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
+diff --git a/protocol/socks/user.go b/protocol/socks/user.go
+new file mode 100644
+index 00000000..d7fb4c13
+--- /dev/null
++++ b/protocol/socks/user.go
+@@ -0,0 +1,14 @@
++package socks
++
++import (
++	"github.com/sagernet/sing/common/auth"
++)
++
++func (h *Inbound) UpdateUsers(users []auth.User) error {
++	next := auth.NewAuthenticator(users)
++	if next == nil {
++		next = &auth.Authenticator{}
++	}
++	h.authenticator.Store(next)
++	return nil
++}
+diff --git a/protocol/trojan/inbound.go b/protocol/trojan/inbound.go
+index 525dc87e..870e4b94 100644
+--- a/protocol/trojan/inbound.go
++++ b/protocol/trojan/inbound.go
+@@ -34,7 +34,7 @@ type Inbound struct {
+ 	router                   adapter.ConnectionRouterEx
+ 	logger                   log.ContextLogger
+ 	listener                 *listener.Listener
+-	service                  *trojan.Service[int]
++	service                  *trojan.Service[string]
+ 	users                    []option.TrojanUser
+ 	tlsConfig                tls.ServerConfig
+ 	fallbackAddr             M.Socksaddr
+@@ -90,9 +90,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		}
+ 		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
+ 	}
+-	service := trojan.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
+-	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
+-		return index
++	service := trojan.NewService[string](adapter.NewUpstreamContextHandler(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
++	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) string {
++		if it.Name != "" {
++			return it.Name
++		}
++		return F.ToString(index)
+ 	}), common.Map(options.Users, func(it option.TrojanUser) string {
+ 		return it.Password
+ 	}))
+@@ -188,12 +191,12 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -206,12 +209,12 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
+ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/trojan/user.go b/protocol/trojan/user.go
+new file mode 100644
+index 00000000..6b7106e7
+--- /dev/null
++++ b/protocol/trojan/user.go
+@@ -0,0 +1,19 @@
++package trojan
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	F "github.com/sagernet/sing/common/format"
++)
++
++func (h *Inbound) UpdateUsers(users []option.TrojanUser) error {
++
++	return h.service.UpdateUsers(common.MapIndexed(users, func(index int, it option.TrojanUser) string {
++		if it.Name != "" {
++			return it.Name
++		}
++		return F.ToString(index)
++	}), common.Map(users, func(it option.TrojanUser) string {
++		return it.Password
++	}))
++}
+diff --git a/protocol/tuic/inbound.go b/protocol/tuic/inbound.go
+index eec5bcb9..7eb2ce56 100644
+--- a/protocol/tuic/inbound.go
++++ b/protocol/tuic/inbound.go
+@@ -34,7 +34,7 @@ type Inbound struct {
+ 	logger       log.ContextLogger
+ 	listener     *listener.Listener
+ 	tlsConfig    tls.ServerConfig
+-	server       *tuic.Service[int]
++	server       *tuic.Service[string]
+ 	userNameList []string
+ }
+ 
+@@ -63,7 +63,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	} else {
+ 		udpTimeout = C.UDPTimeout
+ 	}
+-	service, err := tuic.NewService[int](tuic.ServiceOptions{
++	service, err := tuic.NewService[string](tuic.ServiceOptions{
+ 		Context:   ctx,
+ 		Logger:    logger,
+ 		TLSConfig: tlsConfig,
+@@ -86,19 +86,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var userList []int
++	var userList []string
+ 	var userNameList []string
+ 	var userUUIDList [][16]byte
+ 	var userPasswordList []string
+-	for index, user := range options.Users {
++	for _, user := range options.Users {
+ 		if user.UUID == "" {
+-			return nil, E.New("missing uuid for user ", index)
++			return nil, E.New("missing uuid for user ", user.Name)
+ 		}
+ 		userUUID, err := uuid.FromString(user.UUID)
+ 		if err != nil {
+-			return nil, E.Cause(err, "invalid uuid for user ", index)
++			return nil, E.Cause(err, "invalid uuid for user ", user.Name)
+ 		}
+-		userList = append(userList, index)
++		userList = append(userList, user.Name)
+ 		userNameList = append(userNameList, user.Name)
+ 		userUUIDList = append(userUUIDList, userUUID)
+ 		userPasswordList = append(userPasswordList, user.Password)
+@@ -121,8 +121,8 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userID, _ := auth.UserFromContext[string](ctx)
++	if userName := userID; userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+ 	} else {
+@@ -143,8 +143,8 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userID, _ := auth.UserFromContext[string](ctx)
++	if userName := userID; userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
+ 	} else {
+diff --git a/protocol/tuic/user.go b/protocol/tuic/user.go
+new file mode 100644
+index 00000000..f2832696
+--- /dev/null
++++ b/protocol/tuic/user.go
+@@ -0,0 +1,30 @@
++package tuic
++
++import (
++	"github.com/gofrs/uuid/v5"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/exceptions"
++)
++
++func (h *Inbound) UpdateUsers(users []option.TUICUser) error {
++	var userList []string
++	var userNameList []string
++	var userUUIDList [][16]byte
++	var userPasswordList []string
++	for _, user := range users {
++		if user.UUID == "" {
++			return exceptions.New("missing uuid for user ", user.Name)
++		}
++		userUUID, err := uuid.FromString(user.UUID)
++		if err != nil {
++			return exceptions.Cause(err, "invalid uuid for user ", user.Name)
++		}
++		userList = append(userList, user.Name)
++		userNameList = append(userNameList, user.Name)
++		userUUIDList = append(userUUIDList, userUUID)
++		userPasswordList = append(userPasswordList, user.Password)
++	}
++	h.server.UpdateUsers(userList, userUUIDList, userPasswordList)
++	h.userNameList = userNameList
++	return nil
++}
+diff --git a/protocol/vless/inbound.go b/protocol/vless/inbound.go
+index 80bb10f6..c27399a1 100644
+--- a/protocol/vless/inbound.go
++++ b/protocol/vless/inbound.go
+@@ -40,7 +40,7 @@ type Inbound struct {
+ 	logger     logger.ContextLogger
+ 	listener   *listener.Listener
+ 	users      []option.VLESSUser
+-	service    *vless.Service[int]
++	service    *vless.Service[string]
+ 	tlsConfig  tls.ServerConfig
+ 	transport  adapter.V2RayServerTransport
+ 	references []string
+@@ -59,9 +59,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	service := vless.NewService[int](logger, adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx))
+-	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, _ option.VLESSUser) int {
+-		return index
++	service := vless.NewService[string](logger, adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx))
++	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, it option.VLESSUser) string {
++		if it.Name != "" {
++			return it.Name
++		}
++		return F.ToString(index)
+ 	}), common.Map(inbound.users, func(it option.VLESSUser) string {
+ 		return it.UUID
+ 	}), common.Map(inbound.users, func(it option.VLESSUser) string {
+@@ -170,12 +173,12 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -188,12 +191,12 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
+ func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/vless/user.go b/protocol/vless/user.go
+new file mode 100644
+index 00000000..6d24cf07
+--- /dev/null
++++ b/protocol/vless/user.go
+@@ -0,0 +1,22 @@
++package vless
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	F "github.com/sagernet/sing/common/format"
++)
++
++func (h *Inbound) UpdateUsers(users []option.VLESSUser) error {
++
++	h.service.UpdateUsers(common.MapIndexed(users, func(index int, it option.VLESSUser) string {
++		if it.Name != "" {
++			return it.Name
++		}
++		return F.ToString(index)
++	}), common.Map(users, func(it option.VLESSUser) string {
++		return it.UUID
++	}), common.Map(users, func(it option.VLESSUser) string {
++		return it.Flow
++	}))
++	return nil
++}
+diff --git a/protocol/vmess/inbound.go b/protocol/vmess/inbound.go
+index 0b4f51cc..6a574c56 100644
+--- a/protocol/vmess/inbound.go
++++ b/protocol/vmess/inbound.go
+@@ -40,7 +40,7 @@ type Inbound struct {
+ 	router    adapter.ConnectionRouterEx
+ 	logger    logger.ContextLogger
+ 	listener  *listener.Listener
+-	service   *vmess.Service[int]
++	service   *vmess.Service[string]
+ 	users     []option.VMessUser
+ 	tlsConfig tls.ServerConfig
+ 	transport adapter.V2RayServerTransport
+@@ -66,10 +66,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if options.Transport != nil && options.Transport.Type != "" {
+ 		serviceOptions = append(serviceOptions, vmess.ServiceWithDisableHeaderProtection())
+ 	}
+-	service := vmess.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
++	service := vmess.NewService[string](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
+ 	inbound.service = service
+-	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
+-		return index
++	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) string {
++		if it.Name != "" {
++			return it.Name
++		}
++		return F.ToString(index)
+ 	}), common.Map(options.Users, func(it option.VMessUser) string {
+ 		return it.UUID
+ 	}), common.Map(options.Users, func(it option.VMessUser) int {
+@@ -173,12 +176,12 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+@@ -191,12 +194,12 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
+ func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	userIndex, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
++	user := userIndex
+ 	if user == "" {
+ 		user = F.ToString(userIndex)
+ 	} else {
+diff --git a/protocol/vmess/user.go b/protocol/vmess/user.go
+new file mode 100644
+index 00000000..949853e9
+--- /dev/null
++++ b/protocol/vmess/user.go
+@@ -0,0 +1,21 @@
++package vmess
++
++import (
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common"
++	F "github.com/sagernet/sing/common/format"
++)
++
++func (h *Inbound) UpdateUsers(users []option.VMessUser) error {
++
++	return h.service.UpdateUsers(common.MapIndexed(users, func(index int, it option.VMessUser) string {
++		if it.Name != "" {
++			return it.Name
++		}
++		return F.ToString(index)
++	}), common.Map(users, func(it option.VMessUser) string {
++		return it.UUID
++	}), common.Map(users, func(it option.VMessUser) int {
++		return it.AlterId
++	}))
++}

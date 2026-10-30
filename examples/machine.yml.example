@@ -1,0 +1,12 @@
+# Use the token of this machine, rather than the panel server token.
+panel:
+  url: https://panel.example.com
+machine:
+  machine_id: 1
+  token_env: XBOARD_NODE_MACHINE_TOKEN
+kernel:
+  type: xray # Change to singbox for a sing-box machine.
+  config_dir: ./data/machine
+log:
+  level: info
+health_port: 0

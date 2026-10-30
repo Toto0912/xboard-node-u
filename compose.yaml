@@ -1,0 +1,12 @@
+services:
+  xboard-node:
+    build: .
+    image: xboard-node:local
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      XBOARD_NODE_TOKEN: ${XBOARD_NODE_TOKEN:-}
+      XBOARD_NODE_MACHINE_TOKEN: ${XBOARD_NODE_MACHINE_TOKEN:-}
+    volumes:
+      - ./config.yml:/etc/xboard-node/config.yml:ro
+      - ./data:/etc/xboard-node/data

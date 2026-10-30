@@ -1,0 +1,11 @@
+# Copy to config.yml; set XBOARD_NODE_TOKEN in the process environment.
+panel:
+  url: https://panel.example.com
+  token_env: XBOARD_NODE_TOKEN
+  node_id: 1
+kernel:
+  type: singbox # Change to xray to use Xray-core.
+  config_dir: ./data/node
+log:
+  level: info
+health_port: 0
