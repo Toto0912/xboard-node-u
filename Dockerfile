@@ -13,6 +13,7 @@ COPY scripts/ scripts/
 COPY patches/ patches/
 RUN go run ./scripts/prepare-singbox.go
 RUN go run ./scripts/prepare-xray
+RUN go run ./scripts/prepare-transports
 RUN go mod download
 
 COPY . .

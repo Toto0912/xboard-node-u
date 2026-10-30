@@ -295,4 +295,8 @@ require (
 
 replace github.com/sagernet/sing-box => ./third_party/sing-box
 
+replace github.com/sagernet/sing-vmess => ./third_party/sing-vmess
+
+replace github.com/sagernet/sing-quic => ./third_party/sing-quic
+
 replace github.com/xtls/xray-core => ./third_party/xray-core

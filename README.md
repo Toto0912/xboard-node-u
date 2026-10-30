@@ -11,6 +11,8 @@
 | sing-box | 1.14.4 | `patches/sing-box-1.14.4.patch` |
 | Xray-core | 26.10.29 | `patches/xray-core-26.10.29.patch` |
 
+另对同版本依赖 sing-vmess、sing-quic 应用认证表并发补丁，见 `patches/sing-vmess-user-snapshot.patch` 和 `patches/sing-quic-tuic-users.patch`；构建时自动准备，不需要手工修改模块缓存。
+
 运行 `xboard-node -v` 可查看节点程序和两套内核版本。内核嵌入程序，无需另外安装 sing-box 或 Xray 可执行文件。
 
 ## 功能与部署模式

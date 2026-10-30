@@ -5,6 +5,7 @@
 - Go 1.27+，Git；Make 为可选工具。
 - sing-box v1.14.4，提交 `c005f35300ce76427dc285481ec5695f5b179cd2`。
 - Xray v26.10.29，提交 `0afec66085a85191e9dd2a4a6646c7c9a94688d1`。
+- sing-vmess 与 sing-quic 固定为 go.mod 中现有版本对应的 `a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017`、`7e0a5869a5f49ed0a685143345dfda0448bbc708`，应用认证表并发补丁。
 - Go 模块依赖使用 `go.mod` 和 `go.sum`，内核使用本地 replace 与版本化补丁。
 
 Xray 的规范 Go 伪版本 `v1.260327.1-0.20261029083850-0afec66085a8` 对应上述 10 月提交，不是旧内核。
@@ -31,6 +32,7 @@ go test -tags 'with_quic with_utls with_wireguard with_clash_api' ./internal/...
 ```powershell
 go run ./scripts/prepare-singbox.go
 go run ./scripts/prepare-xray
+go run ./scripts/prepare-transports
 go test -tags 'with_quic with_utls with_wireguard with_clash_api' ./internal/... ./cmd/... ./scripts/...
 go build -tags 'with_quic with_utls with_wireguard with_clash_api' -o xboard-node.exe ./cmd/xboard-node
 go build -o xbctl.exe ./cmd/xbctl
@@ -55,7 +57,7 @@ GitHub 自动生成的 Source code.zip 不包含生成目录，需要先运行�
 从此完整归档构建时，跳过 prepare，直接运行上述 `go test` / `go build` 命令；依赖模块仍需网络或已有缓存。
 准备脚本仅接受可核验提交的 Git checkout，不会把缺少 .git 的归档目录当成可信 checkout。
 
-`third_party/` 是生成目录，不要手工改动后直接升级补丁；重新开发内核时须同时更新来源提交、补丁、go.mod 版本和回归测试。
+`third_party/` 是生成目录，包含两套内核及两项已修补的传输依赖。不要手工改动后直接升级补丁；重新开发内核时须同时更新来源提交、补丁、go.mod 版本和回归测试。
 
 ## Docker 与 CI
 

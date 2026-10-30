@@ -20,6 +20,7 @@ Requirements: Go 1.27 or later, Git, and network access to GitHub and Go modules
 ```sh
 go run ./scripts/prepare-singbox.go
 go run ./scripts/prepare-xray
+go run ./scripts/prepare-transports
 go test -tags 'with_quic with_utls with_wireguard with_clash_api' ./internal/... ./cmd/... ./scripts/...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags 'with_quic with_utls with_wireguard with_clash_api' -o xboard-node ./cmd/xboard-node
 ```
@@ -30,6 +31,12 @@ race detector (requires a C compiler). The generated `third_party/sing-box`
 checkout is ignored; the versioned patch and preparation program reproduce it.
 Preparation verifies the upstream commit and refuses to overwrite unexpected
 local changes. Do not remove the preparation step from CI or Docker builds.
+
+The initial Linux race-detector run found concurrent credential-table access
+in the pinned sing-vmess and sing-quic dependencies. Additional versioned
+patches capture an immutable VMess user generation and synchronize TUIC user
+and password lookup. `scripts/prepare-transports` prepares these dependencies;
+no shared Go module cache files are modified.
 
 ## Runtime behavior
 

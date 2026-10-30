@@ -9,6 +9,7 @@ BUILD_TAGS := with_quic with_utls with_wireguard with_clash_api
 prepare:
 	go run ./scripts/prepare-singbox.go
 	go run ./scripts/prepare-xray
+	go run ./scripts/prepare-transports
 
 .PHONY: build clean test docker install build-linux build-linux-arm64 build-all
 

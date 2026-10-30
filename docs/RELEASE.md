@@ -30,7 +30,7 @@ git push origin v0.1.0-beta.1
 - xboard-node-linux-amd64 / arm64
 - xbctl-linux-amd64 / arm64
 - install.sh、LICENSE、THIRD_PARTY_NOTICES.md、licenses.tar.gz
-- source-with-kernels.tar.gz（节点和两套已打补丁内核源码）
+- source-with-kernels.tar.gz（节点、两套内核和已修补传输依赖的源码）
 - SHA256SUMS.txt（上述附件的 SHA256）
 
 含连字符的标签标记为预发布，不占用稳定版 latest。仅有预发布时，请给安装器和 xbctl 指定 `--version v0.1.0-beta.1`。

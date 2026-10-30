@@ -21,6 +21,11 @@
 Linux amd64/arm64 的 xboard-node 和 xbctl 均编译成功，GitHub 工作流通过 actionlint 静态校验。
 对照已知测试凭据和服务器标识的本地扫描未发现泄漏。
 
+首次上传后的 Linux race 检查发现 sing-vmess/VMess、sing-quic/TUIC 的用户表并发访问，
+以及 Xray Hysteria 会话关闭状态的竞争。现通过固定提交的传输依赖补丁和 Xray 补丁修复，
+修复后本地全项目回归通过；Linux 并发复验和构建以 GitHub Actions 对应提交的结果为准。
+这次上传补充修复尚未更新到此前的测试 VPS，公网访问确认对应前一部署版本。
+
 ## 边界
 
 - REALITY/Vision、VLESS Encryption 新参数、部分少用协议、长时间负载与多机器规模尚未完整验证。

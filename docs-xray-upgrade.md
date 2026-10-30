@@ -20,6 +20,7 @@ Xray 来源固定为官方 v26.10.29 提交 `0afec66085a85191e9dd2a4a6646c7c9a94
 - VPS 联调补充：机器 WS 事件按各节点实际内核解析，避免混合内核 XHTTP 配置被按 sing-box 拒绝。
 - VPS 联调补充：Xray 同端口配置重载先释放旧监听，启动失败尝试回滚，保留累计流量；配置重载可中断现有连接。
 - VPS 联调补充：Hysteria2 协议设置明确生成 version=2，并支持 Hysteria 用户账户热更新。
+- GitHub Linux 并发检查补充：Hysteria 会话管理器在锁内检查关闭状态，单会话关闭标记改用原子访问。
 
 ## 本地验证
 
@@ -43,11 +44,12 @@ Xray 来源固定为官方 v26.10.29 提交 `0afec66085a85191e9dd2a4a6646c7c9a94
 ```sh
 go run ./scripts/prepare-singbox.go
 go run ./scripts/prepare-xray
+go run ./scripts/prepare-transports
 go test -tags 'with_quic with_utls with_wireguard with_clash_api' ./internal/... ./cmd/... ./scripts/...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags 'with_quic with_utls with_wireguard with_clash_api' -o xboard-node ./cmd/xboard-node
 ```
 
-`make build`、`make build-linux`、`make build-linux-arm64`、`make test`、Dockerfile 已接入两套准备步骤。
+`make build`、`make build-linux`、`make build-linux-arm64`、`make test`、Dockerfile 已接入两套内核及传输依赖的准备步骤。
 `make test` 额外启用 race detector，需要 C 编译器；本机尚未执行 race 检查。
 `third_party/` 是生成目录，源码包包含完整补丁和可重建脚本。脚本验证上游提交，拒绝覆盖意外修改。
 
