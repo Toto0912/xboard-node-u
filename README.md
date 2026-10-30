@@ -1,4 +1,6 @@
-# Xboard-Node
+# xboard-node-u
+
+项目仓库：[Toto0912/xboard-node-u](https://github.com/Toto0912/xboard-node-u)。
 
 基于 [cedar2025/Xboard-Node](https://github.com/cedar2025/Xboard-Node) 的双内核节点后端，连接 [Xboard 面板](https://github.com/cedar2025/Xboard)，或脱离面板独立运行。
 
@@ -26,6 +28,8 @@
 需要 Go 1.27 或更新版本、Git，以及访问 GitHub 和 Go 模块的网络。Linux/macOS 安装 Make 后可以运行：
 
 ```sh
+git clone https://github.com/Toto0912/xboard-node-u.git
+cd xboard-node-u
 make build
 ./xboard-node -v
 ```
@@ -65,7 +69,7 @@ sudo bash install.sh --mode machine \
 ARM64 请替换文件名。安装器会生成 `/etc/xboard-node/config.yml`、受限权限的凭据文件和 systemd 服务。
 两种模式的 token 含义不同：单节点使用面板通信密钥，机器模式使用对应机器的 token。
 
-安装器需要下载二进制时，必须显式设置 `XBOARD_NODE_REPOSITORY=你的账户/你的仓库`。GitHub Actions 构建的 `xbctl` 会自动嵌入当前仓库；本地构建可用 `make build REPOSITORY=你的账户/你的仓库`。本分支不会默认从原作者 Release 下载旧程序。详见 [发布与更新](docs/RELEASE.md)。
+安装器需要下载二进制时，必须显式设置 `XBOARD_NODE_REPOSITORY=Toto0912/xboard-node-u`。GitHub Actions 构建的 `xbctl` 会自动嵌入当前仓库；本地构建可用 `make build REPOSITORY=Toto0912/xboard-node-u`。本分支不会默认从原作者 Release 下载旧程序。推送 main 只构建测试附件，正式版本附件需要发布标签后生成。详见 [发布与更新](docs/RELEASE.md)。
 
 ## 配置
 
