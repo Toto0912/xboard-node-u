@@ -76,6 +76,7 @@ type fileInstance struct {
 
 type filePanelConfig struct {
 	URL      string `yaml:"url"`
+	Token    string `yaml:"token,omitempty"`
 	TokenEnv string `yaml:"token_env,omitempty"`
 	NodeID   int    `yaml:"node_id,omitempty"`
 	NodeType string `yaml:"node_type,omitempty"`
@@ -83,6 +84,7 @@ type filePanelConfig struct {
 
 type fileMachineConfig struct {
 	MachineID int    `yaml:"machine_id"`
+	Token     string `yaml:"token,omitempty"`
 	TokenEnv  string `yaml:"token_env,omitempty"`
 }
 
@@ -206,7 +208,7 @@ func printUsage() {
   xbctl instance get <id> [--output text|json]
   xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
   xbctl config health-port [--config PATH]
-  xbctl service status|start|stop|restart|enable|disable|logs
+  xbctl service status|start|stop|restart|enable|disable|logs|backend
   xbctl health
   xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
   xbctl bind add-machine --panel-url URL --token TOKEN --machine-id ID [--kernel singbox|xray]
@@ -238,7 +240,7 @@ func runStatus() error {
 	fmt.Printf("  version:  %s\n", ver)
 
 	// Service status
-	svc := systemctlState()
+	svc := serviceState()
 	fmt.Printf("  service:  %s\n", svc)
 
 	// Health
@@ -295,20 +297,18 @@ func runService(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: xbctl service <status|start|stop|restart|enable|disable|logs>")
 	}
-	sub := args[0]
-	rest := args[1:]
-	switch sub {
-	case "status":
-		return runCommand("sudo", append([]string{"systemctl", "status", serviceName, "--no-pager"}, rest...)...)
-	case "start", "stop", "restart", "enable", "disable":
-		return runCommand("sudo", append([]string{"systemctl", sub, serviceName}, rest...)...)
-	case "logs":
-		if len(rest) == 0 {
-			rest = []string{"-f"}
+	switch args[0] {
+	case "backend":
+		manager, err := detectServiceManager()
+		if err != nil {
+			return err
 		}
-		return runCommand("sudo", append([]string{"journalctl", "-u", serviceName}, rest...)...)
+		fmt.Println(manager)
+		return nil
+	case "status", "start", "stop", "restart", "enable", "disable", "logs":
+		return controlService(args[0], args[1:]...)
 	default:
-		return fmt.Errorf("unknown service command: %s", sub)
+		return fmt.Errorf("unknown service command: %s", args[0])
 	}
 }
 
@@ -376,7 +376,7 @@ func runBindAdd(mode string, args []string) error {
 	}
 	// Restart service to pick up new config
 	fmt.Println("Restarting service...")
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	if err := controlService("restart"); err != nil {
 		return fmt.Errorf("service restart failed: %w", err)
 	}
 	fmt.Println("Binding added successfully")
@@ -386,6 +386,13 @@ func runBindAdd(mode string, args []string) error {
 func runUpgrade(args []string) error {
 	if err := ensureRoot("upgrade"); err != nil {
 		return err
+	}
+	manager, err := detectServiceManager()
+	if err != nil {
+		return err
+	}
+	if manager == openRC {
+		return runAlpineInstaller("upgrade", args)
 	}
 
 	version := "latest"
@@ -544,6 +551,17 @@ func runUninstall(args []string) error {
 			fmt.Println("Uninstall cancelled")
 			return nil
 		}
+	}
+	manager, err := detectServiceManager()
+	if err != nil {
+		return err
+	}
+	if manager == openRC {
+		args := []string{"--yes"}
+		if purge {
+			args = append(args, "--purge")
+		}
+		return runAlpineInstaller("uninstall", args)
 	}
 
 	var warnings []string
@@ -799,7 +817,9 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 			return err
 		}
-		runCommand("systemctl", "stop", serviceName)
+		if err := controlService("stop"); err != nil {
+			return err
+		}
 		fmt.Printf("removed %d binding(s)\n", len(removed))
 		fmt.Println("All bindings removed. Service stopped.")
 		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
@@ -817,7 +837,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 		return err
 	}
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	if err := controlService("restart"); err != nil {
 		return err
 	}
 	fmt.Printf("removed %d binding(s)\n", len(removed))
@@ -892,6 +912,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 			ID: inst.InstanceID,
 			Panel: filePanelConfig{
 				URL:      inst.Panel.URL,
+				Token:    inst.Panel.Token,
 				TokenEnv: inst.Panel.TokenEnv,
 				NodeID:   inst.Panel.NodeID,
 				NodeType: inst.Panel.NodeType,
@@ -928,6 +949,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 		if inst.IsMachineMode() && inst.Machine != nil {
 			fi.Machine = &fileMachineConfig{
 				MachineID: inst.Machine.MachineID,
+				Token:     inst.Machine.Token,
 				TokenEnv:  inst.Machine.TokenEnv,
 			}
 			fi.Panel.NodeID = 0
@@ -1021,7 +1043,7 @@ func collectRowsFromMeta() ([]instanceRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	serviceStatus := systemctlState()
+	serviceStatus := serviceState()
 	healthStatus := healthStatus()
 	rows := make([]instanceRow, 0, len(meta.Instances))
 	for _, inst := range meta.Instances {
@@ -1047,7 +1069,7 @@ func collectRowsFromConfig() ([]instanceRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	serviceStatus := systemctlState()
+	serviceStatus := serviceState()
 	healthStatus := healthStatus()
 	rows := make([]instanceRow, 0, len(instances))
 	for _, inst := range instances {
@@ -1083,19 +1105,6 @@ func printRows(rows []instanceRow, output string) error {
 	tw.Flush()
 	_, err := fmt.Print(buf.String())
 	return err
-}
-
-func systemctlState() string {
-	cmd := exec.Command("systemctl", "is-active", serviceName)
-	out, err := cmd.CombinedOutput()
-	state := strings.TrimSpace(string(out))
-	if state != "" {
-		return state
-	}
-	if err != nil {
-		return "unknown"
-	}
-	return state
 }
 
 func healthStatus() string {
@@ -1215,6 +1224,8 @@ func runConfig(args []string) error {
 		return runConfigInit(args[1:])
 	case "health-port":
 		return runConfigHealthPort(args[1:])
+	case "metadata":
+		return runConfigMetadata(args[1:])
 	default:
 		return fmt.Errorf("unknown config command: %s", args[0])
 	}

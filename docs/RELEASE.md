@@ -29,7 +29,7 @@ git push origin v1.0.1
 
 - xboard-node-linux-amd64 / arm64
 - xbctl-linux-amd64 / arm64
-- install.sh、LICENSE、THIRD_PARTY_NOTICES.md、licenses.tar.gz
+- install.sh、install-alpine.sh、LICENSE、THIRD_PARTY_NOTICES.md、licenses.tar.gz
 - source-with-kernels.tar.gz（节点、两套内核和已修补传输依赖的源码）
 - SHA256SUMS.txt（上述附件的 SHA256）
 

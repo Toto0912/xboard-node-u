@@ -35,6 +35,30 @@ sudo xbctl upgrade           # 升级到最新正式版
 
 需要无人值守安装、指定版本或使用本地程序时，见 [详细安装说明](docs/INSTALL.md)。
 
+## Alpine Linux / OpenRC 安装
+
+适用于使用 OpenRC 的 Alpine Linux，包括没有 systemd 的 LXC。以 **root** 复制运行：
+
+```sh
+apk add --no-cache curl ca-certificates && curl -fsSL https://github.com/Toto0912/xboard-node-u/releases/latest/download/install-alpine.sh -o /tmp/install-alpine.sh && sh /tmp/install-alpine.sh --interactive
+```
+
+按提示填写即可，默认机器模式、sing-box。自动安装程序和 `xbctl`，配置 OpenRC 后台运行、异常重启和开机自启。
+已有配置及密钥默认保留；旧服务已停止但残留脚本/PID 时，会自动备份并清理。
+
+管理命令与 systemd 相同（Alpine 上以 root 执行）：
+
+```sh
+xbctl status
+xbctl service restart
+xbctl service logs
+xbctl upgrade
+```
+
+独立安装器为 [install-alpine.sh](install-alpine.sh)，无需 Bash，也无需安装 systemd。
+需使用 v1.0.1 及以上版本；v1.0.0 不包含此安装器。
+[详细安装、迁移与离线说明](docs/INSTALL-ALPINE.md)。
+
 ## 功能与配置
 
 - 自动同步面板节点配置和用户，支持 WebSocket 推送及 REST 轮询。
