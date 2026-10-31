@@ -1,12 +1,20 @@
-# Xray v26.10.29 本地升级记录
+# Xray v26.10.31 本地升级记录
 
-本分支包含 sing-box 1.14.4-xboard.1 和 Xray 26.10.29。2026-10-30 已部署到测试 VPS，
-用户已确认公网访问正常。发布项目不包含服务器配置或访问凭据。
-Xray 来源固定为官方 v26.10.29 提交 `0afec66085a85191e9dd2a4a6646c7c9a94688d1`，
-并应用 `patches/xray-core-26.10.29.patch`。
+本分支包含 sing-box 1.14.4-xboard.1 和 Xray 26.10.31。2026-11-01 已在独立本地工作区及 Linux 容器完成安全更新验证，未连接或修改 VPS。
+此前的 v26.10.29 于 2026-10-30 部署到测试 VPS，用户已确认公网访问正常；这一历史结果不代表本次版本已部署到公网。发布项目不包含服务器配置或访问凭据。
+Xray 来源固定为官方 v26.10.31 提交 `a4a3dff5b20c2faae567b742c172c7b95e75c083`，
+并应用 `patches/xray-core-26.10.31.patch`。
 官方未提供对应的 v1.* 模块标签，因此 go.mod 使用 Go 解析该提交得到的规范伪版本
-`v1.260327.1-0.20261029083850-0afec66085a8`。这不是回退到三月份内核。
+`v1.260327.1-0.20261031132019-a4a3dff5b20c`。这不是回退到三月份内核。
 运行 `xboard-node -v` 可查看两套内核的真实版本。
+
+## 2026-11-01 安全更新
+
+- 同步上游默认关闭 MPTCP 的修改；节点自身健康检查监听也显式关闭 MPTCP。
+- 保留并复验原有内核兼容补丁，更新上游要求的 protobuf v1.36.12。
+- 本地全项目 Linux race、已有协议、机器/单节点/无面板运行和 Alpine/OpenRC 检查通过。
+- 对照旧版的 socket 系统调用，确认新版独立运行及重启后不再尝试创建 MPTCP socket。
+- 细节、环境限制及安全边界见 [安全更新验证记录](docs/XRAY-SECURITY-2026-10-31.md)。
 
 ## 改动
 
@@ -22,7 +30,7 @@ Xray 来源固定为官方 v26.10.29 提交 `0afec66085a85191e9dd2a4a6646c7c9a94
 - VPS 联调补充：Hysteria2 协议设置明确生成 version=2，并支持 Hysteria 用户账户热更新。
 - GitHub Linux 并发检查补充：Hysteria 会话管理器在锁内检查关闭状态，单会话关闭标记改用原子访问。
 
-## 本地验证
+## 先前版本的验证记录
 
 - Windows amd64，Go 1.27.3。
 - 全项目 `internal/...`、`cmd/...`、`scripts/...` 测试通过（使用完整构建 tags）。
@@ -50,7 +58,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags 'with_quic with_utls with_w
 ```
 
 `make build`、`make build-linux`、`make build-linux-arm64`、`make test`、Dockerfile 已接入两套内核及传输依赖的准备步骤。
-`make test` 额外启用 race detector，需要 C 编译器；本机尚未执行 race 检查。
+`make test` 额外启用 race detector，需要 C 编译器；本次已在本机 Linux 容器完成全项目 race 检查。
 `third_party/` 是生成目录，源码包包含完整补丁和可重建脚本。脚本验证上游提交，拒绝覆盖意外修改。
 
 ## 兼容性边界

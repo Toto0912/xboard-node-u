@@ -1,6 +1,12 @@
 # 验证范围
 
-最后整理：2026-10-30。以下区分已有功能测试与尚未覆盖的情况，不包含服务器地址或测试凭据。
+最后整理：2026-11-01。以下区分已有功能测试与尚未覆盖的情况，不包含服务器地址或测试凭据。
+
+## 本次 Xray 安全更新
+
+Xray 已同步 v26.10.31。新增的 Linux 回归测试覆盖 Xray 默认/空 socket 选项及健康检查监听的普通 TCP 协议；在 `GODEBUG=multipathtcp=2` 下仍不隐式启用 MPTCP。
+本地 Go 1.27.3 Linux 容器已通过完整 race 检查，另完成原有协议连接、OpenRC 21 项安装管理检查和三种部署模式的实际回环 HTTP 请求。
+Linux amd64/arm64 均完成编译，arm64 另通过模拟容器的版本启动检查。具体范围见 [安全更新验证](XRAY-SECURITY-2026-10-31.md)。
 
 ## 已完成
 
@@ -35,6 +41,6 @@ v1.0.0 安装流程增加了本机 Ubuntu 的伪终端测试，验证脚本 stdi
 - REALITY/Vision、VLESS Encryption 新参数、部分少用协议、长时间负载与多机器规模尚未完整验证。
 - 当前测试面板关闭 WebSocket，远程联调使用 REST；WS 修复已有本地回归，未重新开启面板做远程复测。
 - 配置重载可能中断连接；跨进程重启的计费连续性不包含在本次新增验证中。
-- Windows 本机缺少 C 编译器，未运行 race；Linux race 测试由 GitHub CI 执行。
+- Windows 本机缺少 C 编译器；本次完整 race 已在本机 Linux 容器执行，GitHub CI 会继续执行相同检查。
 - Docker 工作流和发布上传需在实际 GitHub 仓库运行后才能确认，不以本地交叉编译代替。
 - Xray 上游移除 TLS allowInsecure，并调整 Freedom 对私有地址的默认行为；原生自定义配置需要迁移，详见升级说明。

@@ -5,9 +5,11 @@
 | 内核 | 当前版本 |
 | --- | --- |
 | sing-box | 1.14.4（含 Xboard 兼容补丁） |
-| Xray-core | 26.10.29（含 Xboard 兼容补丁） |
+| Xray-core | 26.10.31（含 Xboard 兼容补丁） |
 
 两套内核已嵌入程序，无需另装内核。[下载正式版](https://github.com/Toto0912/xboard-node-u/releases/latest) · [变更记录](CHANGELOG.md)
+
+当前源码已同步 Xray v26.10.31 安全更新，默认关闭 Xray 入站及节点健康检查监听的 MPTCP。这是减少攻击面的措施，服务器仍应更新 Linux 内核。安装脚本下载的是已发布 Release，实际内核版本请用 `xboard-node -v` 确认。[更新说明与本地验证](docs/XRAY-SECURITY-2026-10-31.md)
 
 ## Linux systemd 安装
 

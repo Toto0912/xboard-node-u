@@ -32,7 +32,7 @@ require (
 	github.com/sagernet/sing-box v1.14.4
 	github.com/sagernet/sing-tun v0.9.7-0.20261023115432-040db71fcd33
 	github.com/shirou/gopsutil/v4 v4.26.2
-	github.com/xtls/xray-core v1.260327.1-0.20261029083850-0afec66085a8
+	github.com/xtls/xray-core v1.260327.1-0.20261031132019-a4a3dff5b20c
 	golang.org/x/term v0.47.0
 	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -285,7 +285,7 @@ require (
 	google.golang.org/api v0.278.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/grpc v1.84.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	layeh.com/gopher-luar v1.0.11 // indirect

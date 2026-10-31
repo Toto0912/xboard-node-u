@@ -66,7 +66,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		if port <= 0 {
 			return
 		}
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		ln, err := listenHealth(fmt.Sprintf(":%d", port))
 		if err != nil {
 			nlog.Core().Error("failed to start health check listener", "port", port, "error", err)
 			os.Exit(1)
@@ -236,6 +236,14 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
+}
+
+// Keep the health endpoint on ordinary TCP, matching the embedded Xray default.
+// Explicitly setting this also overrides Go's GODEBUG MPTCP listener default.
+func listenHealth(address string) (net.Listener, error) {
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+	return lc.Listen(context.Background(), "tcp", address)
 }
 
 // applyRuntimeConfig wires up Go runtime memory limits from the config file.

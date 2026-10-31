@@ -1,5 +1,12 @@
 # 变更记录
 
+## v1.0.2 — 2026-11-01
+
+- 同步官方 Xray v26.10.31 安全更新，固定提交 `a4a3dff5b20c2faae567b742c172c7b95e75c083`，默认关闭 Xray TCP 监听的 MPTCP。
+- 节点健康检查监听同样显式关闭 MPTCP，避免受 Go 隐式默认值或 `GODEBUG` 设置影响。
+- 将现有 Xboard 限速、Mux、配置注册和 Hysteria 并发兼容补丁迁移至新固定版本，更新 protobuf 至 v1.36.12。
+- 补充 Linux socket 协议回归测试；本地全项目 race、协议连接、三种部署模式与 OpenRC 安装升级检查通过，详见安全更新记录。
+
 ## v1.0.1 — 2026-10-30
 
 - 新增独立的 Alpine / OpenRC 安装器 `install-alpine.sh`，README 在 systemd 安装后提供一键命令。
