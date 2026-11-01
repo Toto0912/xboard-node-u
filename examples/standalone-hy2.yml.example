@@ -1,0 +1,27 @@
+# HY2 独立节点（sing-box）。准备域名证书/私钥文件，替换域名和密码。
+kernel:
+  type: singbox
+  config_dir: /var/lib/xboard-node/standalone-hy2
+  log_level: warn
+cert:
+  cert_mode: file
+  cert_file: /etc/xboard-node/certs/fullchain.pem
+  key_file: /etc/xboard-node/certs/privkey.pem
+standalone:
+  enabled: true
+  node:
+    protocol: hysteria
+    version: 2
+    listen_ip: "0.0.0.0"
+    server_port: 8443
+    tls: 1
+    tls_settings:
+      server_name: "hy2.example.com"
+  users:
+    - id: 1
+      # HY2 的 uuid 字段用作认证密码。
+      uuid: "REPLACE_WITH_YOUR_HY2_PASSWORD"
+log:
+  level: info
+  output: stdout
+health_port: 0

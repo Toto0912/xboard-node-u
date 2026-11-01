@@ -1,19 +1,20 @@
-# Local loopback example. Replace the example UUID before use.
-# Configure an appropriate listener and transport/TLS before exposing a service.
+# SS 独立节点（sing-box）。将密码替换为自己的强密码。
 kernel:
-  type: xray
-  config_dir: ./data/standalone
+  type: singbox
+  config_dir: /var/lib/xboard-node/standalone-ss
+  log_level: warn
 standalone:
   enabled: true
   node:
-    protocol: vless
-    listen_ip: 127.0.0.1
-    server_port: 20446
-    network: tcp
-    tls: 0
+    protocol: shadowsocks
+    listen_ip: "0.0.0.0"
+    server_port: 8388
+    cipher: chacha20-ietf-poly1305
   users:
     - id: 1
-      uuid: 00000000-0000-4000-8000-000000000001
+      # SS 的 uuid 字段用作密码，不要求 UUID 格式。
+      uuid: "REPLACE_WITH_YOUR_SS_PASSWORD"
 log:
   level: info
+  output: stdout
 health_port: 0

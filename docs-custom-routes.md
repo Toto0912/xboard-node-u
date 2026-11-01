@@ -1,4 +1,6 @@
-# Custom Routes
+# 自定义路由
+
+本文的 `custom_route_rules` 和 `custom_routes` 在 **Xboard 面板的节点配置中设置**，由面板下发给 xboard-node-u。不要将下面的 JSON 直接粘贴到本地服务器的 `config.yml`。
 
 ## Quick Example
 

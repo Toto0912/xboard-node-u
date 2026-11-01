@@ -1,4 +1,6 @@
-# Custom Outbounds
+# 自定义出站
+
+本文的 `custom_outbounds` 在 **Xboard 面板的节点配置中设置**，由面板下发给 xboard-node-u。不要将下面的 JSON 直接粘贴到本地服务器的 `config.yml`。
 
 ## Quick Example
 
@@ -52,4 +54,3 @@
 ## Best Practices
 
 - **Prefer** `custom_outbounds`: panel-managed, cross-kernel compatible
-- **Use** `kernel.custom_outbound` only: when native fields are needed
