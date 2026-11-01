@@ -1,6 +1,6 @@
 # 变更记录
 
-## 未发布
+## v1.1.0 — 2026-11-01
 
 - 无面板独立模式新增 `standalone.node.fallbacks`，支持 Xray VLESS / Trojan TCP+TLS 的默认、SNI、ALPN、路径回落及 PROXY protocol。
 - 独立模式对不兼容的内核、协议、传输、Reality、VLESS decryption 和无效回落参数给出明确错误。
