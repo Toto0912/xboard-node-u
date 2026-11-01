@@ -45,6 +45,27 @@ type NodeSpec struct {
 
 	Multiplex           *MultiplexConfig
 	AcceptProxyProtocol bool
+	// Only the local control plane populates this. Omit it from legacy hashes.
+	Standalone   *StandaloneOptions `json:",omitempty"`
+	XrayFallback string             `json:",omitempty"`
+}
+
+// PanelFallbackTarget keeps an optional panel setting from breaking other
+// protocols/transports. The sing-box control plane drops it altogether.
+func (n *NodeSpec) PanelFallbackTarget() string {
+	if n == nil || (n.Protocol != "vless" && n.Protocol != "trojan") ||
+		(n.TLS != 1 && n.TLS != 2) || (n.Network != "" && n.Network != "tcp" && n.Network != "raw") {
+		return ""
+	}
+	if n.Protocol == "vless" && n.TLS == 1 && n.Decryption != "" && n.Decryption != "none" {
+		return ""
+	}
+	return config.NormalizeFallbackTarget(n.XrayFallback)
+}
+
+type StandaloneOptions struct {
+	Fallbacks []config.XrayFallback
+	ALPN      []string
 }
 
 type OutboundConfig struct {

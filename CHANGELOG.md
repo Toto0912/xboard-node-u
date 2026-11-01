@@ -1,5 +1,13 @@
 # 变更记录
 
+## 未发布
+
+- 无面板独立模式新增 `standalone.node.fallbacks`，支持 Xray VLESS / Trojan TCP+TLS 的默认、SNI、ALPN、路径回落及 PROXY protocol。
+- 独立模式对不兼容的内核、协议、传输、Reality、VLESS decryption 和无效回落参数给出明确错误。
+- 增加 VLESS + TLS 回落配置示例和裸核运行说明。
+- 支持 xboard-u 下发的可选 `xray_fallback`，覆盖机器 / 单节点的 REST 拉取及 WS 更新；Xray TCP/RAW + TLS 使用普通回落，Reality 覆盖伪装目标。
+- sing-box 忽略面板回落字段，不影响启动或因该字段变化触发多余重载；旧面板、空值及无效输入保持原行为。
+
 ## v1.0.2 — 2026-11-01
 
 - 同步官方 Xray v26.10.31 安全更新，固定提交 `a4a3dff5b20c2faae567b742c172c7b95e75c083`，默认关闭 Xray TCP 监听的 MPTCP。

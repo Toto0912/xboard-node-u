@@ -87,6 +87,7 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 	}
 
 	return &NodeSpec{
+		XrayFallback:        config.NormalizeFallbackTarget(string(nc.XrayFallback)),
 		Protocol:            nc.Protocol,
 		ListenIP:            nc.ListenIP,
 		ServerPort:          nc.ServerPort,
@@ -129,6 +130,20 @@ func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) 
 	spec := NodeSpecFromPanel(nc)
 	if err := ValidateNodeSpec(spec, kcfg); err != nil {
 		return nil, err
+	}
+	if spec != nil {
+		kind := kcfg.Type
+		if kind == "" {
+			kind = spec.KernelType
+		}
+		kind, _ = normalizeKernelType(kind) // Already checked by ValidateNodeSpec.
+		if kind != "xray" {
+			// Ignoring this for sing-box also prevents needless reloads when only
+			// the Xray-only panel setting changes.
+			spec.XrayFallback = ""
+		} else {
+			spec.XrayFallback = spec.PanelFallbackTarget()
+		}
 	}
 	return spec, nil
 }
@@ -226,6 +241,7 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 	}
 
 	return &panel.NodeConfig{
+		XrayFallback:        panel.OptionalFallbackTarget(n.XrayFallback),
 		Protocol:            n.Protocol,
 		ListenIP:            n.ListenIP,
 		ServerPort:          n.ServerPort,

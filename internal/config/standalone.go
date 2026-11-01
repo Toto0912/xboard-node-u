@@ -32,6 +32,7 @@ type StandaloneNodeConfig struct {
 	Flow        string         `yaml:"flow,omitempty"`
 	Decryption  string         `yaml:"decryption,omitempty"`
 	TLSSettings map[string]any `yaml:"tls_settings,omitempty"`
+	Fallbacks   []XrayFallback `yaml:"fallbacks,omitempty"`
 
 	Host       string `yaml:"host,omitempty"`
 	ServerName string `yaml:"server_name,omitempty"`
@@ -124,6 +125,9 @@ func (c *Config) validateStandalone() error {
 	}
 	if node.TLS < 0 || node.TLS > 2 {
 		return fmt.Errorf("standalone.node.tls must be 0 (off), 1 (tls), or 2 (reality)")
+	}
+	if err := node.ValidateFallbacks(c.Kernel.Type); err != nil {
+		return err
 	}
 	if len(c.Standalone.Users) == 0 {
 		return fmt.Errorf("standalone.users must not be empty")

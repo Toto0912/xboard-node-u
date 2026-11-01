@@ -55,6 +55,15 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		}
 	}
 
+	var standalone *StandaloneOptions
+	if cfg.IsStandalone() && len(sc.Node.Fallbacks) > 0 {
+		alpn, _ := sc.Node.FallbackALPN() // Checked by NodeSpecFromStandaloneValidated.
+		standalone = &StandaloneOptions{
+			Fallbacks: append([]config.XrayFallback(nil), sc.Node.Fallbacks...),
+			ALPN:      alpn,
+		}
+	}
+
 	return &NodeSpec{
 		Protocol:            sc.Node.Protocol,
 		ListenIP:            sc.Node.ListenIP,
@@ -86,10 +95,16 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		TrafficPattern:      sc.Node.TrafficPattern,
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: sc.Node.AcceptProxyProtocol,
+		Standalone:          standalone,
 	}
 }
 
 func NodeSpecFromStandaloneValidated(cfg *config.Config) (*NodeSpec, error) {
+	if cfg.IsStandalone() {
+		if err := cfg.Standalone.Node.ValidateFallbacks(cfg.Kernel.Type); err != nil {
+			return nil, err
+		}
+	}
 	spec := NodeSpecFromStandalone(cfg)
 	if err := ValidateNodeSpec(spec, cfg.Kernel); err != nil {
 		return nil, err

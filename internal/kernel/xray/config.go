@@ -277,6 +277,7 @@ func buildVLESS(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TL
 	}
 
 	applyStreamSettings(base, nc, tc)
+	applyXrayFallbacks(base, nc)
 	return base
 }
 
@@ -302,7 +303,32 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 		applyStreamSettings(base, nc, tc)
 	}
 
+	applyXrayFallbacks(base, nc)
 	return base
+}
+
+// Standalone native rules stay separate from the panel's one optional target.
+// No setting changes unless a valid fallback was explicitly configured.
+func applyXrayFallbacks(base M, nc *model.NodeSpec) {
+	settings := base["settings"].(M)
+	stream := base["streamSettings"].(M)
+	if nc.Standalone != nil && len(nc.Standalone.Fallbacks) > 0 {
+		settings["fallbacks"] = append([]config.XrayFallback(nil), nc.Standalone.Fallbacks...)
+		stream["tlsSettings"].(M)["alpn"] = append([]string(nil), nc.Standalone.ALPN...)
+		return
+	}
+	target := nc.PanelFallbackTarget()
+	if target == "" {
+		return
+	}
+	if nc.TLS == 2 {
+		// REALITY forwards unauthenticated TLS streams to its HTTPS target.
+		// Keep serverNames/SNI and keys unchanged; do not add plaintext fallbacks.
+		stream["realitySettings"].(M)["dest"] = target
+		return
+	}
+	settings["fallbacks"] = []M{{"dest": target, "xver": 0}}
+	stream["tlsSettings"].(M)["alpn"] = []string{"http/1.1"}
 }
 
 type ss2022Config struct {

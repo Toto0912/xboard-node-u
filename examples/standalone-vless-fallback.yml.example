@@ -1,0 +1,32 @@
+# VLESS + TLS + Xray fallback。仅适用于无面板独立模式。
+# 准备真实域名证书及私钥，并在 127.0.0.1:8080 运行明文 HTTP 网站。
+kernel:
+  type: xray
+  config_dir: /var/lib/xboard-node/standalone-vless-fallback
+  log_level: warn
+cert:
+  cert_mode: file
+  cert_file: /etc/xboard-node/certs/fullchain.pem
+  key_file: /etc/xboard-node/certs/privkey.pem
+standalone:
+  enabled: true
+  node:
+    protocol: vless
+    listen_ip: "0.0.0.0"
+    server_port: 443
+    network: tcp
+    tls: 1
+    flow: xtls-rprx-vision
+    tls_settings:
+      server_name: "proxy.example.com"
+      alpn: [http/1.1]
+    fallbacks:
+      - dest: "127.0.0.1:8080"
+        xver: 0
+  users:
+    - id: 1
+      uuid: "00000000-0000-4000-8000-000000000001"
+log:
+  level: info
+  output: stdout
+health_port: 0
