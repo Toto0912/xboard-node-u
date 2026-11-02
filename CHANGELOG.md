@@ -1,13 +1,13 @@
 # 变更记录
 
-## v1.1.1 — 2026-11-02
+## v1.1.2 — 2026-11-02
 
-- 独立模式新增 `standalone.node.xray_fallback`，复用面板的目标校验和内核处理逻辑；支持 Xray VLESS / Trojan TCP/RAW + TLS / Reality。
-- Reality 使用有效回落目标覆盖 `tls_settings.dest`，保留原 SNI、密钥、Short ID 和 Flow；普通 TLS 使用 HTTP/1.1 明文回落。
-- sing-box 忽略新字段，字段单独变化不会触发多余重载；空值、无效目标及不适用的协议组合保持原行为。
-- 保留旧 `fallbacks` 多规则列表，仍仅用于普通 TLS；与有效单目标同时配置时明确报错，Reality 误用旧列表时提示迁移方法。
-- 补充单实例/多实例配置加载、面板行为对齐、TLS / Reality 实际回落及合法代理回归测试，更新独立运行指南和配置示例。
-- 项目版本与 xboard-u v1.1.1 对齐，内核仍为 sing-box 1.14.4、Xray-core 26.10.31。
+- 独立模式的 `standalone.node.fallbacks` 支持 Xray VLESS / Trojan TCP/RAW + TLS / Reality，统一使用原生列表；不增加单目标独立字段。
+- 面板下发的可选回落在 TLS / Reality 下均生成协议层 `fallbacks`，不再覆盖 Reality 的 dest，保留 SNI、密钥、Short ID 和 Flow。
+- 普通浏览器 / Reality 鉴权失败仍转发到原 HTTPS 目标，Reality 握手通过后的协议首包或认证失败才使用原生回落；保留合法代理和 PROXY protocol。
+- Reality 不注入普通 TLS ALPN 设置；条件按内核实际协商值匹配。VLESS 额外加密在 TLS、Reality 下均与回落不兼容。
+- 修复 Xray 在未显式填写 dest 时忽略面板 Reality `server_port` 的问题，显式 dest 仍优先。
+- 保持 sing-box 忽略面板回落字段和客户端订阅隔离；同步示例、升级说明和两端 v1.1.2 版本。
 
 ## v1.1.0 — 2026-11-01
 

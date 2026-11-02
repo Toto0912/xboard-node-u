@@ -50,35 +50,17 @@ type NodeSpec struct {
 	XrayFallback string             `json:",omitempty"`
 }
 
-// PanelFallbackTarget applies the same optional target rules to panel and
-// standalone nodes. The sing-box control plane drops the field altogether.
+// PanelFallbackTarget keeps an optional panel setting from breaking other
+// protocols/transports. The sing-box control plane drops it altogether.
 func (n *NodeSpec) PanelFallbackTarget() string {
 	if n == nil || (n.Protocol != "vless" && n.Protocol != "trojan") ||
 		(n.TLS != 1 && n.TLS != 2) || (n.Network != "" && n.Network != "tcp" && n.Network != "raw") {
 		return ""
 	}
-	if n.Protocol == "vless" && n.TLS == 1 && n.Decryption != "" && n.Decryption != "none" {
+	if n.Protocol == "vless" && n.Decryption != "" && n.Decryption != "none" {
 		return ""
 	}
 	return config.NormalizeFallbackTarget(n.XrayFallback)
-}
-
-// Call after ValidateNodeSpec so both control planes normalize the same way.
-func (n *NodeSpec) normalizeXrayFallback(kcfg config.KernelConfig) {
-	if n == nil {
-		return
-	}
-	kind := kcfg.Type
-	if kind == "" {
-		kind = n.KernelType
-	}
-	kind, _ = normalizeKernelType(kind)
-	if kind != "xray" {
-		// Changes to an ignored option must not change sing-box reload hashes.
-		n.XrayFallback = ""
-	} else {
-		n.XrayFallback = n.PanelFallbackTarget()
-	}
 }
 
 type StandaloneOptions struct {

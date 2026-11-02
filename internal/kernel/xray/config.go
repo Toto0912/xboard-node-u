@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -307,28 +309,26 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	return base
 }
 
-// Standalone native rules stay separate from the shared optional single target.
+// Standalone native rules stay separate from the panel's one optional target.
 // No setting changes unless a valid fallback was explicitly configured.
 func applyXrayFallbacks(base M, nc *model.NodeSpec) {
 	settings := base["settings"].(M)
 	stream := base["streamSettings"].(M)
 	if nc.Standalone != nil && len(nc.Standalone.Fallbacks) > 0 {
 		settings["fallbacks"] = append([]config.XrayFallback(nil), nc.Standalone.Fallbacks...)
-		stream["tlsSettings"].(M)["alpn"] = append([]string(nil), nc.Standalone.ALPN...)
+		if nc.TLS == 1 {
+			stream["tlsSettings"].(M)["alpn"] = append([]string(nil), nc.Standalone.ALPN...)
+		} // REALITY keeps its own dest, SNI and negotiated ALPN unchanged.
 		return
 	}
 	target := nc.PanelFallbackTarget()
 	if target == "" {
 		return
 	}
-	if nc.TLS == 2 {
-		// REALITY forwards unauthenticated TLS streams to its HTTPS target.
-		// Keep serverNames/SNI and keys unchanged; do not add plaintext fallbacks.
-		stream["realitySettings"].(M)["dest"] = target
-		return
-	}
 	settings["fallbacks"] = []M{{"dest": target, "xver": 0}}
-	stream["tlsSettings"].(M)["alpn"] = []string{"http/1.1"}
+	if nc.TLS == 1 {
+		stream["tlsSettings"].(M)["alpn"] = []string{"http/1.1"}
+	} // Protocol fallbacks never override the REALITY handshake target.
 }
 
 type ss2022Config struct {
@@ -664,7 +664,11 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 	if sn, ok := nc.TLSSettings["server_name"]; ok {
 		reality["serverNames"] = []string{fmt.Sprintf("%v", sn)}
 		if _, exists := reality["dest"]; !exists {
-			reality["dest"] = fmt.Sprintf("%v:443", sn)
+			port := "443"
+			if p, err := strconv.Atoi(fmt.Sprint(nc.TLSSettings["server_port"])); err == nil && p > 0 && p <= 65535 {
+				port = strconv.Itoa(p)
+			}
+			reality["dest"] = net.JoinHostPort(strings.Trim(fmt.Sprint(sn), "[]"), port)
 		}
 	}
 

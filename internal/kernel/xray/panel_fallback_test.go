@@ -22,13 +22,12 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/panel"
-	goreality "github.com/xtls/reality"
 	xnet "github.com/xtls/xray-core/common/net"
 	xcore "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf/serial"
 )
 
-func TestSingleFallbackRealTLSRealityAndAuthorizedProxy(t *testing.T) {
+func TestPanelFallbackRealTLSRealityAndAuthorizedProxy(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "panel-http-site") }))
 	defer site.Close()
 	cert := fallbackCertificate(t)
@@ -46,110 +45,90 @@ func TestSingleFallbackRealTLSRealityAndAuthorizedProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, source := range []string{"panel", "standalone"} {
-		for _, protocol := range []string{"vless", "trojan"} {
-			for _, security := range []int{1, 2} {
-				t.Run(fmt.Sprintf("%s-%s-tls%d", source, protocol, security), func(t *testing.T) {
-					target := strings.TrimPrefix(site.URL, "http://")
-					want := "panel-http-site"
-					if security == 2 {
-						target = strings.TrimPrefix(httpsSite.URL, "https://")
-						want = "panel-https-site"
+	for _, protocol := range []string{"vless", "trojan"} {
+		for _, security := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%s-tls%d", protocol, security), func(t *testing.T) {
+				target := strings.TrimPrefix(site.URL, "http://")
+				want := "panel-http-site"
+				if security == 2 {
+					want = "panel-https-site"
+				}
+				port := freeTestPort(t)
+				pc := &panel.NodeConfig{Protocol: protocol, ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp", TLS: security,
+					XrayFallback: panel.OptionalFallbackTarget(target), TLSSettings: map[string]any{"server_name": "localhost", "private_key": base64.RawURLEncoding.EncodeToString(key.Bytes()), "short_id": "0123456789abcdef", "dest": strings.TrimPrefix(httpsSite.URL, "https://")}}
+				kcfg := config.KernelConfig{Type: "xray", LogLevel: "error", CustomOutbound: []map[string]any{{"tag": "direct", "protocol": "freedom", "settings": map[string]any{"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.1/32"}}}}}}}
+				node, err := model.NodeSpecFromPanelValidated(pc, kcfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				node.CustomRoutes = []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}}
+				rendered := buildConfig(kcfg, node, testUsers, cert)
+				in := rendered["inbounds"].([]M)[0]
+				stream := in["streamSettings"].(M)
+				if security == 2 {
+					rs := stream["realitySettings"].(M)
+					if rs["dest"] != pc.TLSSettings["dest"] || rs["serverNames"].([]string)[0] != "localhost" {
+						t.Fatalf("lost target or SNI: %+v", rs)
 					}
-					port := freeTestPort(t)
-					pc := &panel.NodeConfig{Protocol: protocol, ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp", TLS: security,
-						XrayFallback: panel.OptionalFallbackTarget(target), TLSSettings: map[string]any{"server_name": "localhost", "private_key": base64.RawURLEncoding.EncodeToString(key.Bytes()), "short_id": "0123456789abcdef", "dest": "127.0.0.1:1"}}
-					if protocol == "vless" {
-						pc.Flow = "xtls-rprx-vision"
+					if in["settings"].(M)["fallbacks"].([]M)[0]["dest"] != target {
+						t.Fatal("Reality lost its protocol-layer fallback")
 					}
-					kcfg := config.KernelConfig{Type: "xray", LogLevel: "error", CustomOutbound: []map[string]any{{"tag": "direct", "protocol": "freedom", "settings": map[string]any{"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.1/32"}}}}}}}
-					var node *model.NodeSpec
-					var err error
-					if source == "standalone" {
-						node, err = model.NodeSpecFromStandaloneValidated(&config.Config{Kernel: kcfg, Standalone: &config.StandaloneConfig{Enabled: true,
-							Node: config.StandaloneNodeConfig{Protocol: pc.Protocol, ListenIP: pc.ListenIP, ServerPort: pc.ServerPort, Network: "raw", TLS: pc.TLS, Flow: pc.Flow,
-								TLSSettings: pc.TLSSettings, XrayFallback: target}}})
-					} else {
-						node, err = model.NodeSpecFromPanelValidated(pc, kcfg)
+					if _, ok := stream["tlsSettings"]; ok {
+						t.Fatal("ordinary TLS ALPN injected into Reality")
 					}
-					if err != nil {
-						t.Fatal(err)
-					}
-					node.CustomRoutes = []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}}
-					rendered := buildConfig(kcfg, node, testUsers, cert)
-					in := rendered["inbounds"].([]M)[0]
-					stream := in["streamSettings"].(M)
-					if security == 2 {
-						rs := stream["realitySettings"].(M)
-						if rs["dest"] != target || rs["serverNames"].([]string)[0] != "localhost" || rs["privateKey"] != pc.TLSSettings["private_key"] || rs["shortIds"].([]string)[0] != "0123456789abcdef" {
-							t.Fatalf("lost target or SNI: %+v", rs)
-						}
-						if _, ok := in["settings"].(M)["fallbacks"]; ok {
-							t.Fatal("Reality acquired plaintext fallback")
-						}
-					}
-					server := New(kcfg)
-					if err := server.Start(node, testUsers, cert); err != nil {
-						t.Fatal(err)
-					}
-					t.Cleanup(server.Stop)
-					if security == 2 {
-						// RAW starts REALITY's target probe asynchronously. Wait for its
-						// cache before testing the first authenticated connection; an
-						// unfinished probe deliberately stalls a handshake for five seconds.
-						deadline := time.Now().Add(3 * time.Second)
-						for {
-							value, _ := goreality.GlobalPostHandshakeRecordsLens.Load(target + " localhost 2")
-							if _, ready := value.([]int); ready {
-								break
-							}
-							if time.Now().After(deadline) {
-								t.Fatal("Reality target probe did not finish")
-							}
-							time.Sleep(10 * time.Millisecond)
-						}
-					}
-					conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", fmt.Sprintf("127.0.0.1:%d", port), &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS13})
-					if err != nil {
-						t.Fatal(err)
-					}
-					checkFallbackHTTP(t, conn, "/", want)
-					settings := M{}
-					if protocol == "vless" {
-						settings["vnext"] = []M{{"address": "127.0.0.1", "port": port, "users": []M{{"id": testUsers[0].UUID, "encryption": "none", "flow": pc.Flow}}}}
-					} else {
-						settings["servers"] = []M{{"address": "127.0.0.1", "port": port, "password": testUsers[0].UUID}}
-					}
-					transport := M{"network": "tcp", "security": "tls", "tlsSettings": M{"serverName": "localhost", "alpn": []string{"http/1.1"}, "pinnedPeerCertSha256": certPin(cert)}}
-					if security == 2 {
-						transport = M{"network": "tcp", "security": "reality", "realitySettings": M{"serverName": "localhost", "fingerprint": "chrome", "password": base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), "shortId": "0123456789abcdef", "spiderX": "/"}}
-					}
-					raw, _ := json.Marshal(M{"log": M{"loglevel": "error"}, "outbounds": []M{{"protocol": protocol, "settings": settings, "streamSettings": transport}}})
-					pb, err := serial.LoadJSONConfig(bytes.NewReader(raw))
-					if err != nil {
-						t.Fatal(err)
-					}
-					client, err := xcore.New(pb)
-					if err != nil {
-						t.Fatal(err)
-					}
-					t.Cleanup(func() { _ = client.Close() })
-					if err := client.Start(); err != nil {
-						t.Fatal(err)
-					}
-					dest, err := xnet.ParseDestination("tcp:" + strings.TrimPrefix(site.URL, "http://"))
-					if err != nil {
-						t.Fatal(err)
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-					proxyConn, err := xcore.Dial(ctx, client, dest)
-					if err != nil {
-						t.Fatal(err)
-					}
-					checkFallbackHTTP(t, proxyConn, "/", "panel-http-site")
-				})
-			}
+				}
+				server := New(kcfg)
+				if err := server.Start(node, testUsers, cert); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(server.Stop)
+				if security == 2 {
+					waitRealityFallbackProbe(t, pc.TLSSettings["dest"].(string))
+				}
+				conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", fmt.Sprintf("127.0.0.1:%d", port), &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS13})
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkFallbackHTTP(t, conn, "/", want)
+				if security == 2 {
+					native := authenticatedRealityFallbackConnection(t, port, key.PublicKey().Bytes())
+					checkFallbackHTTP(t, native, "/", "panel-http-site")
+				}
+				settings := M{}
+				if protocol == "vless" {
+					settings["vnext"] = []M{{"address": "127.0.0.1", "port": port, "users": []M{{"id": testUsers[0].UUID, "encryption": "none"}}}}
+				} else {
+					settings["servers"] = []M{{"address": "127.0.0.1", "port": port, "password": testUsers[0].UUID}}
+				}
+				transport := M{"network": "tcp", "security": "tls", "tlsSettings": M{"serverName": "localhost", "alpn": []string{"http/1.1"}, "pinnedPeerCertSha256": certPin(cert)}}
+				if security == 2 {
+					transport = M{"network": "tcp", "security": "reality", "realitySettings": M{"serverName": "localhost", "fingerprint": "chrome", "password": base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), "shortId": "0123456789abcdef", "spiderX": "/"}}
+				}
+				raw, _ := json.Marshal(M{"log": M{"loglevel": "error"}, "outbounds": []M{{"protocol": protocol, "settings": settings, "streamSettings": transport}}})
+				pb, err := serial.LoadJSONConfig(bytes.NewReader(raw))
+				if err != nil {
+					t.Fatal(err)
+				}
+				client, err := xcore.New(pb)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = client.Close() })
+				if err := client.Start(); err != nil {
+					t.Fatal(err)
+				}
+				dest, err := xnet.ParseDestination("tcp:" + strings.TrimPrefix(site.URL, "http://"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				proxyConn, err := xcore.Dial(ctx, client, dest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkFallbackHTTP(t, proxyConn, "/", "panel-http-site")
+			})
 		}
 	}
 }

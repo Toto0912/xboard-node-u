@@ -51,9 +51,6 @@ func (n StandaloneNodeConfig) ValidateFallbacks(kernelType string) error {
 	if len(n.Fallbacks) == 0 {
 		return nil
 	}
-	if NormalizeFallbackTarget(n.XrayFallback) != "" {
-		return fmt.Errorf("standalone.node.xray_fallback and fallbacks cannot be combined; use one fallback configuration")
-	}
 	if kernelType != "xray" {
 		return fmt.Errorf("standalone.node.fallbacks requires kernel.type: xray")
 	}
@@ -63,16 +60,20 @@ func (n StandaloneNodeConfig) ValidateFallbacks(kernelType string) error {
 	if n.Network != "" && n.Network != "tcp" && n.Network != "raw" {
 		return fmt.Errorf("standalone.node.fallbacks requires TCP transport (network: tcp or raw)")
 	}
-	if n.TLS != 1 {
-		return fmt.Errorf("standalone.node.fallbacks requires TLS (tls: 1); for Reality (tls: 2), use xray_fallback: host:port to override tls_settings.dest instead")
+	if n.TLS != 1 && n.TLS != 2 {
+		return fmt.Errorf("standalone.node.fallbacks requires TLS or Reality (tls: 1 or 2)")
 	}
 	if n.Protocol == "vless" && n.Decryption != "" && n.Decryption != "none" {
 		return fmt.Errorf("standalone.node.fallbacks cannot be combined with VLESS decryption")
 	}
-	alpn, err := n.FallbackALPN()
-	if err != nil {
-		return err
-	}
+	var alpn []string
+	if n.TLS == 1 {
+		var err error
+		alpn, err = n.FallbackALPN()
+		if err != nil {
+			return err
+		}
+	} // REALITY negotiates ALPN in its handshake, not through tls_settings.alpn.
 	for i, fallback := range n.Fallbacks {
 		prefix := fmt.Sprintf("standalone.node.fallbacks[%d]", i)
 		if fallback.Xver < 0 || fallback.Xver > 2 {
@@ -84,7 +85,7 @@ func (n StandaloneNodeConfig) ValidateFallbacks(kernelType string) error {
 		if fallback.ALPN == "h2" && fallback.Path != "" {
 			return fmt.Errorf("%s.path cannot match HTTP/2 traffic", prefix)
 		}
-		if fallback.ALPN != "" {
+		if fallback.ALPN != "" && n.TLS == 1 {
 			found := false
 			for _, value := range alpn {
 				found = found || value == fallback.ALPN

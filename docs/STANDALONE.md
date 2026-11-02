@@ -13,10 +13,10 @@
 | SS | [完整配置](../examples/standalone.yml.example) | 密码、监听端口 | 示例为 8388 TCP / UDP |
 | VLESS + Reality | [完整配置](../examples/standalone-vless-reality.yml.example) | UUID、Reality 私钥、short ID、目标域名及端口 | 示例为 443 TCP |
 | HY2 | [完整配置](../examples/standalone-hy2.yml.example) | 密码、域名、证书路径及端口 | 示例为 8443 UDP |
-| Xray Reality 回落 | [完整配置](../examples/standalone-xray-reality-fallback.yml.example) | UUID、Reality 私钥、short ID、SNI 及本地 HTTPS 网站端口 | 示例为 443 TCP |
+| Xray Reality 原生回落 | [完整配置](../examples/standalone-xray-reality-fallback.yml.example) | UUID、Reality 私钥、Short ID、原目标和明文回落后端 | 示例为 443 TCP |
 | VLESS + TLS 回落 | [完整配置](../examples/standalone-vless-fallback.yml.example) | UUID、域名、证书路径及本地网站端口 | 示例为 443 TCP |
 
-SS、Reality 和 HY2 示例使用 sing-box，TLS 回落和 Xray Reality 回落示例使用 Xray。配置只保留所选示例，不要把多个完整示例直接拼接在文件最外层。示例监听所有 IPv4 接口，客户端填写服务器公网 IP 或域名。
+SS、Reality 和 HY2 示例使用 sing-box，TLS 回落和 Reality 原生回落示例使用 Xray。配置只保留所选示例，不要把多个完整示例直接拼接在文件最外层。示例监听所有 IPv4 接口，客户端填写服务器公网 IP 或域名。
 
 以 root 执行：
 
@@ -41,21 +41,21 @@ xboard-node -c /path/to/config.yml
 
 **直接在节点端正在使用的主配置文件中添加回落配置，不需要另建 `.yml` 文件，也不需要通过 `kernel.custom_config` 引入。** 如果你的主配置文件是 `/etc/xboard/config.yml`，就在这个文件中编辑。本项目安装脚本默认使用 `/etc/xboard-node/config.yml`；实际编辑哪个文件，以服务启动命令的 `-c` 参数为准，不要把配置写进另一个未被加载的文件。
 
-### 单目标回落：与面板一致（v1.1.1 起）
+在主配置文件中找到独立节点的 `standalone:`，再找到它下面的 `node:`，将 `fallbacks:` 添加到 `node:` 内，**与 `tls:`、`tls_settings:` 同级**。文档中的 `standalone.node.fallbacks` 只是这三层 YAML 的简写，不是另一个文件，也不是可以直接写在最外层的字段。
 
-在主配置文件中找到独立节点的 `standalone:`，再找到它下面的 `node:`，添加 **`xray_fallback: "目标地址:端口"`，与 `tls:`、`tls_settings:` 同级**。不要写在 `tls_settings:` 里面，也不要直接追加到整个文件最外层。
+本节适用于无面板独立模式、`kernel.type: xray`、VLESS / Trojan、TCP（`tcp` / `raw`）。从 **v1.1.2** 起，普通 TLS（`tls: 1`）与 Reality（`tls: 2`）统一使用 **`standalone.node.fallbacks` 列表**，按 Xray 原生协议层回落处理；独立模式不使用 `xray_fallback` 字段。
 
-适用于 Xray、VLESS / Trojan、TCP/RAW；行为与 xboard-u 面板 Fallback 输入框一致：
+### Reality：原目标与回落列表分别配置
 
-| 安全性 / 内核 | `xray_fallback` 的作用 |
+**`fallbacks` 不覆盖 `tls_settings.dest`，也不替换原 SNI、私钥、Short ID 或 Flow。** 两条路径分别是：
+
+| 连接情况 | 去向 |
 | --- | --- |
-| Xray + 普通 TLS（`tls: 1`） | 生成普通回落，连接 TLS 解密后的明文后端，使用 HTTP/1.1 |
-| Xray + Reality（`tls: 2`） | **覆盖 `tls_settings.dest`**，保留 `server_name`（SNI）、私钥、Short ID 和 Flow；目标应是支持 TLS 1.3、证书匹配原 SNI 的 HTTPS 网站 |
-| sing-box | 忽略这个字段，继续使用原 `tls_settings.dest` |
+| 普通浏览器或未通过 Reality 鉴权 | 原 `tls_settings.dest`（HTTPS / TLS 1.3 目标） |
+| 已通过 Reality 握手，后续 VLESS / Trojan 协议首包或认证无效 | `fallbacks` 选择的后端；收到的是已解密数据，通常使用明文 HTTP 服务 |
+| Reality 与代理协议认证均通过 | 正常代理，按路由处理 |
 
-目标支持 `域名:端口`、`IP:端口`、`[IPv6]:端口`，端口范围 1–65535。不填写、格式无效或协议组合不适用时忽略，沿用原配置。普通 TLS 下的 VLESS 额外 `decryption` 不适用此回落。
-
-例如 Xray 监听 443，本机 Nginx HTTPS 网站监听 `127.0.0.1:8443`，网站证书对应 `site.example.com`。下面是**主配置文件的完整结构**，替换 UUID、Reality 私钥和网站域名后使用。浏览器访问节点 443 会转发到本机网站，合法 Reality 用户继续使用代理。
+下面是**主配置文件的完整示例**。HTTPS 伪装目标和明文回落后端是两项独立配置，不能混用：
 
 ```yaml
 kernel:
@@ -71,12 +71,15 @@ standalone:
     network: tcp
     tls: 2
     flow: xtls-rprx-vision
-    xray_fallback: "127.0.0.1:8443"  # 就在这里，与 tls_settings 同级
     tls_settings:
       private_key: "REPLACE_WITH_YOUR_REALITY_PRIVATE_KEY"
       short_id: "0123456789abcdef"
-      server_name: "site.example.com"  # 保留此 SNI，不改成 127.0.0.1
-      dest: "site.example.com:443"     # Xray 中被上面的有效 xray_fallback 覆盖
+      server_name: "site.example.com"
+      dest: "site.example.com:443"  # 原 HTTPS 伪装目标，fallbacks 不会覆盖它
+    fallbacks:                    # 与 tls_settings 同级；这里接收解密后的数据
+      - dest: "127.0.0.1:8080"
+      - path: /special
+        dest: "127.0.0.1:8081"
   users:
     - id: 1
       uuid: "00000000-0000-4000-8000-000000000001"
@@ -86,15 +89,11 @@ log:
 health_port: 0
 ```
 
-完整示例：[Xray Reality 回落](../examples/standalone-xray-reality-fallback.yml.example)。已有 Reality 独立节点时，只需在该节点的 `node:` 中增加 `xray_fallback`，内核设为 `xray`，其余原有参数保留。若使用 `instances:`，添加位置是**对应实例的 `standalone:` → `node:` 内**，不要在根层新建另一个 `standalone:`。保存后执行 `xbctl restart`，再用 `xbctl log` 确认启动；重启会短暂中断该服务管理的所有实例连接。
+完整文件见 [Xray Reality 原生回落示例](../examples/standalone-xray-reality-fallback.yml.example)。如果要“Reality 偷自己”，应把 **`tls_settings.dest`** 改成自己网站的 HTTPS 地址，例如 `127.0.0.1:8443`；该网站须支持 TLS 1.3，证书匹配原 `server_name`。不要通过 `fallbacks` 覆盖目标。
 
-**从旧写法迁移：**若 Reality 节点写了 `fallbacks: [{dest: "127.0.0.1:8443"}]`，请删除整个 `fallbacks` 列表，改为同级的 `xray_fallback: "127.0.0.1:8443"`。Reality 是目标站转发，不支持将 SNI、ALPN、路径匹配或 PROXY protocol 的普通回落列表直接套用。没有填写新字段时，原 `tls_settings.dest` 写法继续有效。
+Reality 不使用普通 TLS 的 `tls_settings.alpn` 来强制协商协议。当前嵌入的 Xray 26.10.31 在已认证 Reality 连接中协商的 ALPN 为空，非空 `alpn` 规则可能不会命中；通常省略该条件，并保留一条默认规则。规则按实际连接状态匹配，不会将它强制改成 HTTP/1.1。
 
-面板单节点和机器模式仍在面板的 Fallback 输入框填写，无需重复编辑节点端配置；见 [面板节点 Fallback](二次开发功能说明.md#面板节点-fallback)。
-
-### 原生多规则回落：仅普通 TLS
-
-需要按 SNI、ALPN、HTTP 路径匹配时，在同一个 `node:` 内使用原有 `fallbacks:` 列表，与 `tls:`、`tls_settings:` 同级。仅支持独立模式、Xray、VLESS / Trojan、TCP/RAW、普通 TLS（`tls: 1`）。**不要与有效的 `xray_fallback` 同时填写；两者同时配置会明确报错。**
+### 普通 TLS：列表写法不变
 
 完整示例见 [VLESS + TLS 回落](../examples/standalone-vless-fallback.yml.example)。提前准备与域名匹配的证书，并在 `127.0.0.1:8080` 运行明文 HTTP 网站。浏览器访问代理的 HTTPS 端口时，非代理流量会回落到该网站；合法代理用户继续走原代理协议。
 
@@ -150,7 +149,7 @@ instances:
     standalone:
       enabled: true
       node:
-        # 此实例原有的 protocol、端口、tls: 1 等配置保留
+        # 此实例原有的 protocol、端口、tls: 1 或 2 等配置保留
         tls_settings:
           server_name: "proxy.example.com"
           alpn: [http/1.1]
@@ -170,11 +169,17 @@ instances:
 | `path` | 可选，按首包 HTTP 路径匹配，非空时以 `/` 开头；不用于 HTTP/2 路径匹配 |
 | `xver` | 默认为 `0`；`1` / `2` 向后端发送对应版本的 PROXY protocol，后端也必须配置接收 |
 
-省略 `tls_settings.alpn` 时，回落入站默认使用 `[http/1.1]`。需要 HTTP/2 回落时，显式设置 `[h2, http/1.1]` 并提供能处理 h2c 的对应后端。尽量保留一条不指定 `name`、`alpn`、`path` 的默认规则。
+普通 TLS 省略 `tls_settings.alpn` 时，回落入站默认使用 `[http/1.1]`。需要 HTTP/2 回落时，显式设置 `[h2, http/1.1]` 并提供能处理 h2c 的对应后端。尽量保留一条不指定 `name`、`alpn`、`path` 的默认规则。
 
 只写端口号时 Xray 会连接 `localhost`，可能解析到 IPv6；后端只监听 IPv4 时，请像示例一样明确填写 `127.0.0.1:端口`。回落目标不能指回代理自身的监听端口，也不要把网站后端开放到公网。
 
-此入口不能与 VLESS 的额外 `decryption` 加密一起使用。不支持的内核、协议、传输、Reality 组合及无效参数会在加载配置时明确报错。`kernel.custom_config` 仍不合并自定义入站；请使用上述专用配置。
+此入口在 TLS 和 Reality 下均不能与 VLESS 的额外 `decryption` 加密一起使用。不支持的内核、协议、传输、安全性组合及无效参数会在加载配置时明确报错。`kernel.custom_config` 仍不合并自定义入站；请使用上述专用配置。
+
+### 面板模式与版本兼容
+
+面板机器模式和单节点模式在 xboard-u 的 Fallback 输入框填写单目标，节点端转换为一条原生 `fallbacks` 规则，无需重复填写本地列表。面板和节点端须一并升级到 **v1.1.2**，sing-box 继续忽略面板下发的回落字段。
+
+旧版曾将面板 Reality Fallback 用于覆盖目标站；v1.1.2 有意改为原生协议层语义。升级前检查这类节点：HTTPS 伪装目标放在 Reality 设置中，回落目标改为接收解密数据的服务；配置数据不会自动删除或替换。尚未正式发布的单目标独立写法 `xray_fallback` 已取消，请改为上述 `fallbacks` 列表。
 
 ## 与现有机器模式共存
 

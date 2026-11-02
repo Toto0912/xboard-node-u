@@ -58,6 +58,7 @@ func TestPanelFallbackEligibility(t *testing.T) {
 		{Protocol: "vmess", TLS: 1}, {Protocol: "vless", TLS: 0},
 		{Protocol: "vless", TLS: 1, Network: "ws"}, {Protocol: "trojan", TLS: 2, Network: "grpc"},
 		{Protocol: "vless", TLS: 1, Decryption: "mlkem-test"},
+		{Protocol: "vless", TLS: 2, Decryption: "mlkem-test"},
 	} {
 		nc.XrayFallback = "127.0.0.1:8080"
 		if nc.PanelFallbackTarget() != "" {

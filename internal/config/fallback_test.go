@@ -35,7 +35,7 @@ func TestStandaloneFallbackValidation(t *testing.T) {
 		{"shadowsocks", func(n *StandaloneNodeConfig) { n.Protocol = "shadowsocks" }, "xray"},
 		{"ws", func(n *StandaloneNodeConfig) { n.Network = "ws" }, "xray"},
 		{"no-tls", func(n *StandaloneNodeConfig) { n.TLS = 0 }, "xray"},
-		{"reality", func(n *StandaloneNodeConfig) { n.TLS = 2 }, "xray"},
+		{"invalid-tls", func(n *StandaloneNodeConfig) { n.TLS = 3 }, "xray"},
 		{"decryption", func(n *StandaloneNodeConfig) { n.Decryption = "mlkem768x25519plus.native.test" }, "xray"},
 		{"negative-xver", func(n *StandaloneNodeConfig) { n.Fallbacks[0].Xver = -1 }, "xray"},
 		{"large-xver", func(n *StandaloneNodeConfig) { n.Fallbacks[0].Xver = 3 }, "xray"},

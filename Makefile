@@ -1,4 +1,4 @@
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell cat VERSION 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo dev)
 .DEFAULT_GOAL := build
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 REPOSITORY ?= $(GITHUB_REPOSITORY)
