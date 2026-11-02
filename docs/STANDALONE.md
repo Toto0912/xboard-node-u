@@ -38,21 +38,77 @@ xboard-node -c /path/to/config.yml
 
 ## Xray fallback 回落
 
-本节的原生回落列表仅用于无面板独立模式，配置位置是 `standalone.node.fallbacks`。使用 `kernel.type: xray`、VLESS 或 Trojan、TCP（`tcp` / `raw`）和普通 TLS（`tls: 1`）。独立模式中 Reality 的目标站转发继续使用 `tls_settings.dest`，HY2 不使用这个配置。面板单节点和机器模式使用 xboard-u 的单独输入框，见 [二次开发功能说明：面板节点 Fallback](二次开发功能说明.md#面板节点-fallback)，无需在本地填写此列表。
+**直接在节点端正在使用的主配置文件中添加回落配置，不需要另建 `.yml` 文件，也不需要通过 `kernel.custom_config` 引入。** 如果你的主配置文件是 `/etc/xboard/config.yml`，就在这个文件中编辑。本项目安装脚本默认使用 `/etc/xboard-node/config.yml`；实际编辑哪个文件，以服务启动命令的 `-c` 参数为准，不要把配置写进另一个未被加载的文件。
+
+在主配置文件中找到独立节点的 `standalone:`，再找到它下面的 `node:`，将 `fallbacks:` 添加到 `node:` 内，**与 `tls:`、`tls_settings:` 同级**。文档中的 `standalone.node.fallbacks` 只是这三层 YAML 的简写，不是另一个文件，也不是可以直接写在最外层的字段。
+
+本节仅适用于无面板独立模式，要求 `kernel.type: xray`、VLESS 或 Trojan、TCP（`tcp` / `raw`）和普通 TLS（`tls: 1`）。Reality（`tls: 2`）继续在同一个主配置文件的 `standalone.node.tls_settings.dest` 中填写目标，不添加此处的 `fallbacks` 列表；HY2 也不使用这个配置。面板单节点和机器模式使用 xboard-u 的单独输入框，见 [二次开发功能说明：面板节点 Fallback](二次开发功能说明.md#面板节点-fallback)。
 
 完整示例见 [VLESS + TLS 回落](../examples/standalone-vless-fallback.yml.example)。提前准备与域名匹配的证书，并在 `127.0.0.1:8080` 运行明文 HTTP 网站。浏览器访问代理的 HTTPS 端口时，非代理流量会回落到该网站；合法代理用户继续走原代理协议。
 
-在 `standalone.node` 内配置：
+下面是**单独运行一个 VLESS + TLS 回落节点时，主配置文件的完整结构**。替换域名、证书路径、UUID 和端口；已经有独立节点配置时，按这个层级补充 `fallbacks`，不要在文件末尾重复粘贴一份 `standalone:`。
 
 ```yaml
-fallbacks:
-  - dest: "127.0.0.1:8080"
-    xver: 0
-  - name: "other.example.com"
-    dest: "127.0.0.1:8081"
-  - path: "/special"
-    dest: "127.0.0.1:8082"
+kernel:
+  type: xray
+  config_dir: /etc/xboard-node/standalone-vless-fallback
+  log_level: warn
+
+cert:
+  cert_mode: file
+  cert_file: /etc/xboard-node/certs/fullchain.pem
+  key_file: /etc/xboard-node/certs/privkey.pem
+
+standalone:
+  enabled: true
+  node:
+    protocol: vless
+    listen_ip: "0.0.0.0"
+    server_port: 443
+    network: tcp
+    tls: 1
+    flow: xtls-rprx-vision
+    tls_settings:
+      server_name: "proxy.example.com"
+      alpn: [http/1.1]
+
+    # 就在这里添加，与 tls_settings 同级
+    fallbacks:
+      - dest: "127.0.0.1:8080"
+        xver: 0
+
+  users:
+    - id: 1
+      uuid: "00000000-0000-4000-8000-000000000001"
+
+log:
+  level: info
+  output: stdout
+health_port: 0
 ```
+
+**如果主配置文件已经使用 `instances:` 管理多个节点**，就在对应的独立实例下添加。下面只展示回落配置的位置，原有 `kernel`、`cert`、用户及其他实例均保留：
+
+```yaml
+instances:
+  # 原有面板节点或机器实例保留在这个列表中
+
+  - id: standalone-vless-fallback
+    # 此实例原有的 kernel、cert 等配置保留
+    standalone:
+      enabled: true
+      node:
+        # 此实例原有的 protocol、端口、tls: 1 等配置保留
+        tls_settings:
+          server_name: "proxy.example.com"
+          alpn: [http/1.1]
+        fallbacks:
+          - dest: "127.0.0.1:8080"
+            xver: 0
+      # 原有 users 保留在这里，与 node 同级
+```
+
+多条回落规则也写在同一个 `fallbacks:` 列表中，可按需添加 `name`、`alpn` 或 `path` 匹配条件。保存主配置文件后执行 `xbctl restart`，再用 `xbctl log` 查看启动情况；重启会短暂中断该服务管理的所有实例连接。
 
 | 字段 | 含义 |
 | --- | --- |
