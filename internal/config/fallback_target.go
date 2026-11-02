@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// NormalizeFallbackTarget is the panel's optional host:port field. Unlike the
+// NormalizeFallbackTarget validates the optional panel/standalone host:port field. Unlike the
 // standalone native fallbacks list, it does not accept bare ports or sockets.
 func NormalizeFallbackTarget(value string) string {
 	value = strings.TrimSpace(value)

@@ -28,11 +28,12 @@ type StandaloneNodeConfig struct {
 	PluginOpt string `yaml:"plugin_opts,omitempty"`
 	ServerKey string `yaml:"server_key,omitempty"`
 
-	TLS         int            `yaml:"tls,omitempty"`
-	Flow        string         `yaml:"flow,omitempty"`
-	Decryption  string         `yaml:"decryption,omitempty"`
-	TLSSettings map[string]any `yaml:"tls_settings,omitempty"`
-	Fallbacks   []XrayFallback `yaml:"fallbacks,omitempty"`
+	TLS          int            `yaml:"tls,omitempty"`
+	Flow         string         `yaml:"flow,omitempty"`
+	Decryption   string         `yaml:"decryption,omitempty"`
+	TLSSettings  map[string]any `yaml:"tls_settings,omitempty"`
+	XrayFallback string         `yaml:"xray_fallback,omitempty"`
+	Fallbacks    []XrayFallback `yaml:"fallbacks,omitempty"`
 
 	Host       string `yaml:"host,omitempty"`
 	ServerName string `yaml:"server_name,omitempty"`

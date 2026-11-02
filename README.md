@@ -7,11 +7,13 @@
 | sing-box | 1.14.4（含 Xboard 兼容补丁） |
 | Xray-core | 26.10.31（含 Xboard 兼容补丁） |
 
+当前项目版本：**v1.1.1**，与 xboard-u v1.1.1 对齐。
+
 两套内核已嵌入程序，无需另装内核。[变更记录](CHANGELOG.md)
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
-- 新增 Xray Fallback，支持面板下发及无面板独立配置。
+- 新增 Xray Fallback，支持面板下发及无面板独立配置；Reality 回落覆盖目标地址并保留 SNI。
 - 更新双内核，支持 Alpine/OpenRC 安装和统一 `xbctl` 管理。
 
 ## Linux systemd 安装
@@ -34,7 +36,7 @@ apk add --no-cache curl ca-certificates && curl -fsSL https://github.com/Toto091
 
 [单节点](examples/node.yml.example) · [机器模式](examples/machine.yml.example) · [无面板独立运行](examples/standalone.yml.example) · [多实例](config.yml.example)
 
-独立节点配置：[SS](examples/standalone.yml.example) · [VLESS + Reality](examples/standalone-vless-reality.yml.example) · [HY2](examples/standalone-hy2.yml.example) · [VLESS + TLS 回落](examples/standalone-vless-fallback.yml.example)
+独立节点配置：[SS](examples/standalone.yml.example) · [VLESS + Reality](examples/standalone-vless-reality.yml.example) · [HY2](examples/standalone-hy2.yml.example) · [VLESS + TLS 回落](examples/standalone-vless-fallback.yml.example) · [Xray Reality 回落](examples/standalone-xray-reality-fallback.yml.example)
 
 ## 常用管理命令
 

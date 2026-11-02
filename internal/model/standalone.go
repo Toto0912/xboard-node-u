@@ -64,7 +64,7 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		}
 	}
 
-	return &NodeSpec{
+	spec := &NodeSpec{
 		Protocol:            sc.Node.Protocol,
 		ListenIP:            sc.Node.ListenIP,
 		ServerPort:          sc.Node.ServerPort,
@@ -97,6 +97,10 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		AcceptProxyProtocol: sc.Node.AcceptProxyProtocol,
 		Standalone:          standalone,
 	}
+	if cfg.IsStandalone() {
+		spec.XrayFallback = config.NormalizeFallbackTarget(sc.Node.XrayFallback)
+	}
+	return spec
 }
 
 func NodeSpecFromStandaloneValidated(cfg *config.Config) (*NodeSpec, error) {
@@ -109,6 +113,7 @@ func NodeSpecFromStandaloneValidated(cfg *config.Config) (*NodeSpec, error) {
 	if err := ValidateNodeSpec(spec, cfg.Kernel); err != nil {
 		return nil, err
 	}
+	spec.normalizeXrayFallback(cfg.Kernel)
 	return spec, nil
 }
 

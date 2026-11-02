@@ -1,5 +1,14 @@
 # 变更记录
 
+## v1.1.1 — 2026-11-02
+
+- 独立模式新增 `standalone.node.xray_fallback`，复用面板的目标校验和内核处理逻辑；支持 Xray VLESS / Trojan TCP/RAW + TLS / Reality。
+- Reality 使用有效回落目标覆盖 `tls_settings.dest`，保留原 SNI、密钥、Short ID 和 Flow；普通 TLS 使用 HTTP/1.1 明文回落。
+- sing-box 忽略新字段，字段单独变化不会触发多余重载；空值、无效目标及不适用的协议组合保持原行为。
+- 保留旧 `fallbacks` 多规则列表，仍仅用于普通 TLS；与有效单目标同时配置时明确报错，Reality 误用旧列表时提示迁移方法。
+- 补充单实例/多实例配置加载、面板行为对齐、TLS / Reality 实际回落及合法代理回归测试，更新独立运行指南和配置示例。
+- 项目版本与 xboard-u v1.1.1 对齐，内核仍为 sing-box 1.14.4、Xray-core 26.10.31。
+
 ## v1.1.0 — 2026-11-01
 
 - 无面板独立模式新增 `standalone.node.fallbacks`，支持 Xray VLESS / Trojan TCP+TLS 的默认、SNI、ALPN、路径回落及 PROXY protocol。

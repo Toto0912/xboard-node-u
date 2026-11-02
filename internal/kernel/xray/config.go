@@ -307,7 +307,7 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	return base
 }
 
-// Standalone native rules stay separate from the panel's one optional target.
+// Standalone native rules stay separate from the shared optional single target.
 // No setting changes unless a valid fallback was explicitly configured.
 func applyXrayFallbacks(base M, nc *model.NodeSpec) {
 	settings := base["settings"].(M)

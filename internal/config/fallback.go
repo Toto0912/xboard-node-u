@@ -51,6 +51,9 @@ func (n StandaloneNodeConfig) ValidateFallbacks(kernelType string) error {
 	if len(n.Fallbacks) == 0 {
 		return nil
 	}
+	if NormalizeFallbackTarget(n.XrayFallback) != "" {
+		return fmt.Errorf("standalone.node.xray_fallback and fallbacks cannot be combined; use one fallback configuration")
+	}
 	if kernelType != "xray" {
 		return fmt.Errorf("standalone.node.fallbacks requires kernel.type: xray")
 	}
@@ -61,7 +64,7 @@ func (n StandaloneNodeConfig) ValidateFallbacks(kernelType string) error {
 		return fmt.Errorf("standalone.node.fallbacks requires TCP transport (network: tcp or raw)")
 	}
 	if n.TLS != 1 {
-		return fmt.Errorf("standalone.node.fallbacks requires TLS (tls: 1); Reality uses tls_settings.dest instead")
+		return fmt.Errorf("standalone.node.fallbacks requires TLS (tls: 1); for Reality (tls: 2), use xray_fallback: host:port to override tls_settings.dest instead")
 	}
 	if n.Protocol == "vless" && n.Decryption != "" && n.Decryption != "none" {
 		return fmt.Errorf("standalone.node.fallbacks cannot be combined with VLESS decryption")

@@ -131,20 +131,7 @@ func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) 
 	if err := ValidateNodeSpec(spec, kcfg); err != nil {
 		return nil, err
 	}
-	if spec != nil {
-		kind := kcfg.Type
-		if kind == "" {
-			kind = spec.KernelType
-		}
-		kind, _ = normalizeKernelType(kind) // Already checked by ValidateNodeSpec.
-		if kind != "xray" {
-			// Ignoring this for sing-box also prevents needless reloads when only
-			// the Xray-only panel setting changes.
-			spec.XrayFallback = ""
-		} else {
-			spec.XrayFallback = spec.PanelFallbackTarget()
-		}
-	}
+	spec.normalizeXrayFallback(kcfg)
 	return spec, nil
 }
 
