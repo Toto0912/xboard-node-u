@@ -7,12 +7,13 @@
 | sing-box | 1.14.4（含 Xboard 兼容补丁） |
 | Xray-core | 26.10.31（含 Xboard 兼容补丁） |
 
-当前版本：**v1.1.2**，与 xboard-u v1.1.2 对齐。
+当前版本：**v1.1.3**，与 xboard-u v1.1.3 对齐。
 
 两套内核已嵌入程序，无需另装内核。[变更记录](CHANGELOG.md)
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
+- v1.1.3 支持 Sing-box / Xray 原生自定义出站和路由，兼容旧面板出站格式。
 - 新增 Xray Fallback，支持面板下发及无面板独立配置；TLS / Reality 均使用原生协议层回落，保留 Reality 目标。
 - 更新双内核，支持 Alpine/OpenRC 安装和统一 `xbctl` 管理。
 

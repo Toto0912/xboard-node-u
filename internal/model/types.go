@@ -69,6 +69,8 @@ type StandaloneOptions struct {
 }
 
 type OutboundConfig struct {
+	Type     string
+	Extra    map[string]any
 	Tag      string
 	Protocol string
 	Settings map[string]any
@@ -150,5 +152,17 @@ func cloneStringSlice(src []string) []string {
 	}
 	out := make([]string, len(src))
 	copy(out, src)
+	return out
+}
+
+// Unlike legacy optional maps, an explicit native settings:{} must survive.
+func cloneOutboundMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]any, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
 	return out
 }

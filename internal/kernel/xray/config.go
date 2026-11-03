@@ -94,7 +94,10 @@ func outboundConfigToXray(oc model.OutboundConfig) M {
 		"protocol": oc.Protocol,
 		"tag":      oc.Tag,
 	}
-	if len(oc.Settings) > 0 {
+	for key, value := range oc.Extra {
+		m[key] = value
+	}
+	if oc.Settings != nil {
 		m["settings"] = oc.Settings
 	}
 	if oc.ProxyTag != "" {

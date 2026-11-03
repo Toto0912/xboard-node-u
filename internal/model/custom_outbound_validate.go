@@ -44,15 +44,38 @@ func ValidateCustomOutboundsForKernel(outbounds []OutboundConfig, kernelType str
 		if tag == "" {
 			return fmt.Errorf("custom_outbounds[%d].tag is required", i)
 		}
+		if outbound.Type != "" {
+			if kernelType != "" && kernelType != "singbox" {
+				return fmt.Errorf("custom_outbounds[%d]: sing-box native type is not supported by kernel %q", i, kernelType)
+			}
+			if protocol != "" || outbound.Settings != nil || outbound.ProxyTag != "" {
+				return fmt.Errorf("custom_outbounds[%d]: do not mix sing-box type with protocol/settings/proxy_tag", i)
+			}
+			protocol = outbound.Type
+		}
 		if protocol == "" {
 			return fmt.Errorf("custom_outbounds[%d].protocol is required", i)
 		}
-		if kernelType != "" {
-			if _, ok := allowedProtocols[protocol]; !ok {
+		if kernelType != "" && outbound.Type == "" {
+			if _, ok := allowedProtocols[protocol]; !ok && !nativeBuiltin(protocol, kernelType) {
 				return fmt.Errorf("custom_outbounds[%d].protocol %q is not supported by kernel %q", i, outbound.Protocol, kernelType)
 			}
 		}
-		if err := validateOutboundSettings(i, outbound.Settings); err != nil {
+		if outbound.Type == "" {
+			if !(nativeBuiltin(protocol, kernelType) && len(outbound.Settings) == 0) {
+				if err := validateOutboundSettings(i, outbound.Settings); err != nil {
+					return err
+				}
+			}
+			if kernelType == "singbox" && len(outbound.Extra) > 0 {
+				return fmt.Errorf("custom_outbounds[%d]: native top-level fields require sing-box type; protocol/settings is the legacy panel format", i)
+			}
+		} else if value, ok := outbound.Extra["server_port"]; ok {
+			if _, err := asPort(value); err != nil {
+				return fmt.Errorf("custom_outbounds[%d].server_port %w", i, err)
+			}
+		}
+		if err := validateNativeOutboundReferences(i, outbound, exactOutboundTags(outbounds, additionalTags)); err != nil {
 			return err
 		}
 		key := strings.ToLower(tag)
@@ -79,6 +102,9 @@ func ValidateCustomOutboundsForKernel(outbounds []OutboundConfig, kernelType str
 		}
 	}
 
+	if err := validateOutboundCycles(outbounds); err != nil {
+		return err
+	}
 	return nil
 }
 

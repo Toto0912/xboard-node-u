@@ -1,5 +1,14 @@
 # 变更记录
 
+## v1.1.3 — 2026-11-03
+
+- 支持面板下发 Sing-box 原生出站，保留 type、detour、TLS、transport 等顶层及嵌套字段；保留 Xray 原生 streamSettings、proxySettings、mux 等字段。
+- 兼容旧 protocol/settings/proxy_tag 出站格式；Sing-box 链式出站转换为原生 detour。
+- 原生路由按实际内核检查格式和出站引用，检查出站依赖循环，错误配置明确拒绝；原生规则不做跨内核转换。
+- 面板保存、重开、REST / WebSocket 下发保留空对象 {}，增加格式提示和原生配置文档；不新增数据库迁移。
+- 面板与节点端版本统一为 v1.1.3，内核版本不变。
+
+
 ## v1.1.2 — 2026-11-02
 
 - 独立模式的 `standalone.node.fallbacks` 支持 Xray VLESS / Trojan TCP/RAW + TLS / Reality，统一使用原生列表；不增加单目标独立字段。

@@ -36,6 +36,9 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 	if err := ValidateCustomRouteRules(n.CustomRouteRules, kernelType, availableTags); err != nil {
 		return fmt.Errorf("validate custom route rules: %w", err)
 	}
+	if err := ValidateNativeRoutes(n.CustomRoutes, kernelType, exactOutboundTags(n.CustomOutbounds, additionalTags)); err != nil {
+		return fmt.Errorf("validate custom routes: %w", err)
+	}
 	if err := validateTransportKernel(n.Network, kernelType); err != nil {
 		return err
 	}

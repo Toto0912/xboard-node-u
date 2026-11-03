@@ -178,6 +178,19 @@ func decodeWeakRaw(input map[string]interface{}, output interface{}) error {
 		TagName:          "json",
 		DecodeHook: mapstructure.ComposeDecodeHookFunc(
 			func(f, t reflect.Type, v interface{}) (interface{}, error) {
+				if t == reflect.TypeOf(OutboundConfig{}) && f.Kind() == reflect.Map {
+					// mapstructure does not invoke json.Unmarshaler. Use the
+					// same lossless codec for REST and nested WS payloads.
+					data, err := json.Marshal(v)
+					if err != nil {
+						return nil, err
+					}
+					var outbound OutboundConfig
+					if err := json.Unmarshal(data, &outbound); err != nil {
+						return nil, err
+					}
+					return outbound, nil
+				}
 				// Handle []interface{} -> StringOrArray
 				if t == reflect.TypeOf(StringOrArray("")) && f.Kind() == reflect.Slice {
 					arr, _ := v.([]interface{})

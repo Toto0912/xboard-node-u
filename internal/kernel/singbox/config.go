@@ -81,6 +81,13 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 // into a sing-box outbound object. sing-box uses a flat layout where all
 // protocol-specific fields sit at the top level alongside "type" and "tag".
 func outboundConfigToSingbox(oc model.OutboundConfig) M {
+	if oc.Type != "" {
+		m := M{"type": oc.Type, "tag": oc.Tag}
+		for key, value := range oc.Extra {
+			m[key] = value
+		}
+		return m
+	}
 	m := M{
 		"type": oc.Protocol,
 		"tag":  oc.Tag,
@@ -132,7 +139,7 @@ func outboundConfigToSingbox(oc model.OutboundConfig) M {
 	}
 
 	if oc.ProxyTag != "" {
-		m["proxy_tag"] = oc.ProxyTag
+		m["detour"] = oc.ProxyTag
 	}
 	return m
 }

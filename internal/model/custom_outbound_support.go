@@ -4,6 +4,7 @@ func OutboundSupportMatrix() map[string]KernelOutboundSupport {
 	return map[string]KernelOutboundSupport{
 		"xray": {
 			Protocols: []string{
+				"direct", "freedom", "block", "blackhole", "dns", "loopback", "hysteria", "masque",
 				"vmess",
 				"vless",
 				"trojan",
