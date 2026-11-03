@@ -82,3 +82,26 @@ func TestNodeSpecFromPanelValidated(t *testing.T) {
 		}
 	})
 }
+
+func TestPanelTransportMigrationIsKernelSpecific(t *testing.T) {
+	for _, network := range []string{"h2", "http", "quic"} {
+		t.Run(network, func(t *testing.T) {
+			configured := &panel.NodeConfig{Protocol: "vless", ServerPort: 9443, Network: network}
+			_, err := NodeSpecFromPanelValidated(configured, config.KernelConfig{Type: "xray"})
+			if err == nil || !strings.Contains(err.Error(), "removed in Xray") {
+				t.Fatalf("expected Xray migration error, got %v", err)
+			}
+			if _, err := NodeSpecFromPanelValidated(configured, config.KernelConfig{Type: "singbox"}); err != nil {
+				t.Fatalf("Sing-box transport should remain available: %v", err)
+			}
+		})
+	}
+	for _, network := range []string{"ws", "grpc", "httpupgrade"} {
+		if _, err := NodeSpecFromPanelValidated(&panel.NodeConfig{
+			Protocol: "vless", ServerPort: 9443, Network: network,
+		}, config.KernelConfig{Type: "xray"}); err != nil {
+			t.Errorf("supported Xray transport %q: %v", network, err)
+		}
+	}
+
+}

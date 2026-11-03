@@ -1,5 +1,13 @@
 # 变更记录
 
+## v2.0.0 — 2026-11-03
+
+- 配套 xboard-u CDN 分离，保持既有节点通信结构及三种部署模式。
+- 补齐 Sing-box gRPC 超时、HTTP 和 HTTPUpgrade 参数映射。
+- Xray 将旧 WebSocket headers.Host 映射为独立 host，明确拒绝已移除的旧 HTTP/H2/H3 和 V2Ray QUIC。
+- 增加本地 TLS 反代 XHTTP、Reality 与协议层回落下行流量验证。
+- 两端版本统一为 v2.0.0；内核仍为 Sing-box 1.14.4 与 Xray 26.10.31。
+
 ## v1.1.3 — 2026-11-03
 
 - 支持面板下发 Sing-box 原生出站，保留 type、detour、TLS、transport 等顶层及嵌套字段；保留 Xray 原生 streamSettings、proxySettings、mux 等字段。

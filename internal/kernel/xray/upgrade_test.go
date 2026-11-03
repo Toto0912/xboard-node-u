@@ -3,10 +3,12 @@ package xray
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -16,12 +18,17 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/panel"
 	xnet "github.com/xtls/xray-core/common/net"
 	xcore "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	"io"
 	"math/big"
 	"net"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -225,4 +232,143 @@ func certPin(cert kernel.TLSCert) string {
 	block, _ := pem.Decode(cert.CertPEM)
 	sum := sha256.Sum256(block.Bytes)
 	return hex.EncodeToString(sum[:])
+}
+
+func TestPanelCDNXHTTPThroughLocalTLSProxy(t *testing.T) {
+	t.Run("tls-edge", func(t *testing.T) { testPanelCDNXHTTP(t, false) })
+	t.Run("tls-upload-reality-downlink", func(t *testing.T) { testPanelCDNXHTTP(t, true) })
+}
+
+func testPanelCDNXHTTP(t *testing.T, realityDownlink bool) {
+	t.Helper()
+	originPort := freeTestPort(t)
+	spec, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{
+		Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: originPort,
+		Network: "xhttp", NetworkSettings: map[string]any{"path": "/xhttp", "mode": "packet-up"},
+		CustomRoutes: []map[string]any{{"type": "field", "ip": []string{"127.0.0.1/32"}, "outboundTag": "direct"}},
+	}, config.KernelConfig{Type: "xray"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origin := New(config.KernelConfig{Type: "xray", LogLevel: "error", CustomOutbound: []map[string]any{
+		{"tag": "direct", "protocol": "freedom", "settings": map[string]any{
+			"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.1/32"}}},
+		}},
+	}})
+	t.Cleanup(func() { origin.Stop() })
+	if err := origin.Start(spec, testUsers[:1], kernel.TLSCert{}); err != nil {
+		t.Fatal(err)
+	}
+
+	cert := upgradeCertificate(t)
+	pair, err := tls.X509KeyPair(cert.CertPEM, cert.KeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(originPort))}
+	edge := httptest.NewUnstartedServer(httputil.NewSingleHostReverseProxy(target))
+	edge.EnableHTTP2 = true
+	edge.TLS = &tls.Config{Certificates: []tls.Certificate{pair}}
+	edge.StartTLS()
+	t.Cleanup(edge.Close)
+
+	xhttp := map[string]any{"path": "/xhttp", "mode": "packet-up"}
+	if realityDownlink {
+		key, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := freeTestPort(t)
+		reality := New(config.KernelConfig{Type: "xray", LogLevel: "error"})
+		fallback, err := model.NodeSpecFromPanelValidated(&panel.NodeConfig{
+			Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: port,
+			Network: "tcp", TLS: 2, XrayFallback: panel.OptionalFallbackTarget(target.Host),
+			TLSSettings: map[string]any{
+				"dest": edge.Listener.Addr().String(), "server_name": "localhost",
+				"private_key": base64.RawURLEncoding.EncodeToString(key.Bytes()), "short_id": "0123456789abcdef",
+			},
+		}, config.KernelConfig{Type: "xray"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(reality.Stop)
+		if err := reality.Start(fallback, testUsers[:1], kernel.TLSCert{}); err != nil {
+			t.Fatal(err)
+		}
+		waitRealityFallbackProbe(t, edge.Listener.Addr().String())
+		xhttp["extra"] = map[string]any{"downloadSettings": map[string]any{
+			"address": "127.0.0.1", "port": port, "network": "xhttp", "security": "reality",
+			"realitySettings": map[string]any{
+				"serverName": "localhost", "fingerprint": "chrome",
+				"password": base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), "shortId": "0123456789abcdef",
+			},
+			"xhttpSettings": map[string]any{"path": "/xhttp"},
+		}}
+	}
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { echo.Close() })
+	go func() {
+		conn, err := echo.Accept()
+		if err == nil {
+			defer conn.Close()
+			_, _ = io.Copy(conn, conn)
+		}
+	}()
+
+	outbound := map[string]any{
+		"protocol": "vless",
+		"settings": map[string]any{"vnext": []any{map[string]any{
+			"address": "127.0.0.1", "port": edge.Listener.Addr().(*net.TCPAddr).Port,
+			"users": []any{map[string]any{"id": testUsers[0].UUID, "encryption": "none"}},
+		}}},
+		"streamSettings": map[string]any{
+			"network": "xhttp", "security": "tls",
+			"xhttpSettings": xhttp,
+			"tlsSettings":   map[string]any{"serverName": "localhost", "pinnedPeerCertSha256": certPin(cert)},
+		},
+	}
+	raw, err := json.Marshal(map[string]any{"outbounds": []any{outbound}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConfig, err := serial.LoadJSONConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := xcore.New(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := xnet.ParseDestination("tcp:" + echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, err := xcore.Dial(ctx, client, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
+	payload := []byte("xhttp through local tls proxy")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo mismatch: %q", got)
+	}
 }

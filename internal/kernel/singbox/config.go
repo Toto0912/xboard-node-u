@@ -807,57 +807,38 @@ func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLS
 }
 
 func applyTransport(base M, nc *model.NodeSpec) {
-	if nc.Network == "" || nc.Network == "tcp" {
+	if nc.Network == "" || nc.Network == "tcp" || nc.Network == "raw" {
 		return
 	}
 
 	transport := M{"type": nc.Network}
+	params := nc.NetworkSettings
+	switch nc.Network {
+	case "ws":
+		copyTransportFields(transport, params, "path", "headers", "max_early_data", "early_data_header_name")
+		if host, ok := params["host"]; ok && transport["headers"] == nil {
+			transport["headers"] = M{"Host": host}
+		}
+	case "grpc":
+		copyTransportFields(transport, params, "service_name", "idle_timeout", "ping_timeout")
+		if name, ok := params["serviceName"]; ok {
+			transport["service_name"] = name
+		}
+	case "httpupgrade":
+		copyTransportFields(transport, params, "path", "host", "headers")
+	case "h2", "http":
+		transport["type"] = "http"
+		copyTransportFields(transport, params, "path", "host", "method", "headers", "idle_timeout", "ping_timeout")
+	}
+	base["transport"] = transport
+}
 
-	if nc.NetworkSettings != nil {
-		switch nc.Network {
-		case "ws":
-			if v, ok := nc.NetworkSettings["path"]; ok {
-				transport["path"] = v
-			}
-			if v, ok := nc.NetworkSettings["headers"]; ok {
-				transport["headers"] = v
-			}
-			if v, ok := nc.NetworkSettings["host"]; ok {
-				if transport["headers"] == nil {
-					transport["headers"] = M{"Host": v}
-				}
-			}
-			if v, ok := nc.NetworkSettings["max_early_data"]; ok {
-				transport["max_early_data"] = v
-			}
-			if v, ok := nc.NetworkSettings["early_data_header_name"]; ok {
-				transport["early_data_header_name"] = v
-			}
-		case "grpc":
-			if v, ok := nc.NetworkSettings["serviceName"]; ok {
-				transport["service_name"] = v
-			} else if v, ok := nc.NetworkSettings["service_name"]; ok {
-				transport["service_name"] = v
-			}
-		case "httpupgrade":
-			if v, ok := nc.NetworkSettings["path"]; ok {
-				transport["path"] = v
-			}
-			if v, ok := nc.NetworkSettings["host"]; ok {
-				transport["host"] = v
-			}
-		case "h2", "http":
-			transport["type"] = "http"
-			if v, ok := nc.NetworkSettings["path"]; ok {
-				transport["path"] = v
-			}
-			if v, ok := nc.NetworkSettings["host"]; ok {
-				transport["host"] = v
-			}
+func copyTransportFields(transport M, params map[string]any, fields ...string) {
+	for _, field := range fields {
+		if value, ok := params[field]; ok {
+			transport[field] = value
 		}
 	}
-
-	base["transport"] = transport
 }
 
 // buildTLSConfig returns sing-box inbound TLS options when certificate material

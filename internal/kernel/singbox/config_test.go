@@ -887,3 +887,30 @@ func TestExtractECHInbound(t *testing.T) {
 		})
 	}
 }
+
+func TestPanelNativeSingBoxTransportOptions(t *testing.T) {
+	for _, test := range []struct {
+		network string
+		input   M
+		want    M
+	}{
+		{"grpc", M{"serviceName": "svc", "idle_timeout": "15s", "ping_timeout": "20s", "permit_without_stream": true},
+			M{"type": "grpc", "service_name": "svc", "idle_timeout": "15s", "ping_timeout": "20s"}},
+		{"http", M{"path": "/http", "method": "GET", "headers": M{"X-Test": "value"}, "ping_timeout": "10s"},
+			M{"type": "http", "path": "/http", "method": "GET", "headers": M{"X-Test": "value"}, "ping_timeout": "10s"}},
+		{"httpupgrade", M{"path": "/upgrade", "headers": M{"X-Test": "value"}},
+			M{"type": "httpupgrade", "path": "/upgrade", "headers": M{"X-Test": "value"}}},
+	} {
+		t.Run(test.network, func(t *testing.T) {
+			base := M{}
+			applyTransport(base, testNodeSpec(&panel.NodeConfig{Network: test.network, NetworkSettings: test.input}))
+			got := base["transport"].(M)
+			if len(got) != len(test.want) {
+				t.Fatalf("unexpected transport: %#v", got)
+			}
+			for key, value := range test.want {
+				assertMapValue(t, got, key, value)
+			}
+		})
+	}
+}

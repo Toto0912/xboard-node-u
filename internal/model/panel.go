@@ -1,6 +1,9 @@
 package model
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
@@ -139,6 +142,12 @@ func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) 
 			kind = spec.KernelType
 		}
 		kind, _ = normalizeKernelType(kind) // Already checked by ValidateNodeSpec.
+		if kind == "xray" {
+			switch strings.ToLower(strings.TrimSpace(spec.Network)) {
+			case "h2", "h3", "http", "quic":
+				return nil, fmt.Errorf("panel transport %q is removed in Xray; migrate the node to an explicitly configured supported transport", spec.Network)
+			}
+		}
 		if kind != "xray" {
 			// Ignoring this for sing-box also prevents needless reloads when only
 			// the Xray-only panel setting changes.

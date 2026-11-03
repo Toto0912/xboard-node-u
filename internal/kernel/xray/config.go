@@ -499,7 +499,7 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 	ss["network"] = network
 
 	switch network {
-	case "ws":
+	case "ws", "websocket":
 		wsSettings := M{}
 		if nc.NetworkSettings != nil {
 			if v, ok := nc.NetworkSettings["path"]; ok {
@@ -508,13 +508,17 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 			headers := M{}
 			if v, ok := nc.NetworkSettings["headers"]; ok {
 				if headersMap, ok := v.(map[string]interface{}); ok {
-					for k, val := range headersMap {
-						headers[k] = val
+					for name, value := range headersMap {
+						if strings.EqualFold(name, "host") {
+							wsSettings["host"] = value
+						} else {
+							headers[name] = value
+						}
 					}
 				}
 			}
-			if v, ok := nc.NetworkSettings["host"]; ok {
-				headers["Host"] = v
+			if host, ok := nc.NetworkSettings["host"]; ok {
+				wsSettings["host"] = host
 			}
 			if len(headers) > 0 {
 				wsSettings["headers"] = headers
