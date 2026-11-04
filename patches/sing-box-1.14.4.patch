@@ -1531,3 +1531,16 @@ index 00000000..949853e9
 +		return it.AlterId
 +	}))
 +}
+diff --git a/dns/transport/local/local_resolved_linux.go b/dns/transport/local/local_resolved_linux.go
+--- a/dns/transport/local/local_resolved_linux.go
++++ b/dns/transport/local/local_resolved_linux.go
+@@ -136,7 +136,8 @@ func NewResolvedResolver(ctx context.Context, logger logger.ContextLogger) (Resol
+ 	if interfaceMonitor == nil {
+ 		return nil, os.ErrInvalid
+ 	}
+-	systemBus, err := dbus.SystemBus()
++	// Each resolver closes its connection independently; do not share the system bus connection.
++	systemBus, err := dbus.ConnectSystemBus()
+ 	if err != nil {
+ 		return nil, err
+ 	}

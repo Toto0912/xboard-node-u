@@ -2,6 +2,8 @@
 
 ## v2.0.0 — 2026-11-03
 
+- 2026-11-05 修复 sing-box 多实例共存时，一个实例重建关闭共享 D-Bus 连接，导致其他实例 DNS 解析失败的问题。
+
 - 配套 xboard-u CDN 分离，保持既有节点通信结构及三种部署模式。
 - 补齐 Sing-box gRPC 超时、HTTP 和 HTTPUpgrade 参数映射。
 - Xray 将旧 WebSocket headers.Host 映射为独立 host，明确拒绝已移除的旧 HTTP/H2/H3 和 V2Ray QUIC。
