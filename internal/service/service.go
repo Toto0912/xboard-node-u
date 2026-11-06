@@ -989,9 +989,6 @@ func (s *Service) pushReportAsync() {
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
 			}
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
-			}
 			s.pushBackoff.onFailure()
 			return
 		}
@@ -1135,11 +1132,6 @@ func (s *Service) sendDeviceBatch() {
 	}
 
 	devices := s.tracker.FlushAliveIPs()
-	// FlushAliveIPs returns nil if no changes since last flush
-	if devices == nil {
-		nlog.Core().Debug("device snapshot unchanged, skipping")
-		return
-	}
 	s.sink.ReportDevices(s.wsClient, devices)
 	nlog.Core().Debug("device snapshot sent", "users", len(devices))
 }

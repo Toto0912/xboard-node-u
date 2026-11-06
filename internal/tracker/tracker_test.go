@@ -164,10 +164,33 @@ func TestFlushAliveIPs(t *testing.T) {
 		t.Errorf("user 2 IPs: got %d, want 1", len(flushed[2]))
 	}
 
-	// Without another Process call, hash is same → returns nil (skip duplicate)
+	// Unchanged snapshots still refresh the panel's expiring device state.
 	flushed2 := tr.FlushAliveIPs()
-	if flushed2 != nil {
-		t.Errorf("expected nil on duplicate flush, got %v", flushed2)
+	if len(flushed2[1]) != 2 || len(flushed2[2]) != 1 {
+		t.Errorf("expected a complete heartbeat snapshot, got %v", flushed2)
+	}
+}
+
+func TestDeviceSnapshotsAreOwnedByEachReport(t *testing.T) {
+	tr := New()
+	tr.Process(nil, map[int]map[string]bool{1: {"192.0.2.1": true}}, 1)
+	first := tr.FlushAliveIPs()
+	tr.Process(nil, map[int]map[string]bool{2: {"192.0.2.2": true}}, 1)
+	second := tr.FlushAliveIPs()
+	if len(first[1]) != 1 || len(first[2]) != 0 || len(second[2]) != 1 {
+		t.Fatalf("snapshot was overwritten: first=%v second=%v", first, second)
+	}
+	second[2][0] = "changed by consumer"
+	if next := tr.FlushAliveIPs(); next[2][0] != "192.0.2.2" {
+		t.Fatal("consumer mutated tracker state")
+	}
+	// A failed send does not consume state. Both channels and retries get it.
+	if next := tr.FlushAliveIPs(); len(next[2]) != 1 {
+		t.Fatal("failed send suppressed a retry")
+	}
+	tr.Process(nil, nil, 0)
+	if empty := tr.FlushAliveIPs(); empty == nil || len(empty) != 0 {
+		t.Fatal("last disconnect must produce an explicit empty snapshot")
 	}
 }
 

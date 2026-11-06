@@ -55,7 +55,7 @@ type Kernel interface {
 	// user set, binds listeners, and begins accepting connections.
 	// Calling Start on an already-running kernel stops the old instance first.
 	Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls TLSCert) error
-	// Stop gracefully shuts down the kernel, draining active connections.
+	// Stop shuts down the kernel and releases its listeners before returning.
 	Stop()
 	// IsRunning returns whether the kernel is currently accepting connections.
 	IsRunning() bool

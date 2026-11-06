@@ -38,9 +38,6 @@ import (
 )
 
 const (
-	// drainTimeout is how long Stop waits for in-flight connections to finish
-	// before hard-killing the instance. Skipped during hot-reload for speed.
-	drainTimeout = 5 * time.Second
 	// startTimeout caps how long instance.Start() may block.
 	startTimeout = 30 * time.Second
 )
@@ -179,8 +176,6 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	x.running.Store(true)
 	x.mu.Unlock()
 
-	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
@@ -215,7 +210,7 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	return x.Start(nodeConfig, users, tls)
 }
 
-// Stop gracefully shuts down the kernel, draining active connections first.
+// Stop closes the instance synchronously so no listener outlives its service.
 func (x *Xray) Stop() {
 	x.lifecycleMu.Lock()
 	defer x.lifecycleMu.Unlock()
@@ -228,10 +223,14 @@ func (x *Xray) Stop() {
 	x.limitDispatcher = nil
 	x.mu.Unlock()
 
-	if ld != nil {
-		drainConns(ld, drainTimeout)
+	if inst != nil {
+		if err := inst.Close(); err != nil {
+			nlog.Core().Warn("xray: close instance", "error", err)
+		}
 	}
-	closeOld(inst, ld)
+	if ld != nil {
+		ld.ResetConns()
+	}
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -697,41 +696,6 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	case <-time.After(timeout):
 		go inst.Close()
 		return fmt.Errorf("start xray: timeout after %v", timeout)
-	}
-}
-
-// closeOld shuts down a previously running instance and its dispatcher.
-// Recycling happens in a background goroutine to prevent the main thread
-// from blocking on slow connection draining, enabling "hitless" reload.
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
-	if inst == nil {
-		return
-	}
-	go func() {
-		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
-		// We use a much longer timeout here than the default Stop() because
-		// it's running in background and doesn't block new user connections.
-		if ld != nil {
-			drainConns(ld, 5*time.Minute)
-		}
-		// 2. Hard close
-		inst.Close()
-		if ld != nil {
-			ld.ResetConns()
-		}
-		nlog.Core().Debug("xray: old instance recycled")
-	}()
-}
-
-// drainConns waits up to timeout for the dispatcher's active connections to
-// reach zero. Used only during graceful Stop, not during hot-reload.
-func drainConns(ld *LimitDispatcher, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ld.connCount.Load() == 0 {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 

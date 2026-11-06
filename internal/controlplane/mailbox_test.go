@@ -1,10 +1,31 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 )
+
+func TestNodeMailboxPreservesConfigAcrossRepeatedSync(t *testing.T) {
+	// REST normalization produces non-nil empty slices. Copying through the
+	// machine mailbox must not change their JSON/hash and restart a live node.
+	for _, spec := range []*model.NodeSpec{
+		{Protocol: "vless"},
+		{Protocol: "vless", Routes: []model.RouteRule{}, CustomOutbounds: []model.OutboundConfig{}, CustomRouteRules: []model.CustomRouteRule{}},
+	} {
+		before, _ := json.Marshal(spec)
+		mb := NewNodeMailbox()
+		mb.SeedBaseline(nil, spec)
+		mb.MarkReady()
+		mb.Apply(Event{Type: EventSyncConfig, Config: spec})
+		state := mb.DrainIfReady()
+		after, _ := json.Marshal(state.Config)
+		if string(before) != string(after) {
+			t.Fatalf("mailbox changed config: before=%s after=%s", before, after)
+		}
+	}
+}
 
 func TestNodeMailboxLatestStateAndNotifyCollapse(t *testing.T) {
 	mb := NewNodeMailbox()
