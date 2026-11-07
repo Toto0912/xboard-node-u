@@ -45,6 +45,10 @@ func TestStandaloneRealityNativeFallbacksAndAuthorizedProxy(t *testing.T) {
 	camouflage.StartTLS()
 	defer camouflage.Close()
 	target := strings.TrimPrefix(camouflage.URL, "https://")
+	targetHost, targetPort, err := net.SplitHostPort(target)
+	if err != nil {
+		t.Fatal(err)
+	}
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(cert.CertPEM)
 	key, err := ecdh.X25519().GenerateKey(rand.Reader)
@@ -61,7 +65,7 @@ func TestStandaloneRealityNativeFallbacksAndAuthorizedProxy(t *testing.T) {
 			kcfg := config.KernelConfig{Type: "xray", LogLevel: "error", CustomOutbound: []map[string]any{{"tag": "direct", "protocol": "freedom", "settings": map[string]any{"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.1/32"}}}}}}}
 			cfg := &config.Config{Kernel: kcfg, Standalone: &config.StandaloneConfig{Enabled: true,
 				Node: config.StandaloneNodeConfig{Protocol: protocol, ListenIP: "127.0.0.1", ServerPort: port, Network: "raw", TLS: 2, Flow: flow,
-					TLSSettings: map[string]any{"server_name": "localhost", "dest": target, "private_key": base64.RawURLEncoding.EncodeToString(key.Bytes()), "short_id": "0123456789abcdef"},
+					TLSSettings: map[string]any{"server_name": "localhost", "dest": targetHost, "server_port": targetPort, "private_key": base64.RawURLEncoding.EncodeToString(key.Bytes()), "short_id": "0123456789abcdef"},
 					Fallbacks: []config.XrayFallback{
 						{Dest: strings.TrimPrefix(defaultSite.URL, "http://")},
 						{Path: "/special", Dest: strings.TrimPrefix(pathSite.URL, "http://")},

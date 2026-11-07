@@ -664,19 +664,31 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 		}
 	}
 
-	if dest, ok := nc.TLSSettings["dest"]; ok {
-		destStr := fmt.Sprintf("%v", dest)
-		reality["dest"] = destStr
-	}
 	if sn, ok := nc.TLSSettings["server_name"]; ok {
 		reality["serverNames"] = []string{fmt.Sprintf("%v", sn)}
-		if _, exists := reality["dest"]; !exists {
+	}
+	// The panel supplies a target host and port separately. Preserve native
+	// host:port / Unix socket / port-only targets used by standalone configs.
+	dest := ""
+	if value := nc.TLSSettings["dest"]; value != nil {
+		dest = strings.TrimSpace(fmt.Sprint(value))
+	}
+	if dest == "" && nc.TLSSettings["server_name"] != nil {
+		dest = strings.TrimSpace(fmt.Sprint(nc.TLSSettings["server_name"]))
+	}
+	if dest != "" {
+		_, _, splitErr := net.SplitHostPort(dest)
+		_, portOnlyErr := strconv.ParseUint(dest, 10, 16)
+		host := strings.Trim(dest, "[]")
+		isHost := !strings.Contains(dest, ":") || net.ParseIP(host) != nil
+		if splitErr != nil && portOnlyErr != nil && isHost && !strings.HasPrefix(dest, "/") && !strings.HasPrefix(dest, "@") {
 			port := "443"
 			if p, err := strconv.Atoi(fmt.Sprint(nc.TLSSettings["server_port"])); err == nil && p > 0 && p <= 65535 {
 				port = strconv.Itoa(p)
 			}
-			reality["dest"] = net.JoinHostPort(strings.Trim(fmt.Sprint(sn), "[]"), port)
+			dest = net.JoinHostPort(host, port)
 		}
+		reality["dest"] = dest
 	}
 
 	return reality
