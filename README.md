@@ -13,7 +13,6 @@
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
-- 支持通过服务端本地 `kernel.custom_config` 自定义 DNS、出站和路由等高级配置，适用于机器、单节点及独立模式，详见 [自定义内核配置](docs/CUSTOM-CONFIG.md)。
 - v2.1.0 修复 Xray 并发访问、停止时监听释放及机器模式重连，优化设备快照与在线心跳。
 - v2.0.0 配套面板 CDN 分离，补齐 Sing-box 传输参数映射及 Xray WebSocket Host 迁移。
 - v1.1.3 支持 Sing-box / Xray 原生自定义出站和路由，兼容旧面板出站格式。
@@ -41,6 +40,8 @@ apk add --no-cache curl ca-certificates && curl -fsSL https://github.com/Toto091
 [单节点](examples/node.yml.example) · [机器模式](examples/machine.yml.example) · [无面板独立运行](examples/standalone.yml.example) · [多实例](config.yml.example)
 
 独立节点配置：[SS](examples/standalone.yml.example) · [VLESS + Reality](examples/standalone-vless-reality.yml.example) · [HY2](examples/standalone-hy2.yml.example) · [VLESS + TLS 回落](examples/standalone-vless-fallback.yml.example) · [Xray Reality 回落](examples/standalone-xray-reality-fallback.yml.example)
+
+支持通过服务端本地 `kernel.custom_config` 自定义 DNS、出站和路由等高级配置，适用于机器、单节点及独立模式，详见 [自定义内核配置](docs/CUSTOM-CONFIG.md)。
 
 ## 常用管理命令
 
