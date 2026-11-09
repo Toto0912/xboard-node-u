@@ -2,6 +2,8 @@
 
 在 **xboard-u → 节点管理 → 编辑节点 → 高级设置 → 自定义出站** 填写 JSON 数组，然后保存高级设置及外层节点。这里是面板设置，不是服务器本地 `config.yml`。面板与 xboard-node-u 均须升级到 v1.1.3。
 
+若需由服务器本地管理出站，可使用另一入口 [`kernel.custom_config`](docs/CUSTOM-CONFIG.md)，在文件顶层的 `outbounds` 数组中填写原生配置；本地与面板出站可同时存在，标签不要重复。
+
 ## Sing-box 原生格式
 
 服务端实际使用 Sing-box 时，可以直接使用官方原生结构，不必套 `protocol/settings`：

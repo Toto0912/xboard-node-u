@@ -13,6 +13,7 @@
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
+- 支持通过服务端本地 `kernel.custom_config` 自定义 DNS、出站和路由等高级配置，适用于机器、单节点及独立模式，详见 [自定义内核配置](docs/CUSTOM-CONFIG.md)。
 - v2.1.0 修复 Xray 并发访问、停止时监听释放及机器模式重连，优化设备快照与在线心跳。
 - v2.0.0 配套面板 CDN 分离，补齐 Sing-box 传输参数映射及 Xray WebSocket Host 迁移。
 - v1.1.3 支持 Sing-box / Xray 原生自定义出站和路由，兼容旧面板出站格式。
@@ -67,3 +68,7 @@ xbctl upgrade    # 升级到最新正式版
 
 - [自定义路由](docs-custom-routes.md)
 - [自定义出站](docs-custom-outbounds.md)
+
+## 服务端本地高级配置
+
+通过 `kernel.custom_config` 引用 JSON 或 YAML 文件，在服务端自定义 DNS、出站、路由等内核配置。支持机器模式、面板单节点模式及无面板独立运行。配置位置、共享方式、DNS 主备示例和字段合并规则见 [自定义内核配置指南](docs/CUSTOM-CONFIG.md)。
