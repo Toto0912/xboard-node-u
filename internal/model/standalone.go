@@ -87,6 +87,7 @@ func NodeSpecFromStandalone(cfg *config.Config) *NodeSpec {
 		TLSSettings:         cloneAnyMap(sc.Node.TLSSettings),
 		Host:                sc.Node.Host,
 		ServerName:          sc.Node.ServerName,
+		HY2Settings:         sc.Node.HY2Settings.Clone(),
 		Version:             sc.Node.Version,
 		UpMbps:              sc.Node.UpMbps,
 		DownMbps:            sc.Node.DownMbps,

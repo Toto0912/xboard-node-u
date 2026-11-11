@@ -32,6 +32,7 @@ type NodeSpec struct {
 	Host       string
 	ServerName string
 
+	HY2Settings  *config.HY2Settings `json:",omitempty"`
 	Version      int
 	UpMbps       int
 	DownMbps     int

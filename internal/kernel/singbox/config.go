@@ -649,6 +649,18 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	if nc.Version == 2 {
 		base["type"] = "hysteria2"
+		if nc.UpMbps > 0 {
+			base["up_mbps"] = nc.UpMbps
+		}
+		if nc.DownMbps > 0 {
+			base["down_mbps"] = nc.DownMbps
+		}
+		if nc.HY2Settings.AutoBandwidth() {
+			base["ignore_client_bandwidth"] = nc.UpMbps == 0 && nc.DownMbps == 0
+		}
+		if nc.HY2Settings != nil && len(nc.HY2Settings.Masquerade) > 0 {
+			base["masquerade"] = nc.HY2Settings.Clone().Masquerade
+		}
 
 		userList := make([]M, 0, len(users))
 		for _, u := range users {

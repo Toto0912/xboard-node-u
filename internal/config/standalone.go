@@ -37,11 +37,12 @@ type StandaloneNodeConfig struct {
 	Host       string `yaml:"host,omitempty"`
 	ServerName string `yaml:"server_name,omitempty"`
 
-	Version      int    `yaml:"version,omitempty"`
-	UpMbps       int    `yaml:"up_mbps,omitempty"`
-	DownMbps     int    `yaml:"down_mbps,omitempty"`
-	Obfs         string `yaml:"obfs,omitempty"`
-	ObfsPassword string `yaml:"obfs_password,omitempty"`
+	HY2Settings  *HY2Settings `yaml:"hy2_settings,omitempty"`
+	Version      int          `yaml:"version,omitempty"`
+	UpMbps       int          `yaml:"up_mbps,omitempty"`
+	DownMbps     int          `yaml:"down_mbps,omitempty"`
+	Obfs         string       `yaml:"obfs,omitempty"`
+	ObfsPassword string       `yaml:"obfs_password,omitempty"`
 
 	CongestionControl string `yaml:"congestion_control,omitempty"`
 	PaddingScheme     string `yaml:"padding_scheme,omitempty"`

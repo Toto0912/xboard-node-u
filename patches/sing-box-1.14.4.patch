@@ -1544,3 +1544,24 @@ diff --git a/dns/transport/local/local_resolved_linux.go b/dns/transport/local/l
  	if err != nil {
  		return nil, err
  	}
+
+diff --git a/protocol/hysteria2/inbound.go b/protocol/hysteria2/inbound.go
+--- a/protocol/hysteria2/inbound.go
++++ b/protocol/hysteria2/inbound.go
+@@ -99,13 +99,13 @@
+ 			}
+ 		case C.Hysterai2MasqueradeTypeString:
+ 			masqueradeHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-				if options.Masquerade.StringOptions.StatusCode != 0 {
+-					w.WriteHeader(options.Masquerade.StringOptions.StatusCode)
+-				}
+ 				for key, values := range options.Masquerade.StringOptions.Headers {
+ 					for _, value := range values {
+ 						w.Header().Add(key, value)
+ 					}
++				}
++				if options.Masquerade.StringOptions.StatusCode != 0 {
++					w.WriteHeader(options.Masquerade.StringOptions.StatusCode)
+ 				}
+ 				w.Write([]byte(options.Masquerade.StringOptions.Content))
+ 			})

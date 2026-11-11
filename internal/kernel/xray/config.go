@@ -456,16 +456,47 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 	if nc.UpMbps > 0 || nc.DownMbps > 0 {
 		quicParams := M{}
 		if nc.UpMbps > 0 {
-			quicParams["brutalUp"] = fmt.Sprintf("%d mbps", nc.UpMbps)
+			quicParams["brutalUp"] = fmt.Sprintf("%d", int64(nc.UpMbps)*1000000)
 		}
 		if nc.DownMbps > 0 {
-			quicParams["brutalDown"] = fmt.Sprintf("%d mbps", nc.DownMbps)
+			quicParams["brutalDown"] = fmt.Sprintf("%d", int64(nc.DownMbps)*1000000)
 		}
 		ss["finalMask"] = M{
 			"quicParams": quicParams,
 		}
 	}
 
+	if nc.HY2Settings.AutoBandwidth() {
+		mask, _ := ss["finalMask"].(M)
+		if mask == nil {
+			mask = M{}
+		}
+		params, _ := mask["quicParams"].(M)
+		if params == nil {
+			params = M{}
+		}
+		params["congestion"] = "brutal"
+		if nc.UpMbps == 0 && nc.DownMbps == 0 {
+			params["congestion"] = "bbr"
+		}
+		mask["quicParams"] = params
+		ss["finalMask"] = mask
+	}
+	if nc.HY2Settings != nil && len(nc.HY2Settings.Masquerade) > 0 {
+		ss["hysteriaSettings"].(M)["masquerade"] = nc.HY2Settings.Clone().Masquerade
+	}
+	if nc.Obfs != "" {
+		mask, _ := ss["finalMask"].(M)
+		if mask == nil {
+			mask = M{}
+		}
+		settings := M{"password": nc.ObfsPassword}
+		if nc.Obfs == "gecko" {
+			settings["packetSize"] = "512-1200"
+		}
+		mask["udp"] = []M{{"type": "salamander", "settings": settings}}
+		ss["finalMask"] = mask
+	}
 	if tc.HasCert() {
 		ss["security"] = "tls"
 		tlsCert := M{

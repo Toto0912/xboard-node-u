@@ -3,6 +3,7 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/cedar2025/xboard-node/internal/config"
 	"strings"
 )
 
@@ -122,6 +123,8 @@ type NodeConfig struct {
 	// Trojan
 	Host       string `json:"host,omitempty"`
 	ServerName string `json:"server_name,omitempty"`
+
+	HY2Settings *config.HY2Settings `json:"hy2_settings,omitempty"`
 
 	// Hysteria
 	Version      int    `json:"version,omitempty"`

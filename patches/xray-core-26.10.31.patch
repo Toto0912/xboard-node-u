@@ -626,3 +626,65 @@ index 5e801ee..ec9d286 100644
  		now := time.Now()
  		timeoutConn := make([]*InterConn, 0, len(m.m))
  		for _, udpConn := range m.m {
+
+diff --git a/transport/internet/hysteria/hub.go b/transport/internet/hysteria/hub.go
+--- a/transport/internet/hysteria/hub.go
++++ b/transport/internet/hysteria/hub.go
+@@ -41,6 +41,15 @@
+ 	user *protocol.MemoryUser
+ }
+ 
++// BBR asks compatible HY2 clients to ignore their configured bandwidth too.
++// The protocol token is "auto", not the unlimited-rate value "0".
++func (h *httpHandler) responseBandwidth() string {
++	if h.quicParams.Congestion == "bbr" {
++		return "auto"
++	}
++	return strconv.FormatUint(h.quicParams.BrutalDown, 10)
++}
++
+ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
+ 	if r.Method == http.MethodPost && r.Host == URLHost && r.URL.Path == URLPath {
+ 		h.Lock()
+@@ -48,7 +57,7 @@
+ 
+ 		if h.auth {
+ 			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
+-			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
++			w.Header().Set(CommonHeaderCCRX, h.responseBandwidth())
+ 			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
+ 			w.WriteHeader(StatusAuthOK)
+ 			return true
+@@ -75,12 +84,22 @@
+ 			case "reno":
+ 			case "bbr":
+ 				congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
+-			case "", "brutal":
++			case "":
+ 				if quicParams.BrutalUp == 0 || down == 0 {
+ 					congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
+ 				} else {
+ 					congestion.UseBrutal(conn, min(quicParams.BrutalUp, down), quicParams.BrutalDisableLossCompensation)
+ 				}
++			case "brutal":
++				if down == 0 {
++					congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
++				} else {
++					rate := down
++					if quicParams.BrutalUp > 0 {
++						rate = min(rate, quicParams.BrutalUp)
++					}
++					congestion.UseBrutal(conn, rate, quicParams.BrutalDisableLossCompensation)
++				}
+ 			case "force-brutal":
+ 				congestion.UseBrutal(conn, quicParams.BrutalUp, quicParams.BrutalDisableLossCompensation)
+ 			default:
+@@ -101,7 +120,7 @@
+ 			}
+ 
+ 			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
+-			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
++			w.Header().Set(CommonHeaderCCRX, h.responseBandwidth())
+ 			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
+ 			w.WriteHeader(StatusAuthOK)
+ 			return true

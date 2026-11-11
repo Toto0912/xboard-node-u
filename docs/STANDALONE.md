@@ -229,3 +229,7 @@ instances:
 每个实例的 `id`、`kernel.config_dir` 和代理监听端口必须不同，且不能与面板下发的节点冲突。示例中的 `health_port: 0` 表示关闭健康检查监听，与代理端口无关。
 
 若原来没有 `instances:`，先把原有机器配置整体缩进到第一个实例，再追加独立实例。保存后执行 `xbctl restart`；该操作会重启所有实例，已有连接会短暂中断。
+
+## HY2 带宽与伪装（v2.2.0）
+
+可在本文件对应实例的 `standalone.node.hy2_settings` 配置自动带宽策略与 Masquerade，无需另建文件。独立配置的带宽是服务端视角。完整写法及两内核示例见 [HY2 配置说明](HYSTERIA2.md)。

@@ -7,12 +7,13 @@
 | sing-box | 1.14.4（含 Xboard 兼容补丁） |
 | Xray-core | 26.10.31（含 Xboard 兼容补丁） |
 
-当前版本：**v2.1.0**，与 xboard-u v2.1.0 对齐。
+当前版本：**v2.2.0**，与 xboard-u v2.2.0 对齐。
 
 两套内核已嵌入程序，无需另装内核。[变更记录](CHANGELOG.md)
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
+- v2.2.0 修复 HY2 带宽映射，新增自动 BBR / Brutal 协商及 Masquerade，详见 [HY2 配置说明](docs/HYSTERIA2.md)。
 - v2.1.0 修复 Xray 并发访问、停止时监听释放及机器模式重连，优化设备快照与在线心跳。
 - v2.0.0 配套面板 CDN 分离，补齐 Sing-box 传输参数映射及 Xray WebSocket Host 迁移。
 - v1.1.3 支持 Sing-box / Xray 原生自定义出站和路由，兼容旧面板出站格式。

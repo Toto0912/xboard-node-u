@@ -21,6 +21,17 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 		return fmt.Errorf("normalize kernel type: %w", err)
 	}
 
+	if err := config.ValidateHY2(n.HY2Settings, n.Protocol, n.Version, kernelType, n.UpMbps, n.DownMbps); err != nil {
+		return err
+	}
+	if (n.Protocol == "hysteria" || n.Protocol == "hysteria2") && n.Version == 2 && n.Obfs != "" {
+		if n.Obfs != "salamander" && n.Obfs != "gecko" {
+			return fmt.Errorf("unsupported HY2 obfs type %q", n.Obfs)
+		}
+		if n.ObfsPassword == "" {
+			return fmt.Errorf("HY2 obfs requires a password")
+		}
+	}
 	additionalOutboundSources, err := collectAdditionalOutboundTagSources(kcfg.CustomConfig, kcfg.CustomOutbound)
 	if err != nil {
 		return fmt.Errorf("collect additional outbound tags: %w", err)
