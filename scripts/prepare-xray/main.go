@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-const upstream = "a4a3dff5b20c2faae567b742c172c7b95e75c083"
+const upstream = "676eaf66f8f05d4d558ee7a74b4736623d3feeb9"
 
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
@@ -23,7 +23,7 @@ func git(dir string, args ...string) (string, error) {
 }
 
 func prepare() error {
-	patch, err := filepath.Abs("patches/xray-core-26.10.31.patch")
+	patch, err := filepath.Abs("patches/xray-core-26.11.9.patch")
 	if err != nil {
 		return err
 	}
@@ -35,7 +35,7 @@ func prepare() error {
 		if err := os.MkdirAll("third_party", 0755); err != nil {
 			return err
 		}
-		if _, err := git(".", "clone", "--depth", "1", "--branch", "v26.10.31", "https://github.com/XTLS/Xray-core.git", dir); err != nil {
+		if _, err := git(".", "clone", "--depth", "1", "--branch", "v26.11.9", "https://github.com/XTLS/Xray-core.git", dir); err != nil {
 			return err
 		}
 	}
@@ -68,5 +68,5 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Println("xray-core v26.10.31 + Xboard compatibility patch ready")
+	fmt.Println("xray-core v26.11.9 + Xboard compatibility patch ready")
 }

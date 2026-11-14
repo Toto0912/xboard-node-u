@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Xboard-Node | https://github.com/cedar2025/Xboard-Node ，开发起点 dev 提交 `0a29338` | 原项目 README 声明 MPL-2.0；根目录 `LICENSE` 补充标准文本，保留原代码作者归属 |
 | sing-box | https://github.com/SagerNet/sing-box ，v1.14.4，`c005f35300ce76427dc285481ec5695f5b179cd2` | GPLv3-or-later，及上游对名称/关联声明的附加文字；原样保存在 `licenses/sing-box-LICENSE.txt` |
-| Xray-core | https://github.com/XTLS/Xray-core ，v26.10.31，`a4a3dff5b20c2faae567b742c172c7b95e75c083` | MPL-2.0，见 `licenses/Xray-core-MPL-2.0.txt` |
+| Xray-core | https://github.com/XTLS/Xray-core ，v26.11.9，`676eaf66f8f05d4d558ee7a74b4736623d3feeb9` | MPL-2.0，见 `licenses/Xray-core-MPL-2.0.txt` |
 | sing-vmess | https://github.com/SagerNet/sing-vmess ，`a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017` | GPLv3-or-later，见 `licenses/sing-vmess-LICENSE.txt` |
 | sing-quic | https://github.com/SagerNet/sing-quic ，`7e0a5869a5f49ed0a685143345dfda0448bbc708` | GPLv3-or-later，见 `licenses/sing-quic-LICENSE.txt` |
 

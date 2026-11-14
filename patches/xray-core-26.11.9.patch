@@ -272,7 +272,7 @@ index 0000000..781670e
 +	}
 +}
 diff --git a/common/buf/io.go b/common/buf/io.go
-index 6b35052..d54a628 100644
+index 4f0e64f..24a1ed3 100644
 --- a/common/buf/io.go
 +++ b/common/buf/io.go
 @@ -5,6 +5,7 @@ import (
@@ -561,11 +561,11 @@ index 0000000..a5ecf30
 +	}
 +}
 diff --git a/go.mod b/go.mod
-index edd3020..7c26c34 100644
+index aa5694c..4536d30 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -29,6 +29,7 @@ require (
- 	golang.org/x/net v0.61.0
+ 	golang.org/x/net v0.62.0
  	golang.org/x/sync v0.24.0
  	golang.org/x/sys v0.49.0
 +	golang.org/x/time v0.14.0
@@ -626,11 +626,11 @@ index 5e801ee..ec9d286 100644
  		now := time.Now()
  		timeoutConn := make([]*InterConn, 0, len(m.m))
  		for _, udpConn := range m.m {
-
 diff --git a/transport/internet/hysteria/hub.go b/transport/internet/hysteria/hub.go
+index 441db87..ec725a4 100644
 --- a/transport/internet/hysteria/hub.go
 +++ b/transport/internet/hysteria/hub.go
-@@ -41,6 +41,15 @@
+@@ -41,6 +41,15 @@ type httpHandler struct {
  	user *protocol.MemoryUser
  }
  
@@ -646,7 +646,7 @@ diff --git a/transport/internet/hysteria/hub.go b/transport/internet/hysteria/hu
  func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
  	if r.Method == http.MethodPost && r.Host == URLHost && r.URL.Path == URLPath {
  		h.Lock()
-@@ -48,7 +57,7 @@
+@@ -48,7 +57,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
  
  		if h.auth {
  			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
@@ -655,7 +655,7 @@ diff --git a/transport/internet/hysteria/hub.go b/transport/internet/hysteria/hu
  			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
  			w.WriteHeader(StatusAuthOK)
  			return true
-@@ -75,12 +84,22 @@
+@@ -75,12 +84,22 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
  			case "reno":
  			case "bbr":
  				congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
@@ -679,7 +679,7 @@ diff --git a/transport/internet/hysteria/hub.go b/transport/internet/hysteria/hu
  			case "force-brutal":
  				congestion.UseBrutal(conn, quicParams.BrutalUp, quicParams.BrutalDisableLossCompensation)
  			default:
-@@ -101,7 +120,7 @@
+@@ -101,7 +120,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
  			}
  
  			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))

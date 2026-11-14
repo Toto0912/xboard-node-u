@@ -93,7 +93,7 @@ health_port: 0
 
 完整文件见 [Xray Reality 原生回落示例](../examples/standalone-xray-reality-fallback.yml.example)。如果要“Reality 偷自己”，应把 **`tls_settings.dest`** 改成自己网站的 HTTPS 地址，例如 `127.0.0.1:8443`；该网站须支持 TLS 1.3，证书匹配原 `server_name`。不要通过 `fallbacks` 覆盖目标。
 
-Reality 不使用普通 TLS 的 `tls_settings.alpn` 来强制协商协议。当前嵌入的 Xray 26.10.31 在已认证 Reality 连接中协商的 ALPN 为空，非空 `alpn` 规则可能不会命中；通常省略该条件，并保留一条默认规则。规则按实际连接状态匹配，不会将它强制改成 HTTP/1.1。
+Reality 不使用普通 TLS 的 `tls_settings.alpn` 来强制协商协议。当前嵌入的 Xray 26.11.9 在已认证 Reality 连接中协商的 ALPN 为空，非空 `alpn` 规则可能不会命中；通常省略该条件，并保留一条默认规则。规则按实际连接状态匹配，不会将它强制改成 HTTP/1.1。
 
 ### 普通 TLS：列表写法不变
 
