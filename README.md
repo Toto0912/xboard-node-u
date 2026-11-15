@@ -13,13 +13,11 @@
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
-- v2.2.1 同步 Xray-core 26.11.9，保留 Xboard 兼容补丁；Sing-box 保持 1.14.4，详见 [内核升级说明](docs/二次开发功能说明.md#xray-内核升级v221)。
-- v2.2.0 修复 HY2 带宽映射，新增自动 BBR / Brutal 协商及 Masquerade，详见 [HY2 配置说明](docs/HYSTERIA2.md)。
-- v2.1.0 修复 Xray 并发访问、停止时监听释放及机器模式重连，优化设备快照与在线心跳。
-- v2.0.0 配套面板 CDN 分离，补齐 Sing-box 传输参数映射及 Xray WebSocket Host 迁移。
-- v1.1.3 支持 Sing-box / Xray 原生自定义出站和路由，兼容旧面板出站格式。
-- 新增 Xray Fallback，支持面板下发及无面板独立配置；TLS / Reality 均使用原生协议层回落，保留 Reality 目标。
-- 更新双内核，支持 Alpine/OpenRC 安装和统一 `xbctl` 管理。
+- v2.2.1 同步 Xray-core 官方最新正式版 **26.11.9**。
+- v1.1.0 新增 Xray Fallback 回落功能。
+- v1.0.2 同步 **Xray-core v26.10.31 紧急安全更新**。
+- v1.0.1 新增 Alpine Linux / OpenRC 独立安装器；无 systemd 的 LXC 可直接安装。两种系统统一使用 `xbctl` 管理。
+- v1.0.0 整合 sing-box 和 Xray 最新版内核，支持机器模式、单节点接入面板及无面板裸核运行。
 
 ## Linux systemd 安装
 
