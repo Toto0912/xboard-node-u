@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/porthopping"
 	"gopkg.in/yaml.v3"
 )
 
@@ -574,12 +575,17 @@ func runUninstall(args []string) error {
 		if err := runCommand("systemctl", "disable", serviceName); err != nil {
 			warnings = append(warnings, fmt.Sprintf("disable service: %v", err))
 		}
+	}
+
+	if err := porthopping.CleanupStopped(); err != nil {
+		return fmt.Errorf("clean HY2 redirects before uninstall (binaries preserved): %w", err)
+	}
+	if fileExists(serviceFilePath) {
 		if err := os.Remove(serviceFilePath); err != nil {
 			warnings = append(warnings, fmt.Sprintf("remove service file: %v", err))
 		}
 		runCommand("systemctl", "daemon-reload")
 	}
-
 	// Remove binaries
 	// Remove binaries and symlinks
 	for _, p := range []string{defaultBinaryPath, defaultCLIPath, "/usr/bin/xbctl"} {
@@ -1192,6 +1198,7 @@ Type=simple
 WorkingDirectory=%s
 EnvironmentFile=-%s
 ExecStart=%s -c %s
+ExecStopPost=%s --cleanup-port-hopping
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -1201,7 +1208,7 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-`, defaultInstallRoot, defaultCredentialsPath, defaultBinaryPath, defaultConfigPath)
+`, defaultInstallRoot, defaultCredentialsPath, defaultBinaryPath, defaultConfigPath, defaultBinaryPath)
 	return os.WriteFile(serviceFilePath, []byte(unit), 0o644)
 }
 

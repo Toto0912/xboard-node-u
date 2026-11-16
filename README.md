@@ -7,12 +7,13 @@
 | sing-box | 1.14.4（含 Xboard 兼容补丁） |
 | Xray-core | 26.11.9（含 Xboard 兼容补丁） |
 
-当前版本：**v2.2.1**，兼容配套面板 xboard-u v2.2.0。
+当前版本：**v2.3.0**，配套面板 xboard-u v2.3.0，兼容原版及旧版 Xboard。
 
 两套内核已嵌入程序，无需另装内核。[变更记录](CHANGELOG.md)
 
 ## 二次开发新功能（详见 [二次开发功能说明](docs/二次开发功能说明.md)）
 
+- v2.3.0 新增 [HY2 端口跳跃与自动转发](docs/HY2-PORT-HOPPING.md)，两种内核、三种运行模式共用范围管理及规则清理。
 - v2.2.1 同步 Xray-core 官方最新正式版 **26.11.9**。
 - v1.1.0 新增 Xray Fallback 回落功能。
 - v1.0.2 同步 **Xray-core v26.10.31 紧急安全更新**。
@@ -42,6 +43,8 @@ apk add --no-cache curl ca-certificates && curl -fsSL https://github.com/Toto091
 独立节点配置：[SS](examples/standalone.yml.example) · [VLESS + Reality](examples/standalone-vless-reality.yml.example) · [HY2](examples/standalone-hy2.yml.example) · [VLESS + TLS 回落](examples/standalone-vless-fallback.yml.example) · [Xray Reality 回落](examples/standalone-xray-reality-fallback.yml.example)
 
 支持通过服务端本地 `kernel.custom_config` 自定义 DNS、出站和路由等高级配置，适用于机器、单节点及独立模式，详见 [自定义内核配置](docs/CUSTOM-CONFIG.md)。
+
+[HY2 端口跳跃与自动转发](docs/HY2-PORT-HOPPING.md) · [独立 HY2 范围示例](examples/standalone-hy2-port-hopping.yml.example)
 
 ## 常用管理命令
 

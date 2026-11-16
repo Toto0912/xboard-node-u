@@ -8,9 +8,12 @@ import (
 )
 
 func TestHY2RoundTripAndStandalone(t *testing.T) {
-	original := &panel.NodeConfig{Protocol: "hysteria", Version: 2, UpMbps: 47, DownMbps: 23, HY2Settings: &config.HY2Settings{Kernel: "singbox", BandwidthMode: "auto", Masquerade: map[string]any{"type": "string", "content": "ok", "headers": map[string]any{"X-Test": []any{"one", "two"}}}}}
+	original := &panel.NodeConfig{Protocol: "hysteria", Version: 2, ServerPort: 60000, UpMbps: 47, DownMbps: 23, HY2Settings: &config.HY2Settings{PortRange: "60000-65000", Kernel: "singbox", BandwidthMode: "auto", Masquerade: map[string]any{"type": "string", "content": "ok", "headers": map[string]any{"X-Test": []any{"one", "two"}}}}}
 	spec := NodeSpecFromPanel(original)
 	wire := spec.ToPanel()
+	if wire.HY2Settings.PortRange != original.HY2Settings.PortRange {
+		t.Fatal("HY2 port range lost in panel round trip")
+	}
 	if wire.UpMbps != 47 || wire.DownMbps != 23 || wire.HY2Settings.Masquerade["content"] != "ok" {
 		t.Fatal("server bandwidth swapped again or extension lost")
 	}
@@ -24,7 +27,7 @@ func TestHY2RoundTripAndStandalone(t *testing.T) {
 	if string(before) == string(after) {
 		t.Fatal("config change absent from hash input")
 	}
-	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}, Standalone: &config.StandaloneConfig{Enabled: true, Node: config.StandaloneNodeConfig{Protocol: "hysteria", Version: 2, UpMbps: 47, DownMbps: 23, HY2Settings: original.HY2Settings}}}
+	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}, Standalone: &config.StandaloneConfig{Enabled: true, Node: config.StandaloneNodeConfig{Protocol: "hysteria", Version: 2, ServerPort: 60000, UpMbps: 47, DownMbps: 23, HY2Settings: original.HY2Settings}}}
 	standalone := NodeSpecFromStandalone(cfg)
 	if standalone.UpMbps != 47 || standalone.DownMbps != 23 || standalone.HY2Settings == original.HY2Settings {
 		t.Fatal("standalone changed server perspective or shares extension")

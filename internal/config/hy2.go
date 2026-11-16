@@ -11,6 +11,7 @@ import (
 // HY2Settings is an optional server-only extension. Absence preserves the
 // original panel's negotiation policy; auto opts into the new bandwidth policy.
 type HY2Settings struct {
+	PortRange     string         `json:"port_range,omitempty" yaml:"port_range,omitempty"`
 	BandwidthMode string         `json:"bandwidth_mode,omitempty" yaml:"bandwidth_mode,omitempty"`
 	Kernel        string         `json:"kernel,omitempty" yaml:"kernel,omitempty"`
 	Masquerade    map[string]any `json:"masquerade,omitempty" yaml:"masquerade,omitempty"`
@@ -67,6 +68,11 @@ func ValidateHY2(s *HY2Settings, protocol string, version int, kind string, up, 
 	}
 	if s == nil {
 		return nil
+	}
+	if s.PortRange != "" {
+		if _, _, err := ParseHY2PortRange(s.PortRange); err != nil {
+			return err
+		}
 	}
 	if s.BandwidthMode != "" && s.BandwidthMode != "auto" {
 		return fmt.Errorf("hy2_settings.bandwidth_mode must be auto or omitted")

@@ -124,6 +124,9 @@ func (c *Config) validateStandalone() error {
 	if node.ServerPort <= 0 || node.ServerPort > 65535 {
 		return fmt.Errorf("standalone.node.server_port must be between 1 and 65535")
 	}
+	if err := ValidateHY2PortRange(node.HY2Settings, node.ServerPort); err != nil {
+		return err
+	}
 	if node.TLS < 0 || node.TLS > 2 {
 		return fmt.Errorf("standalone.node.tls must be 0 (off), 1 (tls), or 2 (reality)")
 	}

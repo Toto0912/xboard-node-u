@@ -118,9 +118,15 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	o.mu.Lock()
-	if _, exists := o.nodes[mn.ID]; exists {
-		o.mu.Unlock()
-		return
+	if previous, exists := o.nodes[mn.ID]; exists {
+		select {
+		case <-previous.done:
+			previous.cancel()
+			delete(o.nodes, mn.ID)
+		default:
+			o.mu.Unlock()
+			return
+		}
 	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
@@ -192,7 +198,6 @@ func (o *Orchestrator) stopNode(nodeID int) {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.nodes, nodeID)
 	o.mu.Unlock()
 
 	o.eventsMu.Lock()
@@ -202,6 +207,13 @@ func (o *Orchestrator) stopNode(nodeID int) {
 	nlog.Core().Info(fmt.Sprintf("machine: stopping node %d", nodeID))
 	h.cancel()
 	<-h.done
+	// Keep the handle visible until all cleanup has completed. Discovery must
+	// not start another generation while its old firewall owner is stopping.
+	o.mu.Lock()
+	if o.nodes[nodeID] == h {
+		delete(o.nodes, nodeID)
+	}
+	o.mu.Unlock()
 }
 
 func (o *Orchestrator) stopAll() {

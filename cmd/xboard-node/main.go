@@ -17,6 +17,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/porthopping"
 	"github.com/cedar2025/xboard-node/internal/service"
 	C "github.com/sagernet/sing-box/constant"
 	xcore "github.com/xtls/xray-core/core"
@@ -30,7 +31,20 @@ var (
 func main() {
 	configPath := flag.String("c", "config.yml", "config file path")
 	showVersion := flag.Bool("v", false, "show version")
+	cleanupRedirects := flag.Bool("cleanup-port-hopping", false, "clean port redirects owned by stopped xboard-node processes")
+	requireStopped := flag.Bool("require-stopped", false, "with cleanup-port-hopping, refuse uninstall while an owner is running")
 	flag.Parse()
+	if *cleanupRedirects {
+		cleanup := porthopping.CleanupStale
+		if *requireStopped {
+			cleanup = porthopping.CleanupStopped
+		}
+		if err := cleanup(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *showVersion {
 		fmt.Printf("xboard-node %s (built %s)\n", version, buildTime)
@@ -51,6 +65,9 @@ func main() {
 		os.Exit(1)
 	}
 	config.InitLogger(instances[0].Log)
+	if err := porthopping.CleanupStale(); err != nil {
+		nlog.Core().Warn("could not recover stale HY2 redirects", "error", err)
+	}
 
 	// Apply runtime memory tuning before anything else allocates.
 	applyRuntimeConfig(instances[0].Runtime)

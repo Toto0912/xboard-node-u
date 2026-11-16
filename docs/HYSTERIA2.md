@@ -1,5 +1,7 @@
 # HY2 带宽策略与 Masquerade
 
+v2.3.0 新增 [HY2 端口跳跃与自动转发](HY2-PORT-HOPPING.md)。
+
 本功能在 v2.2.0 引入。配合 xboard-u v2.2.0 使用，支持机器模式、面板单节点模式及独立模式；不改变 Hysteria 1。
 
 ## 面板模式

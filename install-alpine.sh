@@ -250,8 +250,12 @@ depend() {
     need net
 }
 start_pre() {
+    /usr/local/bin/xboard-node --cleanup-port-hopping || return 1
     checkpath --directory --mode 0700 /var/lib/xboard-node /var/log/xboard-node
     checkpath --file --mode 0600 "$output_log" "$error_log"
+}
+stop_post() {
+    /usr/local/bin/xboard-node --cleanup-port-hopping
 }
 OPENRC
     cat > "$TMP/logrotate" <<'ROTATE'
@@ -449,8 +453,8 @@ install_or_upgrade() {
     fi
     check_legacy_processes
     if ! command -v curl >/dev/null 2>&1 || ! command -v supervise-daemon >/dev/null 2>&1 \
-        || ! command -v logrotate >/dev/null 2>&1 || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
-        apk add --no-cache curl ca-certificates openrc logrotate
+        || ! command -v logrotate >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1 || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+        apk add --no-cache curl ca-certificates openrc logrotate nftables
     fi
     TMP=$(mktemp -d /tmp/xboard-alpine.XXXXXX)
     stage_binary
@@ -508,6 +512,9 @@ uninstall() {
     if [ -f "$SERVICE" ]; then
         rc-service xboard-node stop >/dev/null 2>&1 || die '停止服务失败，未删除程序'
         rc-update del xboard-node default >/dev/null 2>&1 || :
+    fi
+    if [ -x "$BIN" ] && [ -d /run/xboard-node/port-hopping ]; then
+        "$BIN" --cleanup-port-hopping --require-stopped || die 'HY2 转发规则清理失败，保留程序供后续恢复'
     fi
     rm -f "$BIN" "$CLI" "$SERVICE" "$LAUNCHER" "$MANAGER" "$OLD_MANAGER" "$VERSION_FILE" "$ROOT/install-meta.json" /etc/logrotate.d/xboard-node
     if [ -L /usr/bin/xbctl ] && [ "$(readlink /usr/bin/xbctl)" = "$CLI" ]; then rm -f /usr/bin/xbctl; fi

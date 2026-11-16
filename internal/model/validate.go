@@ -24,6 +24,9 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 	if err := config.ValidateHY2(n.HY2Settings, n.Protocol, n.Version, kernelType, n.UpMbps, n.DownMbps); err != nil {
 		return err
 	}
+	if err := config.ValidateHY2PortRange(n.HY2Settings, n.ServerPort); err != nil {
+		return err
+	}
 	if (n.Protocol == "hysteria" || n.Protocol == "hysteria2") && n.Version == 2 && n.Obfs != "" {
 		if n.Obfs != "salamander" && n.Obfs != "gecko" {
 			return fmt.Errorf("unsupported HY2 obfs type %q", n.Obfs)

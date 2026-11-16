@@ -25,6 +25,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/porthopping"
 	"github.com/cedar2025/xboard-node/internal/tracker"
 )
 
@@ -33,6 +34,7 @@ type Service struct {
 	source       controlplane.Source
 	sink         controlplane.Sink
 	kernel       kernel.Kernel
+	portHopping  *porthopping.Manager
 	tracker      *tracker.Tracker
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
@@ -158,6 +160,7 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		source:       cp,
 		sink:         cp,
 		kernel:       k,
+		portHopping:  porthopping.New(cfg.Kernel.ConfigDir),
 		tracker:      tracker.New(),
 		limiter:      l,
 		speedTracker: st,
@@ -174,12 +177,12 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("cert manager: %w", err)
 	}
 	defer s.cert.Stop()
+	defer s.stopKernel()
 
 	// Handshake: get WS config + initial data in one call
 	if err := s.initialSetup(ctx); err != nil {
 		return fmt.Errorf("initial setup: %w", err)
 	}
-	defer s.kernel.Stop()
 
 	// Set up tickers
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
@@ -731,7 +734,53 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
-	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
+	return s.applyKernel(nc, users, false)
+}
+
+func (s *Service) stopKernel() {
+	s.kernel.Stop()
+	if s.portHopping != nil {
+		if err := s.portHopping.Close(); err != nil {
+			nlog.Core().Error("failed to clean HY2 redirects", "error", err)
+		}
+	}
+}
+
+func (s *Service) applyKernel(nc *model.NodeSpec, users []model.UserSpec, reload bool) bool {
+	portRange := ""
+	if nc.HY2Settings != nil {
+		portRange = nc.HY2Settings.PortRange
+	}
+	spec, err := porthopping.NewSpec(nc.ListenIP, portRange, nc.ServerPort)
+	if err != nil {
+		nlog.Core().Error("invalid HY2 redirects", "error", err)
+		return false
+	}
+	activate := func() error {
+		if reload {
+			if err := s.kernel.Reload(nc, users, s.cert.TLSCert()); err == nil {
+				return nil
+			} else {
+				nlog.Core().Warn("reload failed, restarting", "error", err)
+			}
+		}
+		return s.kernel.Start(nc, users, s.cert.TLSCert())
+	}
+	rollback := func() error {
+		s.kernel.Stop()
+		if old := s.appliedState.Config; old != nil && len(s.appliedState.Users) > 0 {
+			return s.kernel.Start(old, s.appliedState.Users, s.cert.TLSCert())
+		}
+		return nil
+	}
+	if s.portHopping != nil {
+		err = s.portHopping.Apply(spec, activate, rollback)
+	} else if spec != nil {
+		err = fmt.Errorf("HY2 redirects manager is not initialized")
+	} else {
+		err = activate()
+	}
+	if err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
@@ -912,7 +961,7 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 
 	if s.lastConfig == nil || len(s.lastUsers) == 0 {
 		if len(s.lastUsers) == 0 {
-			s.kernel.Stop()
+			s.stopKernel()
 			s.appliedState.Users = nil
 		}
 		return
@@ -921,16 +970,7 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	// If config changed, delegate to kernel.Reload. The kernel implementation
 	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
 	if configChanged && s.kernel.IsRunning() {
-		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
-			s.startKernel(s.lastConfig, s.lastUsers)
-		} else {
-			s.appliedState.Config = s.lastConfig
-			s.appliedState.Users = s.lastUsers
-			if s.nodeLog != nil {
-				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-			}
-		}
+		s.applyKernel(s.lastConfig, s.lastUsers, true)
 	} else if !s.kernel.IsRunning() {
 		s.startKernel(s.lastConfig, s.lastUsers)
 	}

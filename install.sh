@@ -461,16 +461,20 @@ run_with_retry() {
 }
 
 install_dependencies() {
+    local -a firewall_packages=()
+    if ! command -v nft >/dev/null 2>&1 && { ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1; }; then
+        firewall_packages=(nftables)
+    fi
     case "$OS" in
         ubuntu|debian)
             DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates "${firewall_packages[@]}" >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf >/dev/null 2>&1; then
-                run_with_retry 5 3 dnf install -y -q curl wget ca-certificates >/dev/null 2>&1
+                run_with_retry 5 3 dnf install -y -q curl wget ca-certificates "${firewall_packages[@]}" >/dev/null 2>&1
             else
-                run_with_retry 5 3 yum install -y -q curl wget ca-certificates >/dev/null 2>&1
+                run_with_retry 5 3 yum install -y -q curl wget ca-certificates "${firewall_packages[@]}" >/dev/null 2>&1
             fi
             ;;
         *)
@@ -692,6 +696,7 @@ Type=simple
 WorkingDirectory=${INSTALL_ROOT}
 EnvironmentFile=-${CREDENTIALS_FILE}
 ExecStart=${BINARY_PATH} -c ${CONFIG_FILE}
+ExecStopPost=${BINARY_PATH} --cleanup-port-hopping
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -861,6 +866,11 @@ perform_uninstall() {
     if [ -f "$SERVICE_PATH" ]; then
         systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    if [ -x "$BINARY_PATH" ] && [ -d /run/xboard-node/port-hopping ]; then
+        "$BINARY_PATH" --cleanup-port-hopping --require-stopped || { log_error "HY2 redirect cleanup failed; binaries preserved"; exit 1; }
+    fi
+    if [ -f "$SERVICE_PATH" ]; then
         rm -f "$SERVICE_PATH"
         systemctl daemon-reload || true
     fi
