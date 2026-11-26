@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,7 @@ func init() {
 	// Warm up the CPU sampler. The first cpu.Percent call with interval=0
 	// always returns 0% because it has no prior sample. This throwaway call
 	// seeds the baseline so subsequent Collect() calls return real values.
-	cpu.Percent(500*time.Millisecond, false)
+	cpu.Percent(0, false)
 
 	// Seed the network baseline so the first Collect() can compute rates.
 	collectNetSpeed()
@@ -117,8 +118,27 @@ func collectNetSpeed() (inSpeed, outSpeed float64) {
 	return inSpeed, outSpeed
 }
 
-// Collect gathers current system metrics
+var hostSample struct {
+	sync.Mutex
+	status  Status
+	expires time.Time
+}
+
+// Collect shares one short-lived host/process sample across co-located nodes.
+// Traffic and user counters are added separately by each node.
 func Collect() Status {
+	hostSample.Lock()
+	defer hostSample.Unlock()
+	if !time.Now().Before(hostSample.expires) {
+		hostSample.status = sampleHost()
+		hostSample.expires = time.Now().Add(time.Second)
+	}
+	status := hostSample.status
+	status.CPUPerCore = slices.Clone(status.CPUPerCore)
+	return status
+}
+
+func sampleHost() Status {
 	var s Status
 
 	s.Uptime = uint64(time.Since(startTime).Seconds())

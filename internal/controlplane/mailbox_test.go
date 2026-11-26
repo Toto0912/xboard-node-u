@@ -225,3 +225,29 @@ func TestNodeMailboxRemoveLastUserPreservesEmptySliceAndSyncBaseline(t *testing.
 		t.Fatalf("expected only user 3 after SyncBaseline, got %#v", state.Users)
 	}
 }
+
+func TestStatusMailboxRetainsReconcileAndDisconnect(t *testing.T) {
+	box := NewStatusMailbox()
+	for range 20 {
+		box.Publish(StatusChange{Connected: true, NeedsResync: true})
+		box.Publish(StatusChange{Connected: false})
+	}
+	select {
+	case <-box.NotifyCh():
+	default:
+		t.Fatal("missing wakeup")
+	}
+	change, ok := box.Drain()
+	if !ok || change.Connected || !change.NeedsResync || !change.SawDisconnect {
+		t.Fatalf("lost status: %+v", change)
+	}
+	if _, ok := box.Drain(); ok {
+		t.Fatal("repeat wake without a change")
+	}
+	box.Publish(StatusChange{Connected: true})
+	<-box.NotifyCh()
+	change, ok = box.Drain()
+	if !ok || !change.Connected || change.SawDisconnect {
+		t.Fatal("old flags persisted")
+	}
+}

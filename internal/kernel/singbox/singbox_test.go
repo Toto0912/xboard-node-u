@@ -144,7 +144,7 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	us := tracker.users[1]
-	us.addConn("1.1.1.1")
+	tracker.registerConn(us, 1, "uuid-1", "1.1.1.1", true)
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 
 	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 2) {

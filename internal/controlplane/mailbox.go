@@ -301,3 +301,45 @@ func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSp
 	*users = current
 	return true
 }
+
+// StatusMailbox coalesces connectivity changes without losing a reconcile request.
+// A single wakeup is sufficient even when the consumer is applying a slow update.
+type StatusMailbox struct {
+	mu      sync.Mutex
+	pending bool
+	change  StatusChange
+	wake    chan struct{}
+}
+
+func NewStatusMailbox() *StatusMailbox { return &StatusMailbox{wake: make(chan struct{}, 1)} }
+func (m *StatusMailbox) NotifyCh() <-chan struct{} {
+	if m == nil {
+		return nil
+	}
+	return m.wake
+}
+func (m *StatusMailbox) Publish(change StatusChange) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.change.Connected = change.Connected
+	m.change.NeedsResync = m.change.NeedsResync || change.NeedsResync || change.Connected
+	m.change.SawDisconnect = m.change.SawDisconnect || !change.Connected
+	m.pending = true
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
+	m.mu.Unlock()
+}
+func (m *StatusMailbox) Drain() (StatusChange, bool) {
+	if m == nil {
+		return StatusChange{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	change, pending := m.change, m.pending
+	m.change, m.pending = StatusChange{}, false
+	return change, pending
+}

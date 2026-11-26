@@ -39,12 +39,12 @@ MACHINE_ID=""
 KERNEL_TYPE="${DEFAULT_KERNEL}"
 RELEASE_VERSION="${DEFAULT_RELEASE_VERSION}"
 HEALTH_PORT="${DEFAULT_HEALTH_PORT}"
-HEALTH_ENABLED=1
 RUNTIME_GOMEMLIMIT=""
 RUNTIME_GOGC=""
 BINARY_SOURCE=""
 CLI_BINARY_SOURCE=""
 FORCE_RECONFIGURE=0
+EXPECT_EMPTY=0
 INTERACTIVE=0
 MODE_GIVEN=0
 PURGE=0
@@ -55,7 +55,11 @@ DOWNLOAD_URL=""
 CURRENT_STATE="fresh"
 TMP_DIR=""
 BACKUP_PATH=""
-SERVICE_EXISTED=0
+OLD_ACTIVE_STATE=inactive
+WAS_ENABLED=0
+OLD_HEALTH_PORT=0
+SERVICE_WORK_DIR="$INSTALL_ROOT"
+MUTATING=0
 CLEANUP_DONE=0
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -73,29 +77,73 @@ cleanup_tmp() {
     fi
 }
 
-load_health_port_from_config() {
-    local cfg_path="$1"
-    if [ ! -f "$cfg_path" ]; then
-        return
-    fi
-    local parsed
-    if [ -x "$CLI_PATH" ]; then
-        parsed=$("$CLI_PATH" config health-port --config "$cfg_path" 2>/dev/null)
-    else
-        parsed=$(grep -m1 'health_port:' "$cfg_path" 2>/dev/null | sed 's/.*health_port:[[:space:]]*//' | tr -cd '0-9')
-    fi
-    if [ -n "$parsed" ] && [ "$parsed" -ge 0 ] 2>/dev/null; then
-        HEALTH_PORT="$parsed"
-        if [ "$HEALTH_PORT" -eq 0 ]; then
-            HEALTH_ENABLED=0
-        else
-            HEALTH_ENABLED=1
+# The checked candidate reads the same normalized first instance as the node.
+load_deployment() {
+    local parsed="" inspector
+    for inspector in "$TMP_DIR/xbctl" "$CLI_PATH"; do
+        [[ -x "$inspector" ]] || continue
+        if parsed=$("$inspector" config deployment-port --config "$1" --credentials "$2" --working-dir "$SERVICE_WORK_DIR" --installed-config "$CONFIG_FILE" 2>"$TMP_DIR/probe.err"); then
+            break
         fi
+        if ! grep -Fxq 'unknown config command: deployment-port' "$TMP_DIR/probe.err"; then
+            cat "$TMP_DIR/probe.err" >&2; return 1
+        fi
+    done
+    if [[ -z "$parsed" ]]; then
+        # v2.4.1 already provides typed JSON metadata, including the first
+        # instance's port. Its old health-port command skipped zero-valued ports.
+        "$TMP_DIR/xbctl" config metadata --config "$1" --meta "$TMP_DIR/probe.json" --version "$RELEASE_VERSION" || return 1
+        parsed=$(awk '/^[[:space:]]*"instance_count":[[:space:]]*[0-9]+,?$/ {n=$2+0; have=1}
+            /^[[:space:]]*"health_port":[[:space:]]*[0-9]+,?$/ && first=="" {first=$2; sub(/,$/,"",first)}
+            END{if(!have)exit 1; if(n==0)print "empty"; else if(first!="")print first; else exit 1}' "$TMP_DIR/probe.json") || return 1
+        if [[ "$parsed" == empty ]] && ! grep -Eq '^instances:[[:space:]]*\[\][[:space:]]*(#.*)?$' "$1"; then
+            log_error "Legacy inspector cannot confirm an empty binding list"; return 1
+        fi
+    fi
+    case "$parsed" in
+        empty) HEALTH_PORT=empty ;;
+        ''|*[!0-9]*) log_error "Cannot determine the effective health port"; return 1 ;;
+        *) HEALTH_PORT=$parsed ;;
+    esac
+}
+
+lock_installation() {
+    mkdir -p "$(dirname "$BINARY_PATH")"
+    exec 9<"$(dirname "$BINARY_PATH")"
+    flock -n 9 || { log_error "Another node install or upgrade is in progress"; return 1; }
+}
+
+record_service_state() {
+    local state
+    if ! state=$(systemctl show --property=ActiveState --value "$SERVICE_NAME"); then
+        if [[ "$CURRENT_STATE" == fresh && "$state" == inactive ]]; then return; fi
+        log_error "Cannot read state for $SERVICE_NAME"; return 1
+    fi
+    case "$state" in
+        active|inactive|failed) OLD_ACTIVE_STATE=$state ;;
+        *) log_error "Service is changing state ($state); retry when settled"; return 1 ;;
+    esac
+    if [[ "$CURRENT_STATE" != fresh && -f "$SERVICE_PATH" ]]; then
+        SERVICE_WORK_DIR=$(systemctl show --property=WorkingDirectory --value "$SERVICE_NAME") || return 1
+        SERVICE_WORK_DIR=${SERVICE_WORK_DIR:-/}
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME"; then WAS_ENABLED=1; fi
+    if [[ "$OLD_ACTIVE_STATE" == active && -f "$CONFIG_FILE" ]]; then
+        load_deployment "$CONFIG_FILE" "$CREDENTIALS_FILE"
+        OLD_HEALTH_PORT=$HEALTH_PORT
     fi
 }
 
 rollback_install() {
+    local state failed=0
     log_warn "Rolling back installation"
+    if ! systemctl stop "$SERVICE_NAME" && [[ "$CURRENT_STATE" != fresh ]]; then
+        log_error "Could not stop the candidate during rollback"
+        failed=1
+    fi
+    if [[ "$WAS_ENABLED" == 0 ]] && systemctl is-enabled --quiet "$SERVICE_NAME"; then
+        systemctl disable "$SERVICE_NAME" >/dev/null || failed=1
+    fi
     if [ -n "$BACKUP_PATH" ] && [ -d "$BACKUP_PATH" ]; then
         if [ -f "$BACKUP_PATH/xboard-node" ]; then
             install -m 755 "$BACKUP_PATH/xboard-node" "$BINARY_PATH"
@@ -117,6 +165,11 @@ rollback_install() {
         else
             rm -f "$INSTALL_META"
         fi
+        if [ -f "$BACKUP_PATH/install.sh" ]; then
+            replace_saved_installer "$BACKUP_PATH/install.sh" || failed=1
+        elif [[ "$ACTION" != upgrade ]]; then
+            rm -f "$INSTALLER_COPY_PATH"
+        fi
         if [ -f "$BACKUP_PATH/xbctl" ]; then
             install -m 755 "$BACKUP_PATH/xbctl" "$CLI_PATH"
         else
@@ -128,9 +181,12 @@ rollback_install() {
             rm -f "$SERVICE_PATH"
         fi
     fi
-    load_health_port_from_config "$CONFIG_FILE"
-    systemctl daemon-reload || true
-    if [ "$SERVICE_EXISTED" -eq 1 ] || [ -f "$SERVICE_PATH" ]; then
+    HEALTH_PORT=$OLD_HEALTH_PORT
+    systemctl daemon-reload || failed=1
+    if [[ "$WAS_ENABLED" == 1 ]] && ! systemctl is-enabled --quiet "$SERVICE_NAME"; then
+        systemctl enable "$SERVICE_NAME" >/dev/null || return 1
+    fi
+    if [[ "$OLD_ACTIVE_STATE" == active ]]; then
         systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
         systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
         if ! wait_for_health; then
@@ -138,9 +194,18 @@ rollback_install() {
             show_recent_logs
             return 1
         fi
-    else
-        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    elif [[ "$CURRENT_STATE" != fresh ]]; then
+        state=$(systemctl show --property=ActiveState --value "$SERVICE_NAME") || return 1
+        if [[ "$OLD_ACTIVE_STATE" == inactive && "$state" == failed ]]; then
+            systemctl reset-failed "$SERVICE_NAME" || return 1
+            state=$(systemctl show --property=ActiveState --value "$SERVICE_NAME") || return 1
+        fi
+        if [[ "$state" != "$OLD_ACTIVE_STATE" ]]; then
+            log_error "Restored service state is $state (expected $OLD_ACTIVE_STATE)"
+            return 1
+        fi
     fi
+    [[ "$failed" == 0 ]] || return 1
     log_warn "Rollback complete"
 }
 
@@ -149,8 +214,8 @@ on_error() {
     local line_no=${1:-unknown}
     if [ "$exit_code" -ne 0 ]; then
         log_error "Install failed at line ${line_no} (exit=${exit_code})"
-        if [ -n "$BACKUP_PATH" ]; then
-            rollback_install || true
+        if [[ "$MUTATING" == 1 ]]; then
+            rollback_install || log_error "Rollback incomplete; check the restored files and service state"
         fi
     fi
     cleanup_tmp
@@ -196,6 +261,7 @@ usage() {
     --gomemlimit        Runtime GOMEMLIMIT value, e.g. 256MiB
     --gogc              Runtime GOGC value, e.g. 50
     --force-reconfigure Overwrite an existing install even if mode/target changed
+    --expect-empty      Upgrade only a stopped installation with no bindings
     --purge             With uninstall, delete /etc/xboard-node too
     --yes, -y           Non-interactive confirmation for destructive operations
 
@@ -277,6 +343,10 @@ parse_args() {
                 FORCE_RECONFIGURE=1
                 shift
                 ;;
+            --expect-empty)
+                EXPECT_EMPTY=1
+                shift
+                ;;
             --interactive)
                 INTERACTIVE=1
                 shift
@@ -302,6 +372,9 @@ parse_args() {
 
     if [ ${#positional[@]} -gt 0 ] && [ "$ACTION" = "install" ]; then
         ACTION="${positional[0]}"
+    fi
+    if [[ "$EXPECT_EMPTY" == 1 && "$ACTION" != upgrade ]]; then
+        log_error "--expect-empty is only valid for upgrade"; return 1
     fi
 
     case "$KERNEL_TYPE" in
@@ -510,9 +583,6 @@ validate_install_request() {
         log_error "health-port must be a non-negative integer"
         exit 1
     fi
-    if [ "$HEALTH_PORT" -eq 0 ]; then
-        HEALTH_ENABLED=0
-    fi
     case "$KERNEL_TYPE" in
         singbox|xray) ;;
         *)
@@ -549,93 +619,77 @@ require_reconfigure_confirmation() {
     return
 }
 
-select_binary_source() {
-    if [ -n "$BINARY_SOURCE" ]; then
-        if [ ! -f "$BINARY_SOURCE" ]; then
-            log_error "Binary source not found: $BINARY_SOURCE"
-            exit 1
+# Only explicitly supplied paths are trusted as local builds. All other files
+# come from one concrete release, even when the caller requested "latest".
+stage_release() {
+    local node="xboard-node-linux-$ARCH" cli="xbctl-linux-$ARCH"
+    local base="https://github.com/$RELEASE_REPOSITORY/releases" resolved name src output reported
+    local i
+    local -a remote=() names=("$node" "$cli") sources=("$BINARY_SOURCE" "$CLI_BINARY_SOURCE")
+    if [[ -z "$BINARY_SOURCE" || -z "$CLI_BINARY_SOURCE" ]]; then
+        if ! [[ "$RELEASE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] ||
+           [[ "$RELEASE_REPOSITORY" == */. || "$RELEASE_REPOSITORY" == */.. ]]; then
+            log_error "Invalid release repository: $RELEASE_REPOSITORY"; return 1
         fi
-        echo "$BINARY_SOURCE"
-        return
+        if [[ "$RELEASE_VERSION" == latest ]]; then
+            resolved=$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 20 --max-time 90 -o /dev/null -w '%{url_effective}' "$base/latest")
+            if [[ "${resolved,,}" != "${base,,}/tag/"* ]]; then
+                log_error "Latest release did not resolve to a tag in $RELEASE_REPOSITORY"; return 1
+            fi
+            RELEASE_VERSION=${resolved:${#base}+5}
+        fi
+        if ! [[ "$RELEASE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            log_error "Invalid release tag: $RELEASE_VERSION"; return 1
+        fi
+        base="$base/download/$RELEASE_VERSION"
+        fetch_asset "$base/SHA256SUMS.txt" "$TMP_DIR/SHA256SUMS.txt"
+        if [[ "$ACTION" == upgrade && -e "$INSTALLER_COPY_PATH" ]]; then
+            if [[ ! -f "$INSTALLER_COPY_PATH" ]]; then
+                log_error "Expected a regular installer: $INSTALLER_COPY_PATH"; return 1
+            fi
+            fetch_asset "$base/install.sh" "$TMP_DIR/install.sh"
+            remote+=("install.sh")
+        fi
     fi
-    if [ -f "./xboard-node" ]; then
-        echo "./xboard-node"
-        return
-    fi
-    if [ -f "./xboard-node-linux-${ARCH}" ]; then
-        echo "./xboard-node-linux-${ARCH}"
-        return
-    fi
-    echo ""
+    for i in 0 1; do
+        name=${names[i]}; src=${sources[i]}
+        if [[ -n "$src" ]]; then
+            log_step "Using operator-provided binary: $src"
+            cp -- "$src" "$TMP_DIR/$name"
+        else
+            fetch_asset "$base/$name" "$TMP_DIR/$name"
+            remote+=("$name")
+        fi
+    done
+    for name in "${remote[@]}"; do
+        # Reconstruct one canonical line so malformed paths and duplicate
+        # binary/text entries cannot select a different file for verification.
+        local sum
+        sum=$(awk -v target="$name" '{ sub(/\r$/,""); file=$2; sub(/^\*/,"",file); if(file==target){n++; if(NF!=2 || length($1)!=64 || $1~/[^a-fA-F0-9]/) bad=1; hash=$1} } END{if(n!=1 || bad) exit 1; print hash}' "$TMP_DIR/SHA256SUMS.txt") || {
+            log_error "Missing, invalid or duplicate SHA256 for $name"; return 1; }
+        (cd "$TMP_DIR" && printf '%s  %s\n' "$sum" "$name" | sha256sum -c -)
+    done
+    mv -- "$TMP_DIR/$node" "$TMP_DIR/xboard-node"
+    mv -- "$TMP_DIR/$cli" "$TMP_DIR/xbctl"
+    chmod 755 "$TMP_DIR/xboard-node" "$TMP_DIR/xbctl"
+    local first_version="" arg
+    for name in xboard-node xbctl; do
+        if [[ "$name" == xboard-node ]]; then arg=-v; else arg=version; fi
+        output=$("$TMP_DIR/$name" "$arg")
+        local program
+        read -r program reported _ <<< "$output"
+        if [[ "$program" != "$name" || -z "$reported" || ( ${#remote[@]} -gt 0 && "$reported" != "$RELEASE_VERSION" ) ||
+              ( -n "$first_version" && "$reported" != "$first_version" ) ]]; then
+            log_error "Unexpected version from $name (expected ${first_version:-$RELEASE_VERSION})"; return 1
+        fi
+        first_version=$reported
+    done
+    if [[ "$RELEASE_VERSION" == latest ]]; then RELEASE_VERSION=$first_version; fi
 }
 
-resolve_download_url() {
-    local artifact="$1"
-    if ! [[ "$RELEASE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || \
-        [[ "$RELEASE_REPOSITORY" = */. || "$RELEASE_REPOSITORY" = */.. ]]; then
-        log_error "Set XBOARD_NODE_REPOSITORY=owner/repository to download this fork, or provide both --binary and --xbctl-binary"
-        return 1
-    fi
-    local download_base="https://github.com/${RELEASE_REPOSITORY}/releases"
-    if [ "$RELEASE_VERSION" = "latest" ]; then
-        DOWNLOAD_URL="${download_base}/latest/download/${artifact}"
-    else
-        DOWNLOAD_URL="${download_base}/download/${RELEASE_VERSION}/${artifact}"
-    fi
-}
-
-stage_binary() {
-    local staged="$TMP_DIR/xboard-node"
-    local local_src
-    local_src=$(select_binary_source)
-    if [ -n "$local_src" ]; then
-        log_step "Using local binary: ${local_src}"
-        cp "$local_src" "$staged"
-    else
-        resolve_download_url "xboard-node-linux-${ARCH}"
-        log_step "Downloading binary: ${DOWNLOAD_URL}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
-            log_error "Failed to download binary from ${DOWNLOAD_URL}"
-            exit 1
-        fi
-    fi
-    chmod +x "$staged"
-    if ! "$staged" -v >/dev/null 2>&1; then
-        log_error "Downloaded binary failed version check"
-        exit 1
-    fi
-}
-
-stage_xbctl() {
-    local staged="$TMP_DIR/xbctl"
-    local local_src=""
-    if [ -n "$CLI_BINARY_SOURCE" ]; then
-        if [ ! -f "$CLI_BINARY_SOURCE" ]; then
-            log_error "xbctl binary source not found: $CLI_BINARY_SOURCE"
-            exit 1
-        fi
-        local_src="$CLI_BINARY_SOURCE"
-    elif [ -f "./xbctl" ]; then
-        local_src="./xbctl"
-    elif [ -f "./xbctl-linux-${ARCH}" ]; then
-        local_src="./xbctl-linux-${ARCH}"
-    fi
-    if [ -n "$local_src" ]; then
-        log_step "Using local xbctl binary: ${local_src}"
-        cp "$local_src" "$staged"
-    else
-        resolve_download_url "xbctl-linux-${ARCH}"
-        log_step "Downloading xbctl: ${DOWNLOAD_URL}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
-            log_error "Failed to download xbctl from ${DOWNLOAD_URL}"
-            exit 1
-        fi
-    fi
-    chmod +x "$staged"
-    if ! "$staged" version > /dev/null 2>&1; then
-        log_error "Downloaded xbctl failed version check"
-        exit 1
-    fi
+fetch_asset() {
+    log_step "Downloading $1"
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 20 --max-time 180 -o "$2" "$1"
 }
 
 render_config() {
@@ -712,7 +766,9 @@ EOF_UNIT
 
 backup_existing_state() {
     BACKUP_PATH="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_PATH"
+    if ! mkdir -m 700 "$BACKUP_PATH"; then
+        BACKUP_PATH=$(mktemp -d "${BACKUP_PATH}.XXXXXX")
+    fi
     if [ -x "$BINARY_PATH" ]; then
         cp "$BINARY_PATH" "$BACKUP_PATH/xboard-node"
     fi
@@ -728,11 +784,11 @@ backup_existing_state() {
     if [ -f "$INSTALL_META" ]; then
         cp "$INSTALL_META" "$BACKUP_PATH/install-meta.json"
     fi
+    if [ -f "$INSTALLER_COPY_PATH" ]; then
+        cp "$INSTALLER_COPY_PATH" "$BACKUP_PATH/install.sh"
+    fi
     if [ -f "$SERVICE_PATH" ]; then
         cp "$SERVICE_PATH" "$BACKUP_PATH/${SERVICE_NAME}"
-        SERVICE_EXISTED=1
-    else
-        SERVICE_EXISTED=0
     fi
 }
 
@@ -742,6 +798,15 @@ stop_existing_service() {
     fi
 }
 
+replace_saved_installer() {
+    local dest staged
+    dest=$(realpath -m -- "$INSTALLER_COPY_PATH") || return 1
+    staged=$(mktemp -- "${dest}.XXXXXX") || return 1
+    if install -m 755 -- "$1" "$staged" && mv -fT -- "$staged" "$dest"; then return 0; fi
+    rm -f -- "$staged"
+    return 1
+}
+
 install_staged_files() {
     stop_existing_service
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
@@ -749,33 +814,31 @@ install_staged_files() {
     install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
-        install -m 755 "$0" "$INSTALLER_COPY_PATH"
+        replace_saved_installer "$0"
     fi
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
 }
 
 wait_for_health() {
-    if ! systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-        return 1
-    fi
-    if [ "$HEALTH_ENABLED" -eq 0 ]; then
-        return 0
-    fi
-    local attempt=0
-    local max_attempts=30
-    while [ "$attempt" -lt "$max_attempts" ]; do
-        if ! systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-            return 1
-        fi
-        if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
-            return 0
+    local first="" current props state pid restarts attempt=0
+    while (( attempt < 30 )); do
+        props=$(systemctl show --property=ActiveState,MainPID,NRestarts "$SERVICE_NAME") || return 1
+        state=; pid=; restarts=
+        while IFS='=' read -r key value; do
+            case "$key" in ActiveState) state=$value ;; MainPID) pid=$value ;; NRestarts) restarts=$value ;; esac
+        done <<< "$props"
+        [[ "$state" == active && "$pid" =~ ^[1-9][0-9]*$ && "$restarts" =~ ^[0-9]+$ ]] || return 1
+        current=$pid:$restarts
+        if [[ -z "$first" ]]; then first=$current; fi
+        [[ "$first" == "$current" ]] || return 1
+        if (( attempt >= 6 )); then
+            if [[ "$HEALTH_PORT" == 0 ]] || [[ $(curl -sS --max-time 1 --noproxy '*' -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HEALTH_PORT/healthz") == 200 ]]; then return 0; fi
         fi
         sleep 1
-        attempt=$((attempt + 1))
+        attempt=$((attempt+1))
     done
     return 1
 }
@@ -801,53 +864,110 @@ start_service() {
 
 perform_install() {
     validate_install_request
+    lock_installation
     detect_current_state
     require_reconfigure_confirmation
     TMP_DIR=$(mktemp -d)
     ensure_dirs
-    stage_binary
-    stage_xbctl
+    stage_release
     render_config
     render_service
+    record_service_state
+    load_deployment "$TMP_DIR/config.yml" "$TMP_DIR/credentials.env"
     backup_existing_state
+    MUTATING=1
     install_staged_files
     start_service
 
+    ensure_cli_link
     log_info "Installation succeeded"
     log_info "Service: ${SERVICE_NAME}"
     log_info "Config: ${CONFIG_FILE}"
     log_info "Credentials: ${CREDENTIALS_FILE}"
-    if [ "$HEALTH_ENABLED" -eq 1 ]; then
+    if [[ "$HEALTH_PORT" != 0 ]]; then
         log_info "Health: http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
     log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if xbctl is not in PATH)"
 }
 
 perform_upgrade() {
+    local checked_config="$CONFIG_FILE" legacy_sums=""
     detect_current_state
+    if [[ "$EXPECT_EMPTY" == 1 && "$CURRENT_STATE" != installed ]]; then
+        log_error "--expect-empty requires an existing installation"; return 1
+    fi
     if [ "$CURRENT_STATE" = "fresh" ]; then
         log_warn "No existing install found; falling back to install"
         perform_install
         return
     fi
+    lock_installation
     TMP_DIR=$(mktemp -d)
     ensure_dirs
-    stage_binary
-    stage_xbctl
+    stage_release
     render_service
+    record_service_state
+    if [[ "$EXPECT_EMPTY" == 1 && "$OLD_ACTIVE_STATE" != inactive ]]; then
+        log_error "--expect-empty requires a stopped service"; return 1
+    fi
+    if ! load_deployment "$CONFIG_FILE" "$CREDENTIALS_FILE" 2>"$TMP_DIR/layout.err"; then
+        if [[ "$EXPECT_EMPTY" != 1 ]]; then cat "$TMP_DIR/layout.err" >&2; return 1; fi
+        legacy_sums=$(sha256sum -- "$CONFIG_FILE" "$INSTALL_META") || return 1
+        checked_config="$TMP_DIR/empty.yml"
+        if ! "$TMP_DIR/xbctl" config migrate-empty-v241 --config "$CONFIG_FILE" --meta "$INSTALL_META" --output "$checked_config"; then
+            cat "$TMP_DIR/layout.err" >&2
+            return 1
+        fi
+        load_deployment "$checked_config" "$CREDENTIALS_FILE"
+        log_info "Confirmed an empty v2.4.1 deployment; upgrading its saved configuration"
+    fi
+    if [[ "$EXPECT_EMPTY" == 1 && "$HEALTH_PORT" != empty ]]; then
+        log_error "--expect-empty could not confirm an empty deployment"; return 1
+    fi
+    "$TMP_DIR/xbctl" config metadata --config "$checked_config" --meta "$TMP_DIR/install-meta.json" --version "$RELEASE_VERSION"
     backup_existing_state
+    # Historical bind commands did not take the install lock. Keep a newer
+    # configuration if an operator rebound or restarted the node during staging.
+    if [[ -n "$legacy_sums" ]]; then
+        local current_sums state
+        current_sums=$(sha256sum -- "$CONFIG_FILE" "$INSTALL_META") || return 1
+        state=$(systemctl show --property=ActiveState --value "$SERVICE_NAME") || return 1
+        if [[ "$current_sums" != "$legacy_sums" || "$state" != inactive ]]; then
+            log_error "Legacy files or service state changed while preparing migration"; return 1
+        fi
+    fi
+    MUTATING=1
+    if [[ "$checked_config" != "$CONFIG_FILE" ]]; then
+        install -m 600 "$checked_config" "$CONFIG_FILE"
+    fi
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
-    ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
+    install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    if [[ -f "$TMP_DIR/install.sh" ]]; then
+        replace_saved_installer "$TMP_DIR/install.sh"
+    fi
     systemctl daemon-reload
+    if [[ "$HEALTH_PORT" == empty ]]; then
+        if [[ "$OLD_ACTIVE_STATE" == active ]]; then systemctl stop "$SERVICE_NAME"; fi
+        ensure_cli_link
+        log_info "Upgrade succeeded; no node bindings, service remains stopped"
+        return
+    fi
     systemctl restart "$SERVICE_NAME"
     if ! wait_for_health; then
         log_error "Upgrade health check failed"
         show_recent_logs
         return 1
     fi
+    ensure_cli_link
     log_info "Upgrade succeeded"
+}
+
+ensure_cli_link() {
+    if [[ ! -e /usr/bin/xbctl && ! -L /usr/bin/xbctl ]]; then
+        ln -s "$CLI_PATH" /usr/bin/xbctl || log_warn "Could not create the optional /usr/bin/xbctl link"
+    fi
 }
 
 confirm_uninstall() {

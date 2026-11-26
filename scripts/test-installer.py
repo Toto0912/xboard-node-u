@@ -1,11 +1,13 @@
 """Exercise the actual piped Bash installer using a PTY, without installing anything."""
 
 import errno
+import hashlib
 import os
 import pty
 import select
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -105,15 +107,183 @@ wizard_case(
     "RESULT|machine|xray|https://panel.example.com|9||17", "retry-test-secret",
 )
 
-for override, expected_repo in [(None, "Toto0912/xboard-node-u"), ("example/fork", "example/fork")]:
-    env = os.environ.copy()
-    env.pop("XBOARD_NODE_REPOSITORY", None)
-    if override:
-        env["XBOARD_NODE_REPOSITORY"] = override
-    result = subprocess.run(
-        ["bash", "-c", 'source "$1"; parse_args --mode node --panel https://panel.example.com --token test --node-id 1; validate_install_request; resolve_download_url xbctl-linux-amd64; printf "%s" "$DOWNLOAD_URL"', "bash", str(INSTALLER)],
-        check=True, capture_output=True, text=True, env=env,
-    )
-    assert result.stdout == f"https://github.com/{expected_repo}/releases/latest/download/xbctl-linux-amd64"
+def staged_release(scenario, repository=None):
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        stage, dist = root / "stage", root / "dist"
+        stage.mkdir()
+        dist.mkdir()
+        names = ("xboard-node", "xbctl")
+        hashes = []
+        old_script, new_script = b"#!/bin/bash\n# v0\n", b"#!/bin/bash\n# v1\n"
+        saved = root / "saved.sh"
+        if scenario != "no-saved-installer":
+            saved.write_bytes(old_script)
+        if scenario == "saved-symlink":
+            target = root / "actual-script"
+            saved.rename(target)
+            saved.symlink_to(target)
+        if scenario != "no-saved-installer":
+            (dist / "install.sh").write_bytes(new_script)
+            hashes.append(f"{hashlib.sha256(new_script).hexdigest()} *install.sh")
+        for name in names:
+            asset = name + "-linux-amd64"
+            tag = "v0" if scenario == "wrong-version" and name == "xbctl" else "v1"
+            body = f'#!/bin/sh\necho {name} >> "$TRACE"\necho "{name} {tag}"\n'.encode()
+            (dist / asset).write_bytes(body)
+            hashes.append(f"{hashlib.sha256(body).hexdigest()} *{asset}")
+        if scenario == "damaged-node":
+            (dist / "xboard-node-linux-amd64").write_text("# damaged")
+        if scenario == "damaged-cli":
+            (dist / "xbctl-linux-amd64").write_text("# damaged")
+        if scenario == "damaged-installer":
+            (dist / "install.sh").write_text("# damaged")
+        if scenario == "missing":
+            hashes.pop()
+        if scenario == "duplicate":
+            hashes.append(hashes[-1])
+        (dist / "SHA256SUMS.txt").write_text("\r\n".join(hashes) + "\r\n")
+        harness = r'''
+source "$INSTALLER"
+ARCH=amd64
+TMP_DIR="$FIXTURE/stage"
+ACTION=upgrade
+INSTALLER_COPY_PATH="$FIXTURE/saved.sh"
+case "$SCENARIO" in
+    explicit) RELEASE_VERSION=v1 ;;
+    local)
+        BINARY_SOURCE="$FIXTURE/dist/xboard-node-linux-amd64"
+        CLI_BINARY_SOURCE="$FIXTURE/dist/xbctl-linux-amd64"
+        RELEASE_VERSION=local-label ;;
+esac
+curl() {
+    local last=${!#} out=""
+    while (( $# )); do if [[ "$1" == -o ]]; then out=$2; shift; fi; shift; done
+    case "$last" in
+        "$EXPECTED/latest")
+            echo query >> "$FIXTURE/lookups"
+            printf '%s' "${last%latest}tag/v1";;
+        "$EXPECTED/download/v1/"*) cp "$FIXTURE/dist/${last##*/}" "$out";;
+        *) return 1;;
+    esac
+}
+stage_release
+if [[ -f "$TMP_DIR/install.sh" ]]; then replace_saved_installer "$TMP_DIR/install.sh"; fi
+'''
+        trace = root / "trace"
+        env = {**os.environ, "INSTALLER":str(INSTALLER), "FIXTURE":temp, "TRACE":str(trace), "SCENARIO":scenario}
+        env.pop("XBOARD_NODE_REPOSITORY", None)
+        if repository:
+            env["XBOARD_NODE_REPOSITORY"] = repository
+        env["EXPECTED"] = "https://github.com/" + (repository or "Toto0912/xboard-node-u") + "/releases"
+        p = subprocess.run(["bash", "-c", harness], env=env, capture_output=True)
+        success = scenario in ("valid", "explicit", "local", "no-saved-installer", "saved-symlink")
+        assert (p.returncode == 0) == success, (scenario, p.stdout, p.stderr)
+        if scenario == "no-saved-installer":
+            assert not saved.exists()
+        else:
+            assert saved.read_bytes() == (new_script if success and scenario != "local" else old_script)
+            assert saved.is_symlink() == (scenario == "saved-symlink")
+        if scenario in ("explicit", "local"):
+            assert not (root / "lookups").exists()
+        else:
+            assert (root / "lookups").read_text().splitlines() == ["query"]
+        ran = trace.read_text().splitlines() if trace.exists() else []
+        assert ran == (list(names) if success or scenario == "wrong-version" else []), (scenario, ran)
+
+
+for scenario in ("valid", "explicit", "local", "no-saved-installer", "saved-symlink", "damaged-node", "damaged-cli", "damaged-installer", "missing", "duplicate", "wrong-version"):
+    staged_release(scenario)
+staged_release("valid", "example/fork")
+
+def maintenance_rollback(previous, candidate, resets, succeeds, reset_error=False):
+    harness = r'''
+source "$INSTALLER"
+CURRENT_STATE=managed
+SERVICE_PATH="$FIXTURE/unit"
+systemctl() {
+    case "$1" in
+        show) cat "$FIXTURE/state" ;;
+        is-enabled) return 1 ;;
+        stop|daemon-reload) return 0 ;;
+        reset-failed)
+            echo reset >> "$FIXTURE/calls"
+            [[ "$FAIL_RESET" == no ]] || return 1
+            echo inactive > "$FIXTURE/state" ;;
+        *) echo "unexpected systemctl $*" >&2; return 1 ;;
+    esac
+}
+record_service_state
+echo "$CANDIDATE" > "$FIXTURE/state"
+rollback_install
+'''
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "state").write_text(previous)
+        (root / "calls").touch()
+        env = {**os.environ, "INSTALLER": str(INSTALLER), "FIXTURE": tmp,
+               "CANDIDATE": candidate, "FAIL_RESET": "yes" if reset_error else "no"}
+        result = subprocess.run(["bash", "-c", harness], env=env, capture_output=True)
+        assert (result.returncode == 0) == succeeds, (previous, candidate, result.stdout, result.stderr)
+        assert (root / "calls").read_text().splitlines() == ["reset"] * resets
+        if succeeds:
+            assert (root / "state").read_text().strip() == previous
+
+
+maintenance_rollback("inactive", "failed", 1, True)
+maintenance_rollback("inactive", "inactive", 0, True)
+maintenance_rollback("failed", "failed", 0, True)
+maintenance_rollback("inactive", "failed", 1, False, reset_error=True)
+maintenance_rollback("failed", "inactive", 0, False)
+
+def legacy_rebind_during_stage(change):
+    harness = r'''
+source "$INSTALLER"
+ACTION=upgrade
+EXPECT_EMPTY=1
+CONFIG_FILE="$FIXTURE/config.yml"
+INSTALL_META="$FIXTURE/install-meta.json"
+detect_current_state() { CURRENT_STATE=installed; }
+lock_installation() { :; }
+ensure_dirs() { :; }
+stage_release() {
+    cat > "$TMP_DIR/xbctl" <<'EOF'
+#!/bin/sh
+if [ "$2" = migrate-empty-v241 ]; then
+    for arg do :; done
+    echo 'instances: []' > "$arg"
+fi
+EOF
+    chmod +x "$TMP_DIR/xbctl"
+}
+render_service() { :; }
+record_service_state() { OLD_ACTIVE_STATE=inactive; }
+load_deployment() { [[ "$1" != "$CONFIG_FILE" ]] || return 1; HEALTH_PORT=empty; }
+backup_existing_state() {
+    case "$CHANGE" in
+        config) echo rebound > "$CONFIG_FILE";;
+        metadata) echo rebound > "$INSTALL_META";;
+        state) echo active > "$FIXTURE/state";;
+    esac
+}
+systemctl() { [[ "$1" == show ]] && cat "$FIXTURE/state"; }
+install() { touch "$FIXTURE/mutated"; return 1; }
+rollback_install() { touch "$FIXTURE/rolled-back"; }
+perform_upgrade
+'''
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name in ("config.yml", "install-meta.json", "state"):
+            (root / name).write_text("inactive\n" if name == "state" else "original\n")
+        p = subprocess.run(["bash", "-c", harness], capture_output=True,
+                           env={**os.environ, "INSTALLER": str(INSTALLER), "FIXTURE": tmp, "CHANGE": change})
+        assert p.returncode and b"changed while preparing migration" in p.stdout, (p.stdout, p.stderr)
+        assert not (root / "mutated").exists() and not (root / "rolled-back").exists()
+        for name, changed_by in (("config.yml", "config"), ("install-meta.json", "metadata")):
+            assert (root / name).read_text() == ("rebound\n" if change == changed_by else "original\n")
+
+
+for change in ("config", "metadata", "state"):
+    legacy_rebind_during_stage(change)
 
 print("Installer tests passed: piped interactive machine/node setup, hidden tokens, input retries and repository selection.")

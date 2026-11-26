@@ -114,11 +114,14 @@ func (q trafficSpool) list() ([]string, int, error) {
 			names = append(names, e.Name())
 		case strings.HasPrefix(e.Name(), ".partial-"):
 			info, err := e.Info()
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			if err != nil {
 				return nil, 0, err
 			}
 			if time.Since(info.ModTime()) > time.Hour {
-				if err := os.Remove(filepath.Join(q.dir, e.Name())); err != nil {
+				if err := os.Remove(filepath.Join(q.dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 					return nil, 0, err
 				}
 			} else {

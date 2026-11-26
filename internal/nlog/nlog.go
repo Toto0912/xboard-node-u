@@ -35,21 +35,33 @@ var (
 	defaultNode string
 	nodeLoggers = make(map[string]*NodeLog)
 
-	logMu      sync.RWMutex
-	logWriter  io.Writer = os.Stdout
-	logMin     = slog.LevelInfo
-	logColor   = true
+	logMu     sync.RWMutex
+	logWriter io.Writer = os.Stdout
+	ownedLog  *os.File
+	logMin    = slog.LevelInfo
+	logColor  = true
 )
 
 // Init configures process-wide log output (called from config.InitLogger).
 // w must be non-nil. minLevel drops messages below that severity.
 // color enables ANSI coloring when true (typically TTY + stdout/stderr).
 func Init(w io.Writer, minLevel slog.Level, color bool) {
+	setOutput(w, minLevel, color, nil)
+}
+
+// InitFile takes ownership of a log file opened by the configuration loader.
+func InitFile(f *os.File, minLevel slog.Level) { setOutput(f, minLevel, false, f) }
+
+func setOutput(w io.Writer, minLevel slog.Level, color bool, owned *os.File) {
 	if w == nil {
 		w = os.Stdout
 	}
 	logMu.Lock()
 	defer logMu.Unlock()
+	if ownedLog != nil && ownedLog != owned {
+		_ = ownedLog.Close()
+	}
+	ownedLog = owned
 	logWriter = w
 	logMin = minLevel
 	logColor = color
@@ -169,9 +181,7 @@ func (nl *NodeLog) Error(msg string, args ...any) {
 // Format: HH:MM:SS.mmm LEVEL [prefix] message [key=value ...]
 func logWithColor(level slog.Level, prefix, msg string, args ...any) {
 	logMu.RLock()
-	out := logWriter
 	min := logMin
-	color := logColor
 	logMu.RUnlock()
 
 	if level < min {
@@ -180,6 +190,12 @@ func logWithColor(level slog.Level, prefix, msg string, args ...any) {
 
 	now := time.Now().Format("15:04:05.000")
 	fullMsg := formatMsg(msg, args)
+	logMu.RLock()
+	defer logMu.RUnlock()
+	if level < logMin {
+		return
+	}
+	out, color := logWriter, logColor
 
 	var levelStr string
 	switch level {

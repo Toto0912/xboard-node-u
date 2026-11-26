@@ -304,7 +304,9 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	// we should enable a default TLS config to ensure the inbound can start.
 	ss, _ := base["streamSettings"].(M)
 	if security, ok := ss["security"].(string); !ok || (security != "tls" && security != "reality") {
-		nc.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
+		effective := *nc
+		effective.TLS = 1
+		nc = &effective
 		applyStreamSettings(base, nc, tc)
 	}
 
@@ -520,7 +522,10 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 }
 
 func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
-	ss := M{}
+	ss, _ := base["streamSettings"].(M)
+	if ss == nil {
+		ss = M{}
+	}
 
 	// Network / transport
 	network := nc.Network
@@ -611,8 +616,7 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 				// xray rejects [] for fields that expect objects (e.g. sockopt, tlsSettings).
 				// Recursively strip empty arrays from the extra map before passing to xray.
 				if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
-					sanitizeEmptyArrays(m)
-					xhttpSettings["extra"] = m
+					xhttpSettings["extra"] = withoutEmptyArrays(m)
 				}
 			}
 		}
@@ -818,7 +822,11 @@ func compileCustomRouteRule(rule model.CustomRouteRule) []M {
 			if value == "" {
 				continue
 			}
-			domains = append(domains, "domain:"+value)
+			if strings.HasPrefix(value, "geosite:") {
+				domains = append(domains, value)
+			} else {
+				domains = append(domains, "domain:"+value)
+			}
 		}
 		if len(domains) > 0 {
 			compiled = append(compiled, M{
@@ -889,20 +897,23 @@ func copyStrings(src []string) []string {
 	return out
 }
 
-// sanitizeEmptyArrays recursively removes empty slices from a map.
+// withoutEmptyArrays copies maps before stripping empty JSON arrays.
 // PHP encodes empty objects as [] instead of {}; xray-core rejects []
 // for fields that expect struct types (e.g. sockopt, tlsSettings).
-func sanitizeEmptyArrays(m map[string]interface{}) {
+func withoutEmptyArrays(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
 	for k, v := range m {
-		switch val := v.(type) {
-		case []interface{}:
-			if len(val) == 0 {
-				delete(m, k)
+		switch value := v.(type) {
+		case []any:
+			if len(value) == 0 {
+				continue
 			}
-		case map[string]interface{}:
-			sanitizeEmptyArrays(val)
+		case map[string]any:
+			v = withoutEmptyArrays(value)
 		}
+		out[k] = v
 	}
+	return out
 }
 
 // extractECHServerKeys extracts the ECH private key from tls_settings.ech

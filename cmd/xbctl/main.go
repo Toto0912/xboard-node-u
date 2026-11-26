@@ -50,72 +50,6 @@ type instanceRow struct {
 	Health  string `json:"health"`
 }
 
-type fileRootConfig struct {
-	Log       *fileLogConfig     `yaml:"log,omitempty"`
-	Kernel    *fileKernelConfig  `yaml:"kernel,omitempty"`
-	Node      *fileNodeConfig    `yaml:"node,omitempty"`
-	WS        *config.WSConfig   `yaml:"ws,omitempty"`
-	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance     `yaml:"instances,omitempty"`
-}
-
-type fileInstance struct {
-	ID         string             `yaml:"id,omitempty"`
-	Panel      filePanelConfig    `yaml:"panel"`
-	Node       *fileNodeConfig    `yaml:"node,omitempty"`
-	Kernel     fileKernelConfig   `yaml:"kernel"`
-	Log        fileLogConfig      `yaml:"log"`
-	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	HealthPort int                `yaml:"health_port,omitempty"`
-	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
-	Standalone map[string]any     `yaml:"standalone,omitempty"`
-	Cert       *config.CertConfig `yaml:"cert,omitempty"`
-	WS         *config.WSConfig   `yaml:"ws,omitempty"`
-	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
-}
-
-type filePanelConfig struct {
-	URL      string `yaml:"url"`
-	Token    string `yaml:"token,omitempty"`
-	TokenEnv string `yaml:"token_env,omitempty"`
-	NodeID   int    `yaml:"node_id,omitempty"`
-	NodeType string `yaml:"node_type,omitempty"`
-}
-
-type fileMachineConfig struct {
-	MachineID int    `yaml:"machine_id"`
-	Token     string `yaml:"token,omitempty"`
-	TokenEnv  string `yaml:"token_env,omitempty"`
-}
-
-type fileNodeConfig struct {
-	PushInterval         int `yaml:"push_interval,omitempty"`
-	PullInterval         int `yaml:"pull_interval,omitempty"`
-	TrackInterval        int `yaml:"track_interval,omitempty"`
-	DeviceReportInterval int `yaml:"device_report_interval,omitempty"`
-}
-
-type fileKernelConfig struct {
-	Type         string           `yaml:"type"`
-	ConfigDir    string           `yaml:"config_dir"`
-	LogLevel     string           `yaml:"log_level,omitempty"`
-	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig string           `yaml:"custom_config,omitempty"`
-	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
-}
-
-type fileLogConfig struct {
-	Level  string `yaml:"level,omitempty"`
-	Output string `yaml:"output,omitempty"`
-}
-
-type fileRuntimeConfig struct {
-	GoMemLimit  string `yaml:"gomemlimit,omitempty"`
-	GoGCPercent int    `yaml:"gogc,omitempty"`
-}
-
 type instanceSummary struct {
 	ID         string `json:"id"`
 	PanelURL   string `json:"panel_url"`
@@ -168,7 +102,7 @@ func run(args []string) error {
 	case "service":
 		return runService(args[1:])
 	case "logs", "log":
-		return runService([]string{"logs"})
+		return runService(append([]string{"logs"}, args[1:]...))
 	case "health":
 		return runHealth()
 	case "bind":
@@ -396,135 +330,90 @@ func runUpgrade(args []string) error {
 		return runAlpineInstaller("upgrade", args)
 	}
 
-	version := "latest"
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--version" && i+1 < len(args) {
-			version = args[i+1]
-			i++
-		}
+	requested := "latest"
+	if len(args) == 2 && args[0] == "--version" {
+		requested = args[1]
+	} else if len(args) != 0 {
+		return errors.New("usage: xbctl upgrade [--version VERSION]")
 	}
-
-	arch := runtime.GOARCH
-	if arch != "amd64" && arch != "arm64" {
-		return fmt.Errorf("unsupported architecture: %s", arch)
-	}
-
-	fmt.Println("Starting upgrade...")
-
-	binaryDir := filepath.Dir(defaultBinaryPath)
-	cliDir := filepath.Dir(defaultCLIPath)
-	newBinary := filepath.Join(binaryDir, ".xboard-node.new")
-	newCLI := filepath.Join(cliDir, ".xbctl.new")
-
-	binaryURL, err := resolveDownloadURL(fmt.Sprintf("xboard-node-linux-%s", arch), version)
+	base, err := releaseBaseURL()
 	if err != nil {
 		return err
 	}
-	cliURL, err := resolveDownloadURL(fmt.Sprintf("xbctl-linux-%s", arch), version)
-	if err != nil {
+	var healthPort int
+	var previousState string
+	prepare := func() error {
+		out, err := exec.Command("systemctl", "show", "--property=WorkingDirectory", "--value", serviceName).Output()
+		if err != nil {
+			return fmt.Errorf("read service working directory: %w", err)
+		}
+		serviceDirectory := strings.TrimSpace(string(out))
+		if serviceDirectory == "" {
+			serviceDirectory = "/"
+		}
+		port, err := deploymentPort(defaultConfigPath, defaultCredentialsPath, serviceDirectory, defaultConfigPath)
+		if err != nil {
+			return err
+		}
+		healthPort = port
+		previousState, err = serviceActiveState()
+		if err != nil {
+			return err
+		}
+		switch previousState {
+		case "active", "inactive", "failed":
+		default:
+			return fmt.Errorf("service state is changing (%s), retry when settled", previousState)
+		}
+		return nil
+	}
+	installedVersion := ""
+	installerPath := filepath.Join(defaultInstallRoot, "install.sh")
+	record := func(tag string, installer []byte) error {
+		root, err := loadWritableRootConfig(defaultConfigPath)
+		if err != nil {
+			return err
+		}
+		meta, err := installMetaBytes(root, tag, "")
+		if err != nil {
+			return err
+		}
+		files := []bindingFile{{path: defaultMetaPath, data: meta, mode: 0644}}
+		if installer != nil {
+			files = append(files, bindingFile{path: installerPath, data: installer, mode: 0755})
+		}
+		if err := commitBindingFiles(files); err != nil {
+			return fmt.Errorf("record installed release: %w", err)
+		}
+		installedVersion = tag
+		if _, err := os.Lstat("/usr/bin/xbctl"); os.IsNotExist(err) {
+			if err := os.Symlink(defaultCLIPath, "/usr/bin/xbctl"); err != nil {
+				fmt.Printf("Warning: could not create xbctl symlink: %v\n", err)
+			}
+		}
+		return nil
+	}
+	if err := upgradeRelease(base, requested, runtime.GOARCH, filepath.Dir(defaultBinaryPath), installerPath, prepare, record, func(rollback bool) error {
+		if rollback && previousState != "active" {
+			return restoreStoppedService(previousState)
+		}
+		if !rollback && healthPort < 0 {
+			if previousState == "active" {
+				return runCommand("systemctl", "stop", serviceName)
+			}
+			return nil
+		}
+		if err := runCommand("systemctl", "daemon-reload"); err != nil {
+			return err
+		}
+		if err := runCommand("systemctl", "restart", serviceName); err != nil {
+			return err
+		}
+		return observeInstalledStart(healthPort)
+	}); err != nil {
 		return err
 	}
-
-	fmt.Printf("Downloading %s...\n", binaryURL)
-	if err := downloadFile(binaryURL, newBinary); err != nil {
-		return fmt.Errorf("download binary: %w", err)
-	}
-
-	fmt.Printf("Downloading %s...\n", cliURL)
-	if err := downloadFile(cliURL, newCLI); err != nil {
-		os.Remove(newBinary)
-		return fmt.Errorf("download xbctl: %w", err)
-	}
-
-	if err := os.Chmod(newBinary, 0o755); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod binary: %w", err))
-	}
-	if err := os.Chmod(newCLI, 0o755); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod xbctl: %w", err))
-	}
-
-	// Validate downloaded binaries
-	if out, err := exec.Command(newBinary, "-v").CombinedOutput(); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("binary version check failed: %s", string(out)))
-	}
-	if out, err := exec.Command(newCLI, "version").CombinedOutput(); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("xbctl version check failed: %s", string(out)))
-	}
-
-	// Backup existing binaries
-	backupBinary := defaultBinaryPath + ".bak"
-	backupCLI := defaultCLIPath + ".bak"
-	// Backup existing binaries
-	if fileExists(defaultBinaryPath) {
-		if err := copyFile(defaultBinaryPath, backupBinary); err != nil {
-			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup binary: %w", err))
-		}
-	}
-	if fileExists(defaultCLIPath) {
-		if err := copyFile(defaultCLIPath, backupCLI); err != nil {
-			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup xbctl: %w", err))
-		}
-	}
-
-	// Atomic rename
-	if err := os.Rename(newBinary, defaultBinaryPath); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("replace binary: %w", err))
-	}
-	if err := os.Rename(newCLI, defaultCLIPath); err != nil {
-		if fileExists(backupBinary) {
-			os.Rename(backupBinary, defaultBinaryPath)
-		}
-		os.Remove(newCLI)
-		return fmt.Errorf("replace xbctl: %w", err)
-	}
-
-	// Recreate /usr/bin/xbctl symlink
-	os.Remove("/usr/bin/xbctl")
-	os.Symlink(defaultCLIPath, "/usr/bin/xbctl")
-
-	// Restart service
-	fmt.Println("Restarting service...")
-	runCommand("systemctl", "daemon-reload")
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
-		fmt.Println("Restart failed, rolling back...")
-		rollbackOK := true
-		if fileExists(backupBinary) {
-			if e := os.Rename(backupBinary, defaultBinaryPath); e != nil {
-				fmt.Printf("Warning: rollback binary failed: %v\n", e)
-				rollbackOK = false
-			}
-		}
-		if fileExists(backupCLI) {
-			if e := os.Rename(backupCLI, defaultCLIPath); e != nil {
-				fmt.Printf("Warning: rollback xbctl failed: %v\n", e)
-				rollbackOK = false
-			}
-		}
-		runCommand("systemctl", "daemon-reload")
-		if e := runCommand("systemctl", "restart", serviceName); e != nil {
-			return fmt.Errorf("upgrade and rollback restart both failed: %w", e)
-		}
-		if rollbackOK {
-			return errors.New("upgrade failed: service restart failed, rolled back successfully")
-		}
-		return errors.New("upgrade failed: partial rollback, check binary state manually")
-	}
-
-	// Clean up backups
-	os.Remove(backupBinary)
-	os.Remove(backupCLI)
-
-	// Update install-meta.json
-	newVer := "unknown"
-	if out, err := exec.Command(defaultBinaryPath, "-v").CombinedOutput(); err == nil {
-		newVer = strings.TrimSpace(string(out))
-	}
-	if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
-		instances, _ := root.NormalizeInstances()
-		writeInstallMetaVersioned(defaultMetaPath, root, newVer, latestInstanceID(instances))
-	}
-
-	fmt.Printf("Upgrade complete (version: %s)\n", newVer)
+	fmt.Printf("Upgrade complete (version: %s)\n", installedVersion)
 	return nil
 }
 
@@ -624,7 +513,7 @@ func ensureRoot(cmd string) error {
 	return nil
 }
 
-func resolveDownloadURL(artifact, version string) (string, error) {
+func releaseBaseURL() (string, error) {
 	repository := strings.TrimSpace(os.Getenv("XBOARD_NODE_REPOSITORY"))
 	if repository == "" {
 		repository = releaseRepository
@@ -633,36 +522,7 @@ func resolveDownloadURL(artifact, version string) (string, error) {
 		strings.HasSuffix(repository, "/.") || strings.HasSuffix(repository, "/..") {
 		return "", errors.New("set XBOARD_NODE_REPOSITORY to your GitHub owner/repository, or use a release build with an embedded repository")
 	}
-	downloadBase := "https://github.com/" + repository + "/releases"
-	if version == "latest" {
-		return downloadBase + "/latest/download/" + artifact, nil
-	}
-	return downloadBase + "/download/" + version + "/" + artifact, nil
-}
-
-func downloadFile(url, dest string) error {
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-	}
-	f, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
-}
-
-func cleanupFiles(a, b string, err error) error {
-	os.Remove(a)
-	os.Remove(b)
-	return err
+	return "https://github.com/" + repository + "/releases", nil
 }
 
 func fileExists(path string) bool {
@@ -670,12 +530,39 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func binaryVersion(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "xboard-node" {
+			return f[1]
+		}
+	}
+	return "unknown"
+}
+
 func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
+
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, data, 0o755)
+	defer in.Close()
+	out, err := os.CreateTemp(filepath.Dir(dst), ".xbctl-backup-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(out.Name())
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Chmod(0755)
+	}
+	if err == nil {
+		err = out.Sync()
+	}
+	if err = errors.Join(err, out.Close()); err != nil {
+		return err
+	}
+	return os.Rename(out.Name(), dst)
 }
 
 func runCommand(name string, args ...string) error {
@@ -811,37 +698,17 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		}
 		return fmt.Errorf("binding not found: panel=%s machine_id=%d", panelURL, machineID)
 	}
+
+	root.Instances = kept
+	if err := saveBindingRemoval(defaultConfigPath, defaultCredentialsPath, defaultMetaPath, root, removed); err != nil {
+		return err
+	}
 	if len(kept) == 0 {
-		// Last binding removed — stop the service to prevent crash-loop
-		root.Instances = nil
-		if err := writeRootConfig(defaultConfigPath, root); err != nil {
-			return err
-		}
-		if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
-			return err
-		}
-		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
-			return err
-		}
 		if err := controlService("stop"); err != nil {
 			return err
 		}
-		fmt.Printf("removed %d binding(s)\n", len(removed))
 		fmt.Println("All bindings removed. Service stopped.")
-		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
 		return nil
-	}
-
-	root.Instances = kept
-	// Preserve top-level shared settings (log, kernel, etc.) — instances inherit from these.
-	if err := writeRootConfig(defaultConfigPath, root); err != nil {
-		return err
-	}
-	if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
-		return err
-	}
-	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
-		return err
 	}
 	if err := controlService("restart"); err != nil {
 		return err
@@ -870,163 +737,14 @@ func loadWritableRootConfig(path string) (*config.RootConfig, error) {
 }
 
 func normalizeRootInstances(root *config.RootConfig) []config.Config {
-	if len(root.Instances) > 0 {
+	if root.Instances != nil {
 		return append([]config.Config(nil), root.Instances...)
 	}
 	// Only treat legacy single-config mode if the embedded Config is valid
-	if root.Config.Panel.URL != "" {
+	if root.Config.Panel.URL != "" || root.Config.IsStandalone() {
 		return []config.Config{root.Config}
 	}
 	return nil
-}
-
-func writeRootConfig(path string, root *config.RootConfig) error {
-	instances := root.Instances
-	if len(instances) == 0 && root.Config.Panel.URL != "" {
-		instances = []config.Config{root.Config}
-	}
-	out := fileRootConfig{Instances: make([]fileInstance, 0, len(instances))}
-
-	// Preserve top-level shared settings so instances can inherit them.
-	p := &root.Config
-	if p.Log.Level != "" || p.Log.Output != "" {
-		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
-	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
-	}
-	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
-		out.Node = &fileNodeConfig{
-			PushInterval:         p.Node.PushInterval,
-			PullInterval:         p.Node.PullInterval,
-			TrackInterval:        p.Node.TrackInterval,
-			DeviceReportInterval: p.Node.DeviceReportInterval,
-		}
-	}
-	if p.Runtime.GoMemLimit != "" || p.Runtime.GoGCPercent != 0 {
-		out.Runtime = &fileRuntimeConfig{GoMemLimit: p.Runtime.GoMemLimit, GoGCPercent: p.Runtime.GoGCPercent}
-	}
-	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
-		out.WS = &p.WS
-	}
-	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
-		out.Cert = &p.Cert
-	}
-
-	for _, inst := range instances {
-		fi := fileInstance{
-			ID: inst.InstanceID,
-			Panel: filePanelConfig{
-				URL:      inst.Panel.URL,
-				Token:    inst.Panel.Token,
-				TokenEnv: inst.Panel.TokenEnv,
-				NodeID:   inst.Panel.NodeID,
-				NodeType: inst.Panel.NodeType,
-			},
-			Kernel: fileKernelConfig{
-				Type:         inst.Kernel.Type,
-				ConfigDir:    inst.Kernel.ConfigDir,
-				LogLevel:     inst.Kernel.LogLevel,
-				GeoDataDir:   inst.Kernel.GeoDataDir,
-				CustomConfig: inst.Kernel.CustomConfig,
-				CustomRoute:  inst.Kernel.CustomRoute,
-				CustomOut:    inst.Kernel.CustomOutbound,
-			},
-			Log: fileLogConfig{
-				Level:  inst.Log.Level,
-				Output: inst.Log.Output,
-			},
-			HealthPort: inst.HealthPort,
-		}
-		if !inst.IsMachineMode() && (inst.Node.PushInterval != 0 || inst.Node.PullInterval != 0 || inst.Node.TrackInterval != 0 || inst.Node.DeviceReportInterval != 0) {
-			fi.Node = &fileNodeConfig{
-				PushInterval:         inst.Node.PushInterval,
-				PullInterval:         inst.Node.PullInterval,
-				TrackInterval:        inst.Node.TrackInterval,
-				DeviceReportInterval: inst.Node.DeviceReportInterval,
-			}
-		}
-		if inst.Runtime.GoMemLimit != "" || inst.Runtime.GoGCPercent != 0 {
-			fi.Runtime = &fileRuntimeConfig{
-				GoMemLimit:  inst.Runtime.GoMemLimit,
-				GoGCPercent: inst.Runtime.GoGCPercent,
-			}
-		}
-		if inst.IsMachineMode() && inst.Machine != nil {
-			fi.Machine = &fileMachineConfig{
-				MachineID: inst.Machine.MachineID,
-				Token:     inst.Machine.Token,
-				TokenEnv:  inst.Machine.TokenEnv,
-			}
-			fi.Panel.NodeID = 0
-			fi.Panel.NodeType = ""
-		}
-		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
-			fi.Cert = &inst.Cert
-		}
-		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
-			fi.WS = &inst.WS
-		}
-		if len(inst.Nodes) > 0 {
-			fi.Nodes = inst.Nodes
-		}
-		out.Instances = append(out.Instances, fi)
-	}
-	data, err := yaml.Marshal(&out)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	return os.WriteFile(path, data, 0o600)
-}
-
-func pruneCredentialKeys(path string, removed []config.Config) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read credentials: %w", err)
-	}
-	removeKeys := map[string]struct{}{}
-	for _, inst := range removed {
-		if env := strings.TrimSpace(inst.Panel.TokenEnv); env != "" {
-			removeKeys[env] = struct{}{}
-		}
-		if inst.Machine != nil {
-			if env := strings.TrimSpace(inst.Machine.TokenEnv); env != "" {
-				removeKeys[env] = struct{}{}
-			}
-		}
-	}
-	lines := strings.Split(string(data), "\n")
-	kept := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		key := trimmed
-		if idx := strings.Index(trimmed, "="); idx >= 0 {
-			key = trimmed[:idx]
-		}
-		if _, ok := removeKeys[key]; ok {
-			continue
-		}
-		kept = append(kept, line)
-	}
-	output := strings.Join(kept, "\n")
-	if output != "" {
-		output += "\n"
-	}
-	return os.WriteFile(path, []byte(output), 0o600)
-}
-
-func writeInstallMeta(path string, root *config.RootConfig) error {
-	ver := "unknown"
-	if meta, err := loadInstallMeta(path); err == nil && strings.TrimSpace(meta.Version) != "" {
-		ver = meta.Version
-	}
-	return writeInstallMetaVersioned(path, root, ver, "")
 }
 
 func instanceMode(inst config.Config) string {
@@ -1118,33 +836,11 @@ func healthStatus() string {
 }
 
 func instanceAwareHealth() string {
-	port := 0
-	if meta, err := loadInstallMeta(defaultMetaPath); err == nil {
-		for _, inst := range meta.Instances {
-			if inst.HealthPort > 0 {
-				port = inst.HealthPort
-				break
-			}
-		}
+	port, err := deploymentPort(defaultConfigPath, defaultCredentialsPath, filepath.Dir(defaultConfigPath), defaultConfigPath)
+	if err != nil {
+		return "unknown"
 	}
-	if port == 0 {
-		if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
-			// Check top-level health_port first (inherited by all instances)
-			if root.HealthPort > 0 {
-				port = root.HealthPort
-			}
-			if port == 0 {
-				instances, _ := root.NormalizeInstances()
-				for _, inst := range instances {
-					if inst.HealthPort > 0 {
-						port = inst.HealthPort
-						break
-					}
-				}
-			}
-		}
-	}
-	if port == 0 {
+	if port <= 0 {
 		return "disabled"
 	}
 	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
@@ -1229,10 +925,12 @@ func runConfig(args []string) error {
 	switch args[0] {
 	case "init":
 		return runConfigInit(args[1:])
-	case "health-port":
+	case "health-port", "deployment-port":
 		return runConfigHealthPort(args[1:])
 	case "metadata":
 		return runConfigMetadata(args[1:])
+	case "migrate-empty-v241":
+		return runMigrateEmptyV241(args[1:])
 	default:
 		return fmt.Errorf("unknown config command: %s", args[0])
 	}
@@ -1405,12 +1103,17 @@ func runConfigInit(args []string) error {
 	}
 
 	// Load existing config (if any).
+	if configIn == "" {
+		configIn = configOut
+	}
 	root := &config.RootConfig{}
 	hasExisting := false
 	if configIn != "" {
 		if loaded, loadErr := loadWritableRootConfig(configIn); loadErr == nil {
 			root = loaded
-			hasExisting = len(root.Instances) > 0 || root.Config.Panel.URL != "" || root.Config.Kernel.Type != ""
+			hasExisting = len(root.Instances) > 0 || root.Config.Panel.URL != "" || root.Config.Kernel.Type != "" || root.Config.IsStandalone()
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			return loadErr
 		}
 	}
 
@@ -1458,78 +1161,65 @@ func runConfigInit(args []string) error {
 	if configOut == "" {
 		return errors.New("--output (or --config) is required")
 	}
-	if err := writeRootConfig(configOut, root); err != nil {
+
+	if credentialsIn == "" {
+		credentialsIn = credentialsOut
+	}
+	if configIn == "" {
+		configIn = configOut
+	}
+	contents, err := bindingConfig(configIn, root, &inst)
+	if err != nil {
 		return err
 	}
-
-	// Write credentials.
+	files := []bindingFile{{path: configOut, data: contents, mode: 0600}}
 	if token != "" && credentialsOut != "" {
-		if err := mergeCredentials(credentialsIn, credentialsOut, envKey, token); err != nil {
+		contents, err := editCredentials(credentialsIn, map[string]string{envKey: token}, nil)
+		if err != nil {
 			return err
 		}
+		files = append(files, bindingFile{path: credentialsOut, data: contents, mode: 0600})
 	}
-
-	// Write install-meta.json.
 	if metaPath != "" {
-		if err := writeInstallMetaVersioned(metaPath, root, releaseVersion, instanceID); err != nil {
+		data, err := installMetaBytes(root, releaseVersion, instanceID)
+		if err != nil {
 			return err
 		}
+		files = append(files, bindingFile{path: metaPath, data: data, mode: 0644})
 	}
-
+	if err := commitBindingFiles(files); err != nil {
+		return err
+	}
 	// Output for bash capture.
 	fmt.Printf("INSTANCE_ID=%s\n", instanceID)
 	fmt.Printf("ENV_KEY=%s\n", envKey)
 	return nil
 }
 
-// mergeCredentials reads existing key=value credentials, adds/replaces
-// the given key, and writes the result preserving insertion order.
-func mergeCredentials(srcPath, dstPath, key, value string) error {
-	entries := make(map[string]string)
-	var order []string
-	if srcPath != "" {
-		data, err := os.ReadFile(srcPath)
-		if err == nil {
-			for _, raw := range strings.Split(string(data), "\n") {
-				line := strings.TrimSpace(raw)
-				if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
-					continue
-				}
-				k, v, _ := strings.Cut(line, "=")
-				if _, exists := entries[k]; !exists {
-					order = append(order, k)
-				}
-				entries[k] = v
-			}
-		}
-	}
-	if _, exists := entries[key]; !exists {
-		order = append(order, key)
-	}
-	entries[key] = value
-
-	var buf strings.Builder
-	for _, k := range order {
-		fmt.Fprintf(&buf, "%s=%s\n", k, entries[k])
-	}
-	return os.WriteFile(dstPath, []byte(buf.String()), 0o600)
-}
-
 // writeInstallMetaVersioned writes install-meta.json with an explicit
 // version and latest-instance-ID. When latestID is empty, the last
 // instance in the config is used (backward compat with writeInstallMeta).
 func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latestID string) error {
+	data, err := installMetaBytes(root, ver, latestID)
+	if err != nil {
+		return err
+	}
+	return commitBindingFiles([]bindingFile{{path: path, data: data, mode: 0644}})
+}
+
+func installMetaBytes(root *config.RootConfig, ver, latestID string) ([]byte, error) {
 	if ver == "" {
 		ver = "unknown"
 	}
 	instances := normalizeRootInstances(root)
 	items := make([]instanceSummary, 0, len(instances))
+	chooseLast := latestID == ""
 	for _, inst := range instances {
 		id, err := inst.AutoInstanceID()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if latestID == "" {
+		if chooseLast {
 			latestID = id
 		}
 		item := instanceSummary{
@@ -1555,42 +1245,8 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal install meta: %w", err)
+		return nil, fmt.Errorf("marshal install meta: %w", err)
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
-}
-
-// runConfigHealthPort reads health_port from an existing config file and
-// prints it to stdout. Exits silently if the file does not exist or has
-// no health_port.
-func runConfigHealthPort(args []string) error {
-	cfgPath := defaultConfigPath
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--config" && i+1 < len(args) {
-			i++
-			cfgPath = args[i]
-		}
-	}
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		return nil // file not found → no health port
-	}
-	root := &config.RootConfig{}
-	if err := yaml.Unmarshal(data, root); err != nil {
-		return nil
-	}
-	// Check instances first, then legacy top-level.
-	if len(root.Instances) > 0 {
-		for _, inst := range root.Instances {
-			if inst.HealthPort > 0 {
-				fmt.Println(inst.HealthPort)
-				return nil
-			}
-		}
-	}
-	if root.Config.HealthPort > 0 {
-		fmt.Println(root.Config.HealthPort)
-	}
-	return nil
+	return data, nil
 }

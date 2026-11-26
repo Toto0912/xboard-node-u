@@ -4,11 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -64,6 +66,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to normalize config: %v\n", err)
 		os.Exit(1)
 	}
+	if len(instances) == 0 {
+		fmt.Println("No node bindings configured.")
+		return
+	}
 	config.InitLogger(instances[0].Log)
 	if err := porthopping.CleanupStale(); err != nil {
 		nlog.Core().Warn("could not recover stale HY2 redirects", "error", err)
@@ -79,14 +85,21 @@ func main() {
 func runWithReload(initialRoot *config.RootConfig, configPath string) {
 	var healthSrv *http.Server
 	var healthPort int
-	startHealth := func(port int) {
+	switchHealth := func(port int) error {
+		if healthPort == port {
+			return nil
+		}
 		if port <= 0 {
-			return
+			if healthSrv != nil {
+				_ = healthSrv.Close()
+			}
+			healthSrv = nil
+			healthPort = 0
+			return nil
 		}
 		ln, err := listenHealth(fmt.Sprintf(":%d", port))
 		if err != nil {
-			nlog.Core().Error("failed to start health check listener", "port", port, "error", err)
-			os.Exit(1)
+			return err
 		}
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -94,14 +107,18 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"status":"ok"}`))
 		})
+		if healthSrv != nil {
+			_ = healthSrv.Close()
+		}
 		healthSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		healthPort = port
-		go func() {
+		go func(server *http.Server) {
 			nlog.Core().Debug(fmt.Sprintf("health check listening on :%d", port))
-			if err := healthSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				nlog.Core().Warn("health check server stopped", "error", err)
 			}
-		}()
+		}(healthSrv)
+		return nil
 	}
 
 	initialInstances, err := initialRoot.NormalizeInstances()
@@ -109,48 +126,75 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		nlog.Core().Error("failed to normalize initial config", "error", err)
 		os.Exit(1)
 	}
-	startHealth(initialInstances[0].HealthPort)
+	if len(initialInstances) == 0 {
+		return
+	}
+	if err := switchHealth(initialInstances[0].HealthPort); err != nil {
+		nlog.Core().Error("failed to open initial health listener", "error", err)
+		os.Exit(1)
+	}
 	defer func() {
 		if healthSrv != nil {
 			healthSrv.Close()
 		}
 	}()
 
-	for root := initialRoot; ; {
-		ctx, cancel := context.WithCancel(context.Background())
-
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-		reloadCh := make(chan *config.RootConfig, 1)
+	// Keep one signal subscription for the entire process, including the time
+	// an old generation spends draining after a configuration change.
+	processCtx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	finished := make(chan struct{})
+	defer close(finished)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			nlog.Core().Info("shutting down", "signal", sig)
+			shutdown()
+		case <-finished:
+			return
+		}
+		select {
+		case sig := <-sigCh:
+			nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
+			os.Exit(1)
+		case <-time.After(service.FinalReportTimeout + 15*time.Second):
+			nlog.Core().Error("shutdown grace period expired, forcing exit")
+			os.Exit(2)
+		case <-finished:
+		}
+	}()
+	type reloadCandidate struct {
+		root       *config.RootConfig
+		healthPort int
+	}
+	for root := initialRoot; processCtx.Err() == nil; {
+		ctx, cancel := context.WithCancel(processCtx)
+		reloadCh := make(chan reloadCandidate, 1)
 
 		watcher, err := config.WatchConfigRoot(ctx, configPath, func(newCfg *config.RootConfig) {
+			candidate, err := newCfg.NormalizeInstances()
+			if err == nil {
+				err = config.ValidateStartupLayout(candidate)
+			}
+			if err != nil {
+				nlog.Core().Warn("invalid reload layout, keeping running services", "error", err)
+				return
+			}
+			port := 0
+			if len(candidate) > 0 {
+				port = candidate[0].HealthPort
+			}
 			select {
-			case reloadCh <- newCfg:
+			case reloadCh <- reloadCandidate{newCfg, port}:
 			default:
 			}
 		})
 		if err != nil {
 			nlog.Core().Warn("config watcher unavailable, hot-reload disabled", "error", err)
 		}
-
-		go func() {
-			select {
-			case sig := <-sigCh:
-				nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
-				cancel()
-
-				select {
-				case sig = <-sigCh:
-					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
-					os.Exit(1)
-				case <-time.After(service.FinalReportTimeout + 15*time.Second):
-					nlog.Core().Error("shutdown grace period expired, forcing exit")
-					os.Exit(2)
-				}
-			case <-ctx.Done():
-			}
-		}()
 
 		instances, err := root.NormalizeInstances()
 		if err != nil {
@@ -160,14 +204,6 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		if err := config.ValidateStartupLayout(instances); err != nil {
 			nlog.Core().Error("startup layout validation failed", "error", err)
 			os.Exit(1)
-		}
-
-		if instances[0].HealthPort != healthPort {
-			if healthSrv != nil {
-				healthSrv.Close()
-				healthSrv = nil
-			}
-			startHealth(instances[0].HealthPort)
 		}
 
 		var firstErr error
@@ -226,19 +262,31 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		go func() { wg.Wait(); close(doneCh) }()
 
 		var newRoot *config.RootConfig
-		select {
-		case newRoot = <-reloadCh:
-			nlog.Core().Info("config changed, restarting all services...")
-			cancel()
-			<-doneCh
-		case <-doneCh:
+	waitForChange:
+		for {
+			select {
+			case candidate := <-reloadCh:
+				if err := switchHealth(candidate.healthPort); err != nil {
+					nlog.Core().Warn("invalid reload health listener, keeping running services", "error", err)
+					continue
+				}
+				newRoot = candidate.root
+				nlog.Core().Info("config changed, restarting all services...")
+				cancel()
+				<-doneCh
+			case <-doneCh:
+			}
+			break waitForChange
 		}
-
-		signal.Stop(sigCh)
+		cancel()
 		if watcher != nil {
 			watcher.Stop()
 		}
 
+		if processCtx.Err() != nil {
+			nlog.Core().Info("stopped")
+			return
+		}
 		if newRoot == nil {
 			if firstErr != nil {
 				os.Exit(1)
@@ -251,6 +299,10 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		if err != nil {
 			nlog.Core().Error("failed to normalize reloaded config", "error", err)
 			os.Exit(1)
+		}
+		if len(newInstances) == 0 {
+			nlog.Core().Info("all node bindings removed")
+			return
 		}
 		config.InitLogger(newInstances[0].Log)
 		applyRuntimeConfig(newInstances[0].Runtime)
@@ -296,7 +348,7 @@ func applyRuntimeConfig(rt config.RuntimeConfig) {
 }
 
 // parseMemLimit converts a human-readable size string to bytes.
-// Supported suffixes: B, KiB, MiB, GiB, TiB (case-insensitive).
+// Accept bytes or decimal/binary size suffixes (case-insensitive).
 func parseMemLimit(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	suffixes := []struct {
@@ -307,24 +359,19 @@ func parseMemLimit(s string) (int64, error) {
 		{"GiB", 1 << 30},
 		{"MiB", 1 << 20},
 		{"KiB", 1 << 10},
-		{"B", 1},
+		{"TB", 1_000_000_000_000}, {"GB", 1_000_000_000}, {"MB", 1_000_000}, {"KB", 1_000}, {"B", 1},
 	}
 	upper := strings.ToUpper(s)
+	mult := int64(1)
 	for _, sf := range suffixes {
-		if strings.HasSuffix(upper, strings.ToUpper(sf.suffix)) {
-			numStr := strings.TrimSuffix(upper, strings.ToUpper(sf.suffix))
-			numStr = strings.TrimSpace(numStr)
-			var n int64
-			if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil {
-				return 0, fmt.Errorf("parse number %q: %w", numStr, err)
-			}
-			return n * sf.mult, nil
+		if num, ok := strings.CutSuffix(upper, strings.ToUpper(sf.suffix)); ok {
+			upper, mult = strings.TrimSpace(num), sf.mult
+			break
 		}
 	}
-	// No suffix: treat as raw bytes.
-	var n int64
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		return 0, fmt.Errorf("unrecognised size format %q", s)
+	n, err := strconv.ParseInt(upper, 10, 64)
+	if err != nil || n < 0 || n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("invalid memory limit %q", s)
 	}
-	return n, nil
+	return n * mult, nil
 }

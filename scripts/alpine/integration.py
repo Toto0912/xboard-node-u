@@ -15,6 +15,7 @@ import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -145,6 +146,62 @@ def node_pids():
             except OSError:
                 pass
     return found
+
+
+def check_online_installer_upgrade():
+    # Use the CI-built release binaries. Only the release download transport is replaced.
+    version = run('xbctl', 'version').stdout.split()[1]
+    manager = ROOT / 'install-alpine.sh'
+    with tempfile.TemporaryDirectory() as tmp:
+        release = Path(tmp)
+        binary_assets = ('xboard-node-linux-amd64', 'xbctl-linux-amd64')
+        for asset in binary_assets:
+            (release / asset).symlink_to(Path('/release') / asset)
+        candidate = release / manager.name
+        new_script = Path(SCRIPT).read_bytes() + b'\n# target release fixture\n'
+        candidate.write_bytes(new_script)
+        manifest = release / 'SHA256SUMS.txt'
+        binary_sums = ''.join(f'{digest(release / name)}  {name}\n' for name in binary_assets)
+        sums = binary_sums + f'{digest(candidate)}  {candidate.name}\n'
+        manifest.write_text(sums)
+        curl = release / 'curl'
+        curl.write_text('''#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    case "$1" in https://*) url=$1 ;; -o) shift; dest=$1 ;; esac
+    shift
+done
+base=https://github.com/fixture/node/releases
+case "$url" in
+    "$base/latest") echo "$base/tag/$FIXTURE_TAG" ;;
+    "$base/download/$FIXTURE_TAG/"*) cp "$FIXTURE_DIR/${url##*/}" "$dest" ;;
+    *) exit 1 ;;
+esac
+''')
+        curl.chmod(0o755)
+        env = {**os.environ, 'PATH': tmp + ':' + os.environ['PATH'], 'XBOARD_NODE_REPOSITORY': 'fixture/node',
+               'FIXTURE_DIR': tmp, 'FIXTURE_TAG': version}
+        original = manager.read_bytes()
+        config = CONFIG.read_bytes()
+        pids = node_pids()
+        assert original != new_script and len(pids) == 1
+        backups = set((ROOT / 'backups').iterdir())
+        run('xbctl', 'upgrade', '--expect-empty', env=env, ok=False)
+        assert set((ROOT / 'backups').iterdir()) == backups and node_pids() == pids
+        for failure in ('missing file', 'bad digest', 'missing checksum'):
+            candidate.write_bytes(new_script)
+            if failure == 'missing file':
+                candidate.unlink()
+            elif failure == 'bad digest':
+                candidate.write_bytes(new_script + b'# damaged')
+            else:
+                manifest.write_text(binary_sums)
+            run('xbctl', 'upgrade', env=env, ok=False)
+            assert node_pids() == pids and CONFIG.read_bytes() == config and manager.read_bytes() == original
+        manifest.write_text(sums)
+        run('xbctl', 'upgrade', env=env)
+        assert manager.read_bytes() == new_script and CONFIG.read_bytes() == config
+        wait_for(proxy_get)
 
 
 OFFLINE = ["--binary", "/release/xboard-node-linux-amd64",
@@ -290,6 +347,9 @@ try:
     run("xbctl", "status")
     record("installed manager upgrades while preserving config and restores working proxy")
 
+    check_online_installer_upgrade()
+    record("ordinary online upgrade refreshes verified installer; missing or corrupt assets preserve live process and installer")
+
     # Explicit reconfigure, both kernels in both panel modes.
     for mode, kernel in [("node", "xray"), ("machine", "xray"), ("node", "singbox")]:
         event_start = len(EVENTS)
@@ -391,6 +451,8 @@ try:
     wait_for(proxy_get)
     run('xbctl', 'bind', 'remove-node', '--panel', f'http://127.0.0.1:{SERVER_PORT}', '--node-id', '8')
     wait_for(lambda: not node_pids())
+    run('xbctl', 'upgrade', '--expect-empty', *OFFLINE)
+    assert not node_pids()
     record('removing final binding stops OpenRC node service')
     run('xbctl', 'uninstall', '--purge', '--yes')
     assert not ROOT.exists() and not BIN.exists() and not Path('/usr/local/bin/xbctl').exists()

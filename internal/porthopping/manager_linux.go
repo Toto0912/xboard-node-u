@@ -80,9 +80,13 @@ func locked(dir string, fn func() error) error {
 		return err
 	}
 	defer lock.Close()
+	return withFileLock(lock, syscall.LOCK_EX, fn)
+}
+
+func withFileLock(lock *os.File, mode int, fn func() error) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := syscall.Flock(int(lock.Fd()), mode|syscall.LOCK_NB)
 		if err == nil {
 			break
 		}
@@ -110,12 +114,16 @@ func save(dir string, r *record) error {
 }
 
 func records(dir string) ([]*record, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]*record, 0, len(files))
-	for _, path := range files {
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, file.Name())
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
@@ -219,8 +227,30 @@ func CleanupStopped() error {
 // Apply reserves the range before opening sockets. A crash at any later step
 // leaves a durable ownership record for ExecStopPost or startup recovery.
 func (m *Manager) Apply(spec *Spec, activate, rollback func() error) error {
+	return m.apply(spec, nil, activate, rollback)
+}
+
+// ApplyScalar checks managed redirects without creating a state directory or
+// running firewall commands when the node only needs a single UDP listener.
+func (m *Manager) ApplyScalar(listen string, port int, activate, rollback func() error) error {
+	scope := "::"
+	if ip, err := netip.ParseAddr(listen); err == nil {
+		scope = ip.Unmap().String()
+	}
+	scalar := &Spec{Listen: scope, Start: port, End: port}
+	return m.apply(nil, scalar, func() error { return m.TrackListener(listen, port, activate) }, rollback)
+}
+
+func (m *Manager) apply(spec, scalar *Spec, activate, rollback func() error) error {
+	if spec != nil {
+		start := activate
+		activate = func() error { return m.TrackListener(spec.Listen, spec.Start, start) }
+	}
 	if spec == nil {
 		if _, err := os.Stat(recordPath(m.dir, m.owner)); errors.Is(err, os.ErrNotExist) {
+			if scalar != nil {
+				return m.activateScalar(scalar, activate, rollback)
+			}
 			return activateOnly(activate, rollback) // scalar ports require no privileges.
 		}
 	}
@@ -233,6 +263,10 @@ func (m *Manager) Apply(spec *Spec, activate, rollback func() error) error {
 			return fmt.Errorf("recover stale HY2 rules: %w", err)
 		}
 		var previous *record
+		requested := spec
+		if scalar != nil {
+			requested = scalar
+		}
 		for _, r := range all {
 			if !alive(r) {
 				continue
@@ -244,15 +278,15 @@ func (m *Manager) Apply(spec *Spec, activate, rollback func() error) error {
 				previous = r
 				continue
 			}
-			if overlap(spec, r.Active) || overlap(spec, r.Pending) {
-				return fmt.Errorf("HY2 UDP range %d-%d on %s conflicts with active node owner %s", spec.Start, spec.End, spec.Listen, r.Owner)
+			if err := checkRangeOwner(requested, r); err != nil {
+				return err
 			}
 		}
 		if spec == nil && previous == nil {
 			return activateOnly(activate, rollback)
 		}
 		if spec != nil {
-			if err := checkSockets(spec, previous); err != nil {
+			if err := m.checkSockets(spec); err != nil {
 				return err
 			}
 		}
@@ -278,7 +312,11 @@ func (m *Manager) Apply(spec *Spec, activate, rollback func() error) error {
 			var failures []error
 			failures = append(failures, cause)
 			if rollback != nil {
-				failures = append(failures, rollback())
+				if previous != nil && previous.Active != nil {
+					failures = append(failures, m.TrackListener(previous.Active.Listen, previous.Active.Start, rollback))
+				} else {
+					failures = append(failures, rollback())
+				}
 			}
 			if previous != nil {
 				if err := applyRules(r, previous.Active); err != nil {
@@ -310,6 +348,57 @@ func (m *Manager) Apply(spec *Spec, activate, rollback func() error) error {
 	})
 }
 
+func checkRangeOwner(requested *Spec, r *record) error {
+	if overlap(requested, r.Active) || overlap(requested, r.Pending) {
+		return fmt.Errorf("HY2 UDP ports %d-%d on %s conflict with node owner %s", requested.Start, requested.End, requested.Listen, r.Owner)
+	}
+	return nil
+}
+
+// Opening read-only also permits a scalar node with read access to shared
+// state to coordinate with range owners without changing any rules or files.
+func (m *Manager) withRangeCheck(scalar *Spec, fn func() error) (bool, error) {
+	lock, err := os.Open(filepath.Join(m.dir, ".lock"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	return true, withFileLock(lock, syscall.LOCK_SH, func() error {
+		all, err := records(m.dir)
+		if err != nil {
+			return err
+		}
+		for _, r := range all {
+			// Even a dead owner can still have installed redirects until cleanup.
+			if err := checkRangeOwner(scalar, r); err != nil {
+				return err
+			}
+		}
+		return fn()
+	})
+}
+
+func (m *Manager) activateScalar(scalar *Spec, activate, rollback func() error) error {
+	ran, err := m.withRangeCheck(scalar, func() error { return activateOnly(activate, rollback) })
+	if ran || err != nil {
+		return err
+	}
+	// The first ever range may create its lock while the scalar is binding.
+	// Once the socket exists a later range sees it in /proc; if the range won
+	// the race its reservation is now visible, so undo the scalar activation.
+	if err := activateOnly(activate, rollback); err != nil {
+		return err
+	}
+	_, err = m.withRangeCheck(scalar, func() error { return nil })
+	if err != nil && rollback != nil {
+		return errors.Join(err, rollback())
+	}
+	return err
+}
+
 func (m *Manager) Close() error {
 	if _, err := os.Stat(recordPath(m.dir, m.owner)); errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -331,7 +420,76 @@ func (m *Manager) Close() error {
 	})
 }
 
-func checkSockets(spec *Spec, previous *record) error {
+// A scalar listener has no firewall record. Recognize it by the socket actually
+// opened during this manager's activation, including on a rollback restart.
+func (m *Manager) TrackListener(listen string, port int, activate func() error) error {
+	if port == 0 {
+		err := activate()
+		if err == nil {
+			m.listenerInode = ""
+		}
+		return err
+	}
+	if listen == "" {
+		listen = "::"
+	}
+	ip, err := netip.ParseAddr(listen)
+	if err != nil {
+		return activate()
+	}
+	base := &Spec{Listen: ip.Unmap().String(), Start: port, End: port}
+	before := make(map[string]bool)
+	beforeErr := walkSockets(base, func(_ *Spec, inode, state string) error {
+		if state == "07" {
+			before[inode] = true
+		}
+		return nil
+	})
+	if err := activate(); err != nil {
+		return err
+	}
+	old := m.listenerInode
+	m.listenerInode = ""
+	if beforeErr != nil {
+		return nil
+	}
+	var candidates []string
+	err = walkSockets(base, func(_ *Spec, inode, state string) error {
+		if state == "07" && (inode == old || !before[inode]) {
+			candidates = append(candidates, inode)
+		}
+		return nil
+	})
+	if err == nil && len(candidates) == 1 && ownsSocket(candidates[0]) {
+		m.listenerInode = candidates[0]
+	}
+	return nil
+}
+
+func ownsSocket(inode string) bool {
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return false
+	}
+	for _, fd := range fds {
+		target, err := os.Readlink("/proc/self/fd/" + fd.Name())
+		if err == nil && target == "socket:["+inode+"]" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) checkSockets(spec *Spec) error {
+	return walkSockets(spec, func(sock *Spec, inode, state string) error {
+		if state == "07" && m.listenerInode != "" && inode == m.listenerInode && ownsSocket(inode) {
+			return nil
+		}
+		return fmt.Errorf("HY2 range includes UDP port %d already in use (%s)", sock.Start, sock.Listen)
+	})
+}
+
+func walkSockets(spec *Spec, visit func(*Spec, string, string) error) error {
 	for _, name := range []string{"/proc/net/udp", "/proc/net/udp6"} {
 		data, err := os.ReadFile(name)
 		if errors.Is(err, os.ErrNotExist) {
@@ -342,7 +500,7 @@ func checkSockets(spec *Spec, previous *record) error {
 		}
 		for _, line := range strings.Split(string(data), "\n")[1:] {
 			fields := strings.Fields(line)
-			if len(fields) < 2 {
+			if len(fields) < 10 {
 				continue
 			}
 			pair := strings.Split(fields[1], ":")
@@ -369,11 +527,9 @@ func checkSockets(spec *Spec, previous *record) error {
 			if !overlap(spec, socket) {
 				continue
 			}
-			// The owner's existing core socket is allowed during a reload.
-			if previous != nil && previous.Active != nil && int(port) == previous.Active.Start && overlap(previous.Active, socket) {
-				continue
+			if err := visit(socket, fields[9], fields[3]); err != nil {
+				return err
 			}
-			return fmt.Errorf("HY2 range includes UDP port %d already in use (%s)", port, name)
 		}
 	}
 	return nil

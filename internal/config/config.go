@@ -82,7 +82,7 @@ type KernelOverride struct {
 //	  gogc: 50              # halve GC target → lower peak RSS, slightly more CPU
 type RuntimeConfig struct {
 	// GoMemLimit is a human-readable soft memory limit passed to runtime/debug.SetMemoryLimit.
-	// Valid suffixes: B, KiB, MiB, GiB, TiB.  Empty = no limit (default).
+	// Supports bytes and decimal (MB) or binary (MiB) size suffixes.  Empty = no limit (default).
 	// Recommended starting point: set to ~80% of the machine's available RAM.
 	GoMemLimit string `yaml:"gomemlimit"`
 
@@ -191,6 +191,11 @@ type RootConfig struct {
 }
 
 func LoadRoot(path string) (*RootConfig, error) {
+	return LoadRootFrom(path, path)
+}
+
+// LoadRootFrom validates staged YAML using the path where the service will read it.
+func LoadRootFrom(path, installedPath string) (*RootConfig, error) {
 	rc := &RootConfig{}
 
 	data, err := os.ReadFile(path)
@@ -198,7 +203,7 @@ func LoadRoot(path string) (*RootConfig, error) {
 		if err := yaml.Unmarshal(data, rc); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
-		if len(rc.Instances) == 0 {
+		if rc.Instances == nil {
 			legacy := &Config{}
 			if err := yaml.Unmarshal(data, legacy); err != nil {
 				return nil, fmt.Errorf("parse legacy config: %w", err)
@@ -222,7 +227,7 @@ func LoadRoot(path string) (*RootConfig, error) {
 	// data (certs, sing-box cache, …) lives next to the config file when
 	// config_dir is not explicitly set. This makes non-root / dev deployments
 	// work without any extra configuration.
-	baseDir := configBaseDir(path)
+	baseDir := configBaseDir(installedPath)
 
 	rc.applyEnvOverrides()
 	rc.resolveEnvRefs()
@@ -245,7 +250,7 @@ func LoadRoot(path string) (*RootConfig, error) {
 }
 
 func (rc *RootConfig) applyEnvOverrides() {
-	if len(rc.Instances) == 0 {
+	if rc.Instances == nil {
 		rc.Config.applyEnvOverrides()
 		return
 	}
@@ -255,7 +260,7 @@ func (rc *RootConfig) applyEnvOverrides() {
 }
 
 func (rc *RootConfig) resolveEnvRefs() {
-	if len(rc.Instances) == 0 {
+	if rc.Instances == nil {
 		rc.Config.resolveEnvRefs()
 		return
 	}
@@ -265,7 +270,7 @@ func (rc *RootConfig) resolveEnvRefs() {
 }
 
 func (rc *RootConfig) setDefaultsFrom(baseDir string) {
-	if len(rc.Instances) == 0 {
+	if rc.Instances == nil {
 		rc.Config.setDefaultsFrom(baseDir)
 		return
 	}
@@ -311,7 +316,7 @@ func configBaseDir(configPath string) string {
 }
 
 func (rc *RootConfig) validateRoot() error {
-	if len(rc.Instances) == 0 {
+	if rc.Instances == nil {
 		return rc.Config.validate()
 	}
 	seen := map[string]struct{}{}
@@ -330,7 +335,7 @@ func (rc *RootConfig) validateRoot() error {
 }
 
 func (rc *RootConfig) NormalizeInstances() ([]*Config, error) {
-	if len(rc.Instances) == 0 {
+	if rc.Instances == nil {
 		id, err := rc.Config.AutoInstanceID()
 		if err != nil {
 			return nil, err
@@ -745,6 +750,9 @@ func (c *Config) validate() error {
 	if c.Node.PushInterval < 0 {
 		return fmt.Errorf("node.push_interval must not be negative")
 	}
+	if c.Node.TrackInterval < 0 || c.Node.DeviceReportInterval < 0 || c.WS.StatusInterval < 0 || c.WS.HandshakeTimeout < 0 || c.WS.BackoffInitial < 0 || c.WS.BackoffMax < 0 || c.WS.DiscoveryInterval < 0 {
+		return fmt.Errorf("node and WebSocket intervals must not be negative")
+	}
 	if c.Node.PullInterval < 0 {
 		return fmt.Errorf("node.pull_interval must not be negative")
 	}
@@ -863,6 +871,7 @@ func InitLogger(cfg LogConfig) {
 	}
 
 	var w io.Writer
+	var owned *os.File
 	useColor := false
 	switch cfg.Output {
 	case "stdout", "":
@@ -884,13 +893,16 @@ func InitLogger(cfg LogConfig) {
 				w = os.Stdout
 				useColor = term.IsTerminal(int(os.Stdout.Fd()))
 			} else {
-				w = f
-				useColor = false
+				owned = f
 			}
 		}
 	}
 
-	nlog.Init(w, minLevel, useColor)
+	if owned != nil {
+		nlog.InitFile(owned, minLevel)
+	} else {
+		nlog.Init(w, minLevel, useColor)
+	}
 	// Application logging goes through nlog; silence slog.Default for stray library use.
 	slog.SetDefault(slog.New(slog.DiscardHandler))
 }
@@ -898,6 +910,17 @@ func InitLogger(cfg LogConfig) {
 // ValidateStartupLayout checks that multiple instances do not conflict on
 // health ports, kernel config directories, or node bindings.
 func ValidateStartupLayout(instances []*Config) error {
+	return ValidateStartupLayoutAt(instances, "")
+}
+
+// ValidateStartupLayoutAt resolves relative paths as seen by the service.
+func ValidateStartupLayoutAt(instances []*Config, workingDir string) error {
+	resolve := func(path string) string {
+		if workingDir != "" && !filepath.IsAbs(path) {
+			return filepath.Join(workingDir, path)
+		}
+		return path
+	}
 	healthPorts := make(map[int]string)
 	configDirs := make(map[string]string)
 	machineRoots := make(map[string]string)
@@ -915,7 +938,7 @@ func ValidateStartupLayout(instances []*Config) error {
 			healthPorts[instance.HealthPort] = owner
 		}
 		if dir := strings.TrimSpace(instance.Kernel.ConfigDir); dir != "" {
-			dir, err := filepath.Abs(dir)
+			dir, err := filepath.Abs(resolve(dir))
 			if err != nil {
 				return fmt.Errorf("resolve kernel config_dir: %w", err)
 			}
@@ -931,7 +954,7 @@ func ValidateStartupLayout(instances []*Config) error {
 		// but still validate custom_config if set at the instance level.
 		if instance.IsMachineMode() {
 			if path := strings.TrimSpace(instance.Kernel.CustomConfig); path != "" {
-				if _, err := os.Stat(path); err != nil {
+				if _, err := os.Stat(resolve(path)); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
 				}
 			}
@@ -939,7 +962,7 @@ func ValidateStartupLayout(instances []*Config) error {
 		}
 		for _, node := range instance.ExpandNodes() {
 			if node.Cert.CertDir != "" {
-				dir, err := filepath.Abs(node.Cert.CertDir)
+				dir, err := filepath.Abs(resolve(node.Cert.CertDir))
 				if err != nil {
 					return fmt.Errorf("resolve cert_dir: %w", err)
 				}
@@ -954,7 +977,7 @@ func ValidateStartupLayout(instances []*Config) error {
 			}
 			nodeBindings[binding] = owner
 			if path := strings.TrimSpace(node.Kernel.CustomConfig); path != "" {
-				if _, err := os.Stat(path); err != nil {
+				if _, err := os.Stat(resolve(path)); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
 				}
 			}

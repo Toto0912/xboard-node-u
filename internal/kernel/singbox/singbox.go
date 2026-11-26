@@ -6,6 +6,7 @@ import (
 	"fmt"
 	N "github.com/sagernet/sing/common/network"
 	"io"
+	"strconv"
 	"sync"
 
 	box "github.com/sagernet/sing-box"
@@ -53,6 +54,7 @@ type SingBox struct {
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
+	userPolicy      *kernel.UserPolicy
 
 	// trackerRegistered prevents duplicate AppendTracker calls on the same
 	// Router instance during Reload. Reset to false on full restart.
@@ -126,7 +128,8 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 	if s.connTracker == nil {
 		s.connTracker = NewConnTracker(0)
 	}
-	s.connTracker.SetUserMap(buildUserMap(users))
+	s.connTracker.userPolicy.Store(s.userPolicy)
+	setTrackerUsers(s.connTracker, nodeConfig.Protocol, users)
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
@@ -271,6 +274,15 @@ func (s *SingBox) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 	}
 }
 
+func (s *SingBox) SetUserPolicy(p *kernel.UserPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.userPolicy = p
+	if s.connTracker != nil {
+		s.connTracker.userPolicy.Store(p)
+	}
+}
+
 // SetDeviceLimitFunc configures per-user device limit gate-keeping.
 // Connections exceeding the limit are rejected at connect time.
 func (s *SingBox) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
@@ -382,7 +394,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	if added == 0 && removed == 0 {
 		// Only limits may have changed — update tracker map.
 		if s.connTracker != nil {
-			s.connTracker.SetUserMap(buildUserMap(users))
+			setTrackerUsers(s.connTracker, s.nodeConfig.Protocol, users)
 		}
 		s.users = users
 		return 0, 0, nil
@@ -395,83 +407,68 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	return
 }
 
+// Decode only the account records produced by the same inbound builder as a cold start.
+func updateEncodedUsers[T any](data []byte, update func([]T) error) error {
+	var users []T
+	if err := json.Unmarshal(data, &users); err != nil {
+		return err
+	}
+	if len(users) == 0 {
+		// The kernel's full configuration decoder represents an empty list as nil.
+		users = nil
+	}
+	return update(users)
+}
+
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
 // Must be called with s.mu held.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
-	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls)
-	data, err := json.Marshal(cfgMap)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+	inbound := buildInbound(s.nodeConfig, users, s.tls)
+	if inbound == nil {
+		return s.reloadLocked(s.nodeConfig, users, s.tls)
 	}
-
-	opts, err := singJSON.UnmarshalExtendedContext[option.Options](s.ctx, data)
-	if err != nil {
-		return fmt.Errorf("parse options: %w", err)
-	}
-
 	im := service.FromContext[adapter.InboundManager](s.ctx)
 	if im == nil {
 		return fmt.Errorf("inbound manager not available")
 	}
-
-	for _, inb := range opts.Inbounds {
-		tag := inb.Tag
-		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-			err := fmt.Errorf("live user update unsupported")
-			switch v := existing.(type) {
-			case adapter.UpdatableInbound[option.VMessUser]:
-				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.VLESSUser]:
-				if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TrojanUser]:
-				if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.Hysteria2User]:
-				if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableShadowsocksInbound:
-				if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-					err = v.UpdateUsersByOptions(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TUICUser]:
-				if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.AnyTLSUser]:
-				if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.MieruUser]:
-				if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[auth.User]:
-				switch opts := inb.Options.(type) {
-				case *option.NaiveInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.SocksInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.HTTPMixedInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				}
-			}
-			if err == nil {
-				continue
-			}
-			nlog.Core().Warn("incremental update unavailable, rebuilding kernel", "tag", tag, "error", err)
-		}
-
+	tag, _ := inbound["tag"].(string)
+	existing, ok := im.Get(tag)
+	if !ok || existing.Type() != inbound["type"] {
+		return s.reloadLocked(s.nodeConfig, users, s.tls)
+	}
+	data, err := json.Marshal(inbound["users"])
+	if err != nil {
+		return fmt.Errorf("marshal inbound users: %w", err)
+	}
+	switch v := existing.(type) {
+	case adapter.UpdatableInbound[option.VMessUser]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableInbound[option.VLESSUser]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableInbound[option.TrojanUser]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableInbound[option.Hysteria2User]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableShadowsocksInbound:
+		err = updateEncodedUsers(data, v.UpdateUsersByOptions)
+	case adapter.UpdatableInbound[option.TUICUser]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableInbound[option.AnyTLSUser]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableInbound[option.MieruUser]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	case adapter.UpdatableInbound[auth.User]:
+		err = updateEncodedUsers(data, v.UpdateUsers)
+	default:
+		err = fmt.Errorf("live user update unsupported")
+	}
+	if err != nil {
+		nlog.Core().Warn("incremental update unavailable, rebuilding kernel", "tag", tag, "error", err)
 		return s.reloadLocked(s.nodeConfig, users, s.tls)
 	}
 
 	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
+		setTrackerUsers(s.connTracker, s.nodeConfig.Protocol, users)
 	}
 
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
@@ -510,13 +507,21 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	return nil
 }
 
-// buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute
-// connections to the correct user. All sing-box protocols use the user's UUID
-// as the inbound name/username, so this covers every protocol.
-func buildUserMap(users []model.UserSpec) map[string]int {
-	m := make(map[string]int, len(users))
-	for _, u := range users {
-		m[u.UUID] = u.ID
+// Naive exposes the numeric login to the router. Limits are keyed by UUID for every protocol.
+func setTrackerUsers(t *ConnTracker, protocol string, users []model.UserSpec) {
+	ids := make(map[string]int, len(users))
+	var names map[string]string
+	if protocol == "naive" {
+		names = make(map[string]string, len(users))
 	}
-	return m
+	for _, u := range users {
+		ids[u.UUID] = u.ID
+		if names != nil {
+			names[strconv.Itoa(u.ID)] = u.UUID
+		}
+	}
+	if protocol == "hysteria2" {
+		protocol = "hysteria"
+	}
+	t.setUserMaps(ids, names, protocol+"-in")
 }

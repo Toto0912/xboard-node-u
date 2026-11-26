@@ -11,6 +11,43 @@ import (
 	panelapi "github.com/cedar2025/xboard-node/internal/panel"
 )
 
+func TestStandaloneRevocationRequiresExplicitPanelResponse(t *testing.T) {
+	for _, endpoint := range []string{"/api/v1/server/UniProxy/config", "/api/v1/server/UniProxy/user"} {
+		for _, tc := range []struct {
+			name    string
+			status  int
+			state   string
+			revoked bool
+		}{
+			{"removed", 410, "revoked", true},
+			{"proxy-gone", 410, "", false},
+			{"not-found", 404, "", false},
+			{"outage", 503, "revoked", false},
+		} {
+			t.Run(endpoint+"/"+tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != endpoint {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+					w.Header().Set("X-Xboard-Node-State", tc.state)
+					w.WriteHeader(tc.status)
+				}))
+				defer server.Close()
+				cp := NewPanelControlPlane(config.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, config.WSConfig{}, config.KernelConfig{Type: "singbox"})
+				snapshot, err := cp.Poll(context.Background())
+				if tc.revoked {
+					if err != nil || snapshot.Users == nil || len(snapshot.Users) != 0 {
+						t.Fatalf("expected an explicit empty roster, got %+v, %v", snapshot, err)
+					}
+				} else if err == nil || snapshot.Users != nil {
+					t.Fatalf("transport failure must preserve running users, got %+v, %v", snapshot, err)
+				}
+			})
+		}
+	}
+}
+
 func TestPanelControlPlaneInitialRejectsInvalidCustomOutbounds(t *testing.T) {
 	server := newPanelTestServer(`{"protocol":"shadowsocks","server_port":8388,"custom_outbounds":[{"tag":"proxy","protocol":"socks","proxy_tag":"missing","settings":{"server":"2.2.2.2","server_port":1080}}]}`)
 	defer server.Close()
@@ -30,7 +67,15 @@ func TestPanelControlPlanePollRejectsInvalidCustomOutbounds(t *testing.T) {
 	defer server.Close()
 
 	cp := NewPanelControlPlane(config.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}, config.WSConfig{}, config.KernelConfig{Type: "singbox"})
-	_, err := cp.Poll(context.Background())
+	snap, err := cp.Poll(context.Background())
+	if len(snap.Users) != 1 || snap.CommitConfig != nil || snap.CommitUsers != nil {
+		t.Fatalf("partial snapshot incorrect: %+v", snap)
+	}
+	machine := NewMachinePanelControlPlane(cp.client, config.KernelConfig{Type: "singbox"}, nil, nil)
+	ms, me := machine.Poll(context.Background())
+	if me == nil || len(ms.Users) != 1 || ms.CommitUsers != nil || ms.CommitConfig != nil {
+		t.Fatalf("machine partial snapshot: %+v, %v", ms, me)
+	}
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

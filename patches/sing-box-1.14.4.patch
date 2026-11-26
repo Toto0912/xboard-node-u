@@ -297,14 +297,15 @@ index 00000000..f4d7d2ba
 +}
 diff --git a/protocol/mieru/inbound.go b/protocol/mieru/inbound.go
 new file mode 100644
-index 00000000..594a87db
+index 00000000..ef1a2b8d
 --- /dev/null
 +++ b/protocol/mieru/inbound.go
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,371 @@
 +package mieru
 +
 +import (
 +	"context"
++	"errors"
 +	"fmt"
 +	"io"
 +	"net"
@@ -321,6 +322,7 @@ index 00000000..594a87db
 +	"github.com/sagernet/sing/common"
 +	"github.com/sagernet/sing/common/buf"
 +	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json/badoption"
 +	M "github.com/sagernet/sing/common/metadata"
 +	N "github.com/sagernet/sing/common/network"
 +
@@ -330,6 +332,7 @@ index 00000000..594a87db
 +	mieruserver "github.com/enfein/mieru/v3/apis/server"
 +	mierutp "github.com/enfein/mieru/v3/apis/trafficpattern"
 +	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
++	mierunet "github.com/enfein/mieru/v3/pkg/common"
 +	"google.golang.org/protobuf/proto"
 +)
 +
@@ -343,6 +346,7 @@ index 00000000..594a87db
 +	router    adapter.ConnectionRouterEx
 +	logger    log.ContextLogger
 +	listener  *listener.Listener
++	transport string
 +	server    mieruserver.Server
 +	userNames []string
 +
@@ -356,17 +360,19 @@ index 00000000..594a87db
 +	}
 +
 +	s := mieruserver.NewServer()
-+	if err := s.Store(config); err != nil {
-+		return nil, fmt.Errorf("failed to store mieru server config: %w", err)
-+	}
-+
 +	inboundInstance := &Inbound{
 +		Adapter:   inbound.NewAdapter(C.TypeMieru, tag),
 +		ctx:       ctx,
 +		router:    uot.NewRouter(router, logger),
 +		logger:    logger,
 +		server:    s,
++		transport: options.Transport,
 +		userNames: userNames,
++	}
++	if options.Listen == nil {
++		// Preserve Mieru's default wildcard on IPv4-only and dual-stack hosts.
++		addr := badoption.Addr(netip.MustParseAddr(mierunet.AllIPAddr()))
++		options.Listen = &addr
 +	}
 +	inboundInstance.listener = listener.New(listener.Options{
 +		Context: ctx,
@@ -374,8 +380,22 @@ index 00000000..594a87db
 +		Network: []string{N.NetworkTCP, N.NetworkUDP},
 +		Listen:  options.ListenOptions,
 +	})
-+
++	config.StreamListenerFactory = inboundInstance
++	config.PacketListenerFactory = inboundInstance
++	if err := s.Store(config); err != nil {
++		return nil, fmt.Errorf("failed to store mieru server config: %w", err)
++	}
 +	return inboundInstance, nil
++}
++
++// Mieru requests one socket for its single configured port. Bind it before
++// starting the mux so a listener failure reaches the kernel's rollback path.
++func (h *Inbound) Listen(context.Context, string, string) (net.Listener, error) {
++	return h.listener.TCPListener(), nil
++}
++
++func (h *Inbound) ListenPacket(context.Context, string, string) (net.PacketConn, error) {
++	return h.listener.UDPConn(), nil
 +}
 +
 +func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -386,7 +406,18 @@ index 00000000..594a87db
 +	h.mu.Lock()
 +	defer h.mu.Unlock()
 +
++	var err error
++	if h.transport == "TCP" {
++		_, err = h.listener.ListenTCP()
++	} else {
++		_, err = h.listener.ListenUDP()
++	}
++	if err != nil {
++		return fmt.Errorf("bind mieru %s listener: %w", h.transport, err)
++	}
 +	if err := h.server.Start(); err != nil {
++		_ = h.server.Stop()
++		_ = h.listener.Close()
 +		return fmt.Errorf("failed to start mieru server: %w", err)
 +	}
 +
@@ -401,7 +432,12 @@ index 00000000..594a87db
 +	defer h.mu.Unlock()
 +
 +	if h.server.IsRunning() {
-+		return h.server.Stop()
++		err := h.server.Stop()
++		closeErr := h.listener.Close()
++		if errors.Is(closeErr, net.ErrClosed) {
++			closeErr = nil
++		}
++		return errors.Join(err, closeErr)
 +	}
 +	return nil
 +}
@@ -541,6 +577,7 @@ index 00000000..594a87db
 +
 +// WritePacket writes the SOCKS5 UDP header and the payload.
 +func (c *mieruPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
++	defer buffer.Release()
 +	header := buf.NewSize(3 + M.MaxSocksaddrLength)
 +	defer header.Release()
 +
@@ -637,10 +674,10 @@ index 00000000..594a87db
 +}
 diff --git a/protocol/mieru/outbound.go b/protocol/mieru/outbound.go
 new file mode 100644
-index 00000000..f58b4c48
+index 00000000..a8a79797
 --- /dev/null
 +++ b/protocol/mieru/outbound.go
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,283 @@
 +package mieru
 +
 +import (
@@ -655,7 +692,6 @@ index 00000000..f58b4c48
 +	C "github.com/sagernet/sing-box/constant"
 +	"github.com/sagernet/sing-box/log"
 +	"github.com/sagernet/sing-box/option"
-+	"github.com/sagernet/sing/common"
 +	E "github.com/sagernet/sing/common/exceptions"
 +	M "github.com/sagernet/sing/common/metadata"
 +	N "github.com/sagernet/sing/common/network"
@@ -693,10 +729,6 @@ index 00000000..f58b4c48
 +	if err := c.Store(config); err != nil {
 +		return nil, fmt.Errorf("failed to store mieru client config: %w", err)
 +	}
-+	if err := c.Start(); err != nil {
-+		return nil, fmt.Errorf("failed to start mieru client: %w", err)
-+	}
-+	logger.InfoContext(ctx, "mieru client is started")
 +
 +	return &Outbound{
 +		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeMieru, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
@@ -754,11 +786,15 @@ index 00000000..f58b4c48
 +}
 +
 +func (o *Outbound) Close() error {
-+	return common.Close(o.client)
++	return o.client.Stop()
 +}
 +
 +func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 +	if stage == adapter.StartStateStart {
++		if err := o.client.Start(); err != nil {
++			_ = o.client.Stop()
++			return fmt.Errorf("failed to start mieru client: %w", err)
++		}
 +		scope.Add(o.Close)
 +	}
 +	return nil

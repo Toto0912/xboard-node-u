@@ -337,3 +337,40 @@ func TestWSClient_SyncUsersEmptyArrayPreservedAndMissingIgnored(t *testing.T) {
 		t.Fatalf("expected NodeID=7, got %d", received[0].NodeID)
 	}
 }
+
+func TestWSIdleTimeoutAndActiveHeartbeat(t *testing.T) {
+	for _, heartbeat := range []bool{false, true} {
+		up := websocket.Upgrader{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := up.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			if err := c.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+				return
+			}
+			if !heartbeat {
+				_, _, _ = c.ReadMessage()
+				return
+			}
+			tick := time.NewTicker(15 * time.Millisecond)
+			defer tick.Stop()
+			for range tick.C {
+				if err := c.WriteJSON(wsMessage{Event: "ping"}); err != nil {
+					return
+				}
+			}
+		}))
+		ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+		cl := NewWSClient("ws"+strings.TrimPrefix(srv.URL, "http"), "test", 1, WSClientConfig{}, nil, nil, nil)
+		cl.readIdle = 100 * time.Millisecond
+		err := cl.connect(ctx)
+		expired := ctx.Err() != nil
+		cancel()
+		srv.Close()
+		if heartbeat != expired || (!heartbeat && err == nil) {
+			t.Fatalf("heartbeat=%v deadline=%v err=%v", heartbeat, expired, err)
+		}
+	}
+}

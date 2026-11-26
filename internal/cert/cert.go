@@ -66,6 +66,9 @@ type Manager struct {
 	acmeCancel      context.CancelFunc
 	activeACME      *acmeRuntime
 	tx              *certTransaction
+	// Retain source paths across panel overrides. An administrator may point file mode
+	// at a cache file directly or through a symlink.
+	fileSources     map[string]struct{}
 	ownedPersisted  bool
 	ownedCertDigest [32]byte
 	ownedKeyDigest  [32]byte
@@ -124,10 +127,44 @@ type certMaterial struct {
 
 // NewManager creates a certificate manager.
 func NewManager(cfg config.CertConfig) *Manager {
-	return &Manager{
-		cfg:     cfg,
-		renewCh: make(chan struct{}, 1),
+	m := &Manager{
+		cfg:         cfg,
+		renewCh:     make(chan struct{}, 1),
+		fileSources: make(map[string]struct{}),
 	}
+	m.rememberFileSources(cfg)
+	return m
+}
+
+func (m *Manager) rememberFileSources(cfg config.CertConfig) {
+	if resolveModeFor(cfg) == "file" {
+		for _, path := range []string{cfg.CertFile, cfg.KeyFile} {
+			if path != "" {
+				m.fileSources[filepath.Clean(path)] = struct{}{}
+			}
+		}
+	}
+}
+
+// Cache writes use rename and cleanup uses unlink. Do neither when an input
+// aliases an output, even if the cache path itself is a symlink or hard link.
+func (m *Manager) cacheIncludesSource(dir string) bool {
+	for _, name := range []string{"cert.pem", "key.pem"} {
+		dest := filepath.Join(dir, name)
+		destInfo, err := os.Stat(dest)
+		for path := range m.fileSources {
+			if filepath.Clean(path) == dest {
+				return true
+			}
+			if err == nil {
+				info, e := os.Stat(path)
+				if e == nil && os.SameFile(destInfo, info) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // storePEM atomically swaps the in-memory cert material and persists to disk
@@ -188,7 +225,7 @@ func (m *Manager) persistSelfPEMLocked(cert, key []byte) {
 
 func (m *Manager) removePersistedPEMLocked() {
 	dir := m.cfg.CertDir
-	if dir == "" || !m.ownedPersisted {
+	if dir == "" || !m.ownedPersisted || m.cacheIncludesSource(dir) {
 		return
 	}
 	certPath := filepath.Join(dir, "cert.pem")
@@ -235,7 +272,7 @@ func (m *Manager) Commit() {
 // Caller must hold m.mu. Errors are logged but not returned.
 func (m *Manager) persistPEMLocked(cert, key []byte) {
 	dir := m.cfg.CertDir
-	if dir == "" {
+	if dir == "" || m.cacheIncludesSource(dir) {
 		return
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -372,6 +409,7 @@ func (m *Manager) Reconfigure(ctx context.Context, newCfg config.CertConfig) (bo
 			m.syncACMEFields()
 		}
 	}
+	m.rememberFileSources(newCfg)
 	m.cfg = newCfg
 	m.mu.Unlock()
 
@@ -440,6 +478,7 @@ func acmeFingerprint(cfg config.CertConfig) string {
 	b.WriteByte('|')
 	b.WriteString(strings.TrimSpace(cfg.Email))
 	b.WriteByte('|')
+	fmt.Fprintf(&b, "%d|%s|", cfg.HTTPPort, cfg.CertDir)
 	b.WriteString(strings.TrimSpace(cfg.DNSProvider))
 	b.WriteByte('|')
 	for _, k := range keys {

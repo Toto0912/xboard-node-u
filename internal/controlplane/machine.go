@@ -21,7 +21,7 @@ type MachinePanelControlPlane struct {
 	kcfg   config.KernelConfig
 	push   PushClient // virtual push client from WS mux (may be nil)
 
-	registerFn func(statuses chan<- StatusChange) *NodeMailbox
+	registerFn func(statuses *StatusMailbox) *NodeMailbox
 	handoff    MachineKernelHandoff
 }
 
@@ -33,7 +33,7 @@ func NewMachinePanelControlPlane(
 	client *panel.Client,
 	kcfg config.KernelConfig,
 	push PushClient,
-	registerFn func(statuses chan<- StatusChange) *NodeMailbox,
+	registerFn func(statuses *StatusMailbox) *NodeMailbox,
 ) *MachinePanelControlPlane {
 	return &MachinePanelControlPlane{
 		client:     client,
@@ -71,12 +71,12 @@ func (p *MachinePanelControlPlane) Initial(
 	ctx context.Context,
 	metricsFn func() map[string]interface{},
 	events chan<- Event,
-	statuses chan<- StatusChange,
+	statuses *StatusMailbox,
 ) (Bootstrap, error) {
 	// In machine mode the orchestrator handles the shared WS handshake, but each
 	// node service still needs one initial REST snapshot so newly discovered nodes
 	// can start immediately instead of waiting for a subsequent WS full-sync.
-	hs, err := p.client.Handshake()
+	hs, err := p.client.HandshakeContext(ctx)
 	if err != nil {
 		nlog.Core().Debug("machine node handshake skipped, using REST", "error", err)
 	}
@@ -87,7 +87,7 @@ func (p *MachinePanelControlPlane) Initial(
 		bootstrap.PullInterval = hs.Settings.PullInterval
 	}
 
-	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
+	configSnapshot, cfgETag, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config: %w", err)
 	}
@@ -97,7 +97,7 @@ func (p *MachinePanelControlPlane) Initial(
 	if expected := p.handoff.Confirmed; expected != nil && *expected != MachineConfigDigest(configSnapshot) {
 		return Bootstrap{}, fmt.Errorf("machine kernel handoff config changed since preflight")
 	}
-	users, userETag, err := p.client.GetUsersWithETag()
+	users, userETag, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial users: %w", err)
 	}
@@ -146,7 +146,7 @@ func (p *MachinePanelControlPlane) Initial(
 }
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
+	configSnapshot, cfgETag, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
 	}
@@ -156,7 +156,7 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 		p.handoff.Mismatch()
 		configSnapshot, cfgETag = nil, ""
 	}
-	users, userETag, err := p.client.GetUsersWithETag()
+	users, userETag, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
 	}
@@ -167,7 +167,7 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	}
 	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
+		return Snapshot{Users: model.UserSpecsFromPanel(users)}, fmt.Errorf("machine poll normalize: %w", err)
 	}
 	return Snapshot{
 		Config:       nodeSpec,
@@ -181,7 +181,7 @@ func (p *MachinePanelControlPlane) Discover(
 	ctx context.Context,
 	metricsFn func() map[string]interface{},
 	events chan<- Event,
-	statuses chan<- StatusChange,
+	statuses *StatusMailbox,
 ) (PushClient, error) {
 	return nil, nil
 }

@@ -46,6 +46,7 @@ type Service struct {
 	batchStats   atomic.Pointer[spoolStatus]
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
+	userPolicy   kernel.UserPolicy
 	cert         *cert.Manager
 
 	baseCertCfg       config.CertConfig
@@ -82,11 +83,11 @@ type Service struct {
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
-	wsClient              controlplane.PushClient        // Push client (nil if push is not enabled)
-	wsEvents              chan controlplane.Event        // receives data events from push transport
-	wsStatusCh            chan controlplane.StatusChange // receives push connectivity notifications
-	wsCancel              context.CancelFunc             // cancels the WS client goroutine
-	wsDisconnectAt        time.Time                      // when WS last disconnected (zero if connected)
+	wsClient              controlplane.PushClient     // Push client (nil if push is not enabled)
+	wsEvents              chan controlplane.Event     // receives data events from push transport
+	wsStatus              *controlplane.StatusMailbox // receives push connectivity notifications
+	wsCancel              context.CancelFunc          // cancels the WS client goroutine
+	wsDisconnectAt        time.Time                   // when WS last disconnected (zero if connected)
 	wsResyncWanted        atomic.Uint64
 	wsResyncDone          atomic.Uint64
 	userMutSeq            uint64
@@ -106,17 +107,18 @@ type kernelApplyResult struct {
 }
 
 type pullResult struct {
-	config       *model.NodeSpec
-	users        []model.UserSpec
-	configHash   string
-	userHash     string
-	certChanged  bool
-	forced       bool
-	resyncGen    uint64
-	userMutSeq   uint64
-	configMutSeq uint64
-	commitConfig func()
-	commitUsers  func()
+	configRejected bool
+	config         *model.NodeSpec
+	users          []model.UserSpec
+	configHash     string
+	userHash       string
+	certChanged    bool
+	forced         bool
+	resyncGen      uint64
+	userMutSeq     uint64
+	configMutSeq   uint64
+	commitConfig   func()
+	commitUsers    func()
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -247,12 +249,18 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		baseCertCfg:  cloneCertConfig(cfg.Cert),
 		baseCertInit: true,
 		wsEvents:     make(chan controlplane.Event, 16),
-		wsStatusCh:   make(chan controlplane.StatusChange, 4),
+		wsStatus:     controlplane.NewStatusMailbox(),
 		pullResults:  make(chan pullResult, 1),
 	}
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	if owner, ok := s.source.(interface{ CloseIdleConnections() }); ok {
+		defer owner.CloseIdleConnections()
+	}
+	if x, ok := s.kernel.(*xray.Xray); ok {
+		x.SetResourceContext(ctx)
+	}
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
 		return fmt.Errorf("cert manager: %w", err)
@@ -298,6 +306,7 @@ func (s *Service) Run(ctx context.Context) error {
 	defer wsReconcileTicker.Stop()
 
 	s.startWSClient(ctx)
+	var discovery <-chan pushDiscoveryResult
 
 	for {
 		select {
@@ -344,10 +353,17 @@ func (s *Service) Run(ctx context.Context) error {
 			s.applyPullResult(ctx, result)
 
 		case <-wsDiscoveryTicker.C:
-			s.wsDiscovery(ctx)
+			if s.source.SupportsDiscovery() && discovery == nil {
+				completed := make(chan pushDiscoveryResult, 1)
+				discovery = completed
+				go func() { completed <- s.discoverPush(ctx) }()
+			}
+		case result := <-discovery:
+			discovery = nil
+			s.applyPushDiscovery(ctx, result)
 
-		case status := <-s.wsStatusCh:
-			s.handleWSStatus(ctx, status)
+		case <-s.wsStatus.NotifyCh():
+			s.drainWSStatus(ctx)
 
 		case <-s.machineMailboxCh:
 			s.drainMachineMailbox(ctx)
@@ -362,8 +378,9 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
+	s.kernel.SetUserPolicy(&s.userPolicy)
 
-	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
+	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatus)
 	if err != nil {
 		return err
 	}
@@ -402,7 +419,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		}
 		return fmt.Errorf("initial config is nil")
 	}
-	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), bootstrap.Config, s.cert.TLSCert()); err != nil {
+	if err := validateCandidateFields(s.cfg, s.kernel.Protocols(), bootstrap.Config); err != nil {
 		return err
 	}
 
@@ -414,7 +431,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	if s.machineMailbox != nil {
 		bootstrap.Users, userConflict = s.machineMailbox.ArbitrateUsers(bootstrap.Users)
 	}
-	s.updateUserState(bootstrap.Users)
+	s.stageUserState(bootstrap.Users, "")
 
 	nlog.Core().Info("initial snapshot ready",
 		"protocol", bootstrap.Config.Protocol,
@@ -609,13 +626,19 @@ func (s *Service) wsMetrics() map[string]interface{} {
 	return s.buildMetrics(status, s.kernel.IsRunning())
 }
 
+func (s *Service) drainWSStatus(ctx context.Context) {
+	if state, ok := s.wsStatus.Drain(); ok {
+		s.handleWSStatus(ctx, state)
+	}
+}
+
 // handleWSStatus reacts to WS connectivity changes.
 
 // - On disconnect: record timestamp, immediately REST poll.
 // - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
-	if status.NeedsResync {
-		s.requestWSResync(ctx, "drop_detected")
+	if status.SawDisconnect || !status.Connected {
+		s.kernel.ClearGlobalDevices()
 	}
 	if status.Connected {
 		s.metricsMu.Lock()
@@ -627,9 +650,6 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		} else {
 			nlog.Core().Info("ws connected")
 		}
-		// After reconnect, proactively pull an authoritative user snapshot to catch
-		// any updates missed during the disconnection window.
-		s.pullViaAPIWithOptions(ctx, true)
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
@@ -641,67 +661,59 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		} else {
 			nlog.Core().Info("ws disconnected")
 		}
-		// Clear global device state on disconnect
-		s.kernel.ClearGlobalDevices()
+	}
+	if status.Connected || status.NeedsResync {
+		// A response already in flight predates the reconnect or dropped frame.
+		s.configMutSeq++
+		s.userMutSeq++
+		s.requestWSResync(ctx, "ws_reconnect_or_drop")
+	} else {
 		s.pullViaAPIAsync(ctx)
 	}
 }
 
-// wsDiscovery periodically checks WS availability:
-//
-//  1. REST-only mode (wsClient == nil): Re-handshake to check if panel now has
-//     WS enabled. If so, create and start a WS client. This handles the case
-//     where WS was not enabled at startup but enabled later.
-//
-//  2. WS disconnected for >10 min: Re-handshake to check if WS config changed.
-//     If WS is now disabled, stop the WS client and switch to REST-only.
-//     If WS config changed (different URL/channel), restart with new config.
-func (s *Service) wsDiscovery(ctx context.Context) {
-	if !s.source.SupportsDiscovery() {
-		return
-	}
+// Each discovered endpoint owns its event channels. Retiring that pair also drops
+// buffered updates and late disconnects from the previous endpoint.
+type pushDiscoveryResult struct {
+	client   controlplane.PushClient
+	events   chan controlplane.Event
+	statuses *controlplane.StatusMailbox
+	err      error
+}
 
-	needsCheck := false
-	if s.wsClient == nil {
-		needsCheck = true
-		nlog.Core().Debug("push discovery: no push client, checking if control plane enabled push")
-	} else if !s.wsDisconnectAt.IsZero() && time.Since(s.wsDisconnectAt) > 10*time.Minute {
-		needsCheck = true
-		nlog.Core().Debug("push discovery: push disconnected for >10min, re-checking")
-	}
-	if !needsCheck {
-		return
-	}
+func (s *Service) discoverPush(ctx context.Context) pushDiscoveryResult {
+	r := pushDiscoveryResult{events: make(chan controlplane.Event, cap(s.wsEvents)), statuses: controlplane.NewStatusMailbox()}
+	r.client, r.err = s.source.Discover(ctx, s.wsMetrics, r.events, r.statuses)
+	return r
+}
 
-	pushClient, err := s.source.Discover(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
-	if err != nil {
+func (s *Service) applyPushDiscovery(ctx context.Context, result pushDiscoveryResult) {
+	client, err := result.client, result.err
+	if err != nil || ctx.Err() != nil {
 		nlog.Core().Debug("push discovery failed", "error", err)
 		return
 	}
-	if s.source.SupportsPolling() {
-		s.pullViaAPIAsync(ctx)
+	if client == nil && s.wsClient == nil {
+		return
 	}
-
-	if pushClient != nil {
-		if s.wsClient == nil {
-			nlog.Core().Info("push discovery: control plane enabled push, creating client")
-			s.metricsMu.Lock()
-			s.wsClient = pushClient
-			s.wsDisconnectAt = time.Time{}
-			s.metricsMu.Unlock()
-			s.startWSClient(ctx)
+	if old, ok := s.wsClient.(interface{ Endpoint() string }); ok {
+		if next, ok := client.(interface{ Endpoint() string }); ok && old.Endpoint() == next.Endpoint() {
+			return
 		}
-	} else if s.wsClient != nil {
-		nlog.Core().Info("push discovery: control plane disabled push, switching to polling")
-		if s.wsCancel != nil {
-			s.wsCancel()
-		}
-		s.metricsMu.Lock()
-		s.wsClient = nil
-		s.wsDisconnectAt = time.Time{}
-		s.metricsMu.Unlock()
+	}
+	if s.wsCancel != nil {
+		s.wsCancel()
 		s.wsCancel = nil
 	}
+	s.wsEvents, s.wsStatus = result.events, result.statuses
+	s.metricsMu.Lock()
+	s.wsClient = client
+	s.wsDisconnectAt = time.Time{}
+	s.metricsMu.Unlock()
+	s.configMutSeq++
+	s.userMutSeq++
+	s.startWSClient(ctx)
+	s.requestWSResync(ctx, "ws_endpoint_changed")
 }
 
 // handleWSEvent processes data events received via WebSocket
@@ -712,7 +724,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 			return
 		}
 		newConfigHash := computeConfigHash(event.Config)
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), event.Config, s.cert.TLSCert()); err != nil {
+		if err := validateCandidateFields(s.cfg, s.kernel.Protocols(), event.Config); err != nil {
 			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
 			return
 		}
@@ -888,18 +900,22 @@ func (s *Service) pullViaAPIWithOptions(ctx context.Context, forceFull bool) {
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
 			s.pullBackoff.onFailure()
-			s.pullActive.Store(false)
-			return
+			if snapshot.Users == nil {
+				s.pullActive.Store(false)
+				return
+			}
+		} else {
+			s.pullBackoff.onSuccess()
 		}
-		s.pullBackoff.onSuccess()
 
 		result := pullResult{
-			commitConfig: snapshot.CommitConfig,
-			commitUsers:  snapshot.CommitUsers,
-			forced:       force,
-			resyncGen:    resyncGen,
-			userMutSeq:   startUserSeq,
-			configMutSeq: startConfigSeq,
+			configRejected: err != nil,
+			commitConfig:   snapshot.CommitConfig,
+			commitUsers:    snapshot.CommitUsers,
+			forced:         force,
+			resyncGen:      resyncGen,
+			userMutSeq:     startUserSeq,
+			configMutSeq:   startConfigSeq,
 		}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
@@ -927,6 +943,9 @@ func (s *Service) pullViaAPIWithOptions(ctx context.Context, forceFull bool) {
 
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
+	// The event loop can select a completed poll ahead of a queued WS wakeup.
+	// Observe the newest status while the previous poll still owns pullActive.
+	s.drainWSStatus(ctx)
 	s.pullActive.Store(false)
 	configStale := result.configMutSeq != s.configMutSeq
 	usersStale := result.userMutSeq != s.userMutSeq
@@ -942,14 +961,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 
 	configChanged := false
-	configOK := true
-	mailboxConflict := false
-	if result.users != nil && s.machineMailbox != nil {
-		result.users, mailboxConflict = s.machineMailbox.ArbitrateUsers(result.users)
-		if mailboxConflict {
-			result.userHash = computeUserHash(result.users)
-		}
-	}
+	configOK := !result.configRejected
 	usersOK := !s.usersNeedsReapply
 
 	s.metricsMu.RLock()
@@ -968,7 +980,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	var appliedConfig *model.NodeSpec
 
 	if result.config != nil {
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
+		if err := validateCandidateFields(s.cfg, s.kernel.Protocols(), result.config); err != nil {
 			nlog.Core().Warn("runtime config validation failed", "error", err)
 			result.config = nil
 			configOK = false
@@ -999,6 +1011,21 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		}
 	}
 
+	// A rejected candidate cannot authorize new credentials or relax limits.
+	// Publish the restricted list to the mailbox as well as the running kernel.
+	if !configOK && result.users != nil {
+		result.users = intersectAppliedUsers(s.appliedState.Users, result.users)
+		result.userHash = computeUserHash(result.users)
+		result.commitUsers = nil
+	}
+	mailboxConflict := false
+	if result.users != nil && s.machineMailbox != nil {
+		result.users, mailboxConflict = s.machineMailbox.ArbitrateUsers(result.users)
+		if mailboxConflict {
+			result.userHash = computeUserHash(result.users)
+		}
+	}
+
 	// A no-body 304 says nothing about an uncommitted target. Keep potential
 	// new grants out of config reloads until a non-stale full response arrives.
 	target := s.safeUsersForRestart()
@@ -1014,7 +1041,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			if usersChanged && configChanged {
 				// Both kernels can restart their cached old list on a failed
 				// config reload. Enforce withdrawals on that list first.
-				safe := intersectAppliedUsers(s.appliedState.Users, target)
+				safe := s.stageUserState(target, result.userHash)
 				if s.kernel.IsRunning() && (len(safe) == 0 || s.usersNeedsReapply) {
 					s.stopKernelInstance()
 				} else if s.kernel.IsRunning() && computeUserHash(safe) != computeUserHash(s.appliedState.Users) {
@@ -1023,7 +1050,6 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 					}
 				}
 				s.appliedState.Users = safe
-				s.updateUserState(target)
 			} else if usersChanged {
 				usersOK = s.applyUserUpdate(ctx, target, result.userHash)
 			}
@@ -1160,15 +1186,52 @@ func (s *Service) updateUserState(users []model.UserSpec) {
 	s.restoreUserState(users, computeUserHash(users))
 }
 
+// Prepare kernel-visible buckets for new users while both dispatchers admit
+// only the confirmed intersection. Existing buckets retain the tighter rate.
+func (s *Service) stageUserState(target []model.UserSpec, hash string) []model.UserSpec {
+	safe := intersectAppliedUsers(s.appliedState.Users, target)
+	s.userPolicy.Publish(safe)
+	// Buckets are shared by numeric ID. A UUID rotation still has to keep
+	// the old connection's cap until its replacement is confirmed.
+	oldSpeed := make(map[int]int, len(s.appliedState.Users))
+	for _, u := range s.appliedState.Users {
+		if u.SpeedLimit > 0 {
+			oldSpeed[u.ID] = u.SpeedLimit
+		}
+	}
+	prepared := cloneUsersNonNil(target)
+	for i, u := range prepared {
+		if old := oldSpeed[u.ID]; old > 0 && (u.SpeedLimit <= 0 || old < u.SpeedLimit) {
+			prepared[i].SpeedLimit = old
+		}
+	}
+	s.setUserLimits(prepared)
+	s.rememberUsers(target, hash)
+	return safe
+}
+
+func (s *Service) setUserLimits(users []model.UserSpec) {
+	s.limiter.UpdateUsers(users)
+	s.speedTracker.UpdateBuckets()
+}
+
+func (s *Service) publishUserPolicy(users []model.UserSpec) {
+	s.setUserLimits(users)
+	s.userPolicy.Publish(users)
+}
+
 func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
+	s.publishUserPolicy(users)
+	s.rememberUsers(users, hash)
+}
+
+func (s *Service) rememberUsers(users []model.UserSpec, hash string) {
 	if hash == "" {
 		hash = computeUserHash(users)
 	}
 	if users == nil {
 		users = []model.UserSpec{}
 	}
-	s.limiter.UpdateUsers(users)
-	s.speedTracker.UpdateBuckets()
 	s.metricsMu.Lock()
 	s.lastUsers = cloneUsersNonNil(users)
 	s.metricsMu.Unlock()
@@ -1210,6 +1273,20 @@ func (s *Service) applyKernel(nc *model.NodeSpec, users []model.UserSpec, reload
 	return s.applyKernelWithTLS(nc, users, reload, s.cert.TLSCert()).applied
 }
 
+func isHysteria2(nc *model.NodeSpec) bool {
+	return nc.Protocol == "hysteria2" || nc.Protocol == "hysteria" && nc.Version == 2
+}
+
+func (s *Service) trackKernelListener(nc *model.NodeSpec, activate func() error) error {
+	if s.portHopping == nil {
+		return activate()
+	}
+	if isHysteria2(nc) {
+		return s.portHopping.TrackListener(nc.ListenIP, nc.ServerPort, activate)
+	}
+	return s.portHopping.TrackListener("", 0, activate)
+}
+
 func (s *Service) applyKernelWithTLS(nc *model.NodeSpec, users []model.UserSpec, reload bool, tlsCert kernel.TLSCert) (result kernelApplyResult) {
 	portRange := ""
 	if nc.HY2Settings != nil {
@@ -1234,14 +1311,22 @@ func (s *Service) applyKernelWithTLS(nc *model.NodeSpec, users []model.UserSpec,
 	rollback := func() error {
 		s.stopKernelInstance()
 		if old := s.appliedState.Config; old != nil && len(s.appliedState.Users) > 0 {
-			if err := s.kernel.Start(old, s.appliedState.Users, s.appliedState.TLSCert); err != nil {
+			if err := s.trackKernelListener(old, func() error {
+				return s.kernel.Start(old, s.appliedState.Users, s.appliedState.TLSCert)
+			}); err != nil {
 				return err
 			}
 			result.rolledBackUsers = cloneUsersNonNil(s.appliedState.Users)
 		}
 		return nil
 	}
-	if s.portHopping != nil {
+	if s.portHopping != nil && spec == nil && isHysteria2(nc) {
+		err = s.portHopping.ApplyScalar(nc.ListenIP, nc.ServerPort, activate, rollback)
+	} else if s.portHopping != nil {
+		if spec == nil {
+			start := activate
+			activate = func() error { return s.trackKernelListener(nc, start) }
+		}
 		err = s.portHopping.Apply(spec, activate, rollback)
 	} else if spec != nil {
 		err = fmt.Errorf("HY2 redirects manager is not initialized")
@@ -1257,6 +1342,7 @@ func (s *Service) applyKernelWithTLS(nc *model.NodeSpec, users []model.UserSpec,
 		return result
 	}
 
+	s.publishUserPolicy(users)
 	s.appliedState.Config = nc
 	s.appliedState.Users = cloneUsersNonNil(users)
 	s.appliedState.TLSCert = cloneTLSCert(tlsCert)
@@ -1307,8 +1393,7 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		return true
 	}
 
-	s.appliedState.Users = intersectAppliedUsers(s.appliedState.Users, users)
-	s.restoreUserState(users, newHash)
+	s.appliedState.Users = s.stageUserState(users, newHash)
 	if s.lastConfig == nil {
 		return true // staged for the first config
 	}
@@ -1320,6 +1405,7 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		nlog.Core().Warn("user update failed, rebuilding from the requested list", "error", err)
 		return s.rebuildUsers(users)
 	}
+	s.publishUserPolicy(users)
 	s.appliedState.Users = cloneUsersNonNil(users)
 	if s.nodeLog != nil && (added > 0 || removed > 0) {
 		s.nodeLog.Info(fmt.Sprintf("users updated: +%d -%d", added, removed))
@@ -1335,7 +1421,7 @@ func (s *Service) rebuildUsers(users []model.UserSpec) bool {
 	}
 	result := s.applyKernelWithTLS(s.lastConfig, users, false, s.cert.TLSCert())
 	if result.applied {
-		s.updateUserState(users)
+		s.rememberUsers(users, "")
 	} else {
 		s.recordUserApplyFailure(users, result.rolledBackUsers)
 	}
@@ -1350,7 +1436,7 @@ func (s *Service) recordUserApplyFailure(target, rolledBack []model.UserSpec) {
 		if s.kernel.IsRunning() {
 			s.stopKernelInstance()
 		}
-		s.updateUserState(target)
+		s.stageUserState(target, "")
 	}
 	if !s.hasPendingForceResync() {
 		s.wsResyncWanted.Add(1)
@@ -1359,7 +1445,7 @@ func (s *Service) recordUserApplyFailure(target, rolledBack []model.UserSpec) {
 
 // A WS delta cannot prove that a previously failed REST grant is still valid.
 func (s *Service) restrictPendingUsers(target []model.UserSpec) {
-	safe := intersectAppliedUsers(s.appliedState.Users, target)
+	safe := s.stageUserState(target, "")
 	if s.kernel.IsRunning() && computeUserHash(safe) != computeUserHash(s.appliedState.Users) {
 		if len(safe) == 0 {
 			s.stopKernel()
@@ -1368,7 +1454,6 @@ func (s *Service) restrictPendingUsers(target []model.UserSpec) {
 		}
 	}
 	s.appliedState.Users = safe
-	s.updateUserState(target)
 }
 
 // applyUserDelta applies an incremental user change (add or remove) directly
@@ -1392,8 +1477,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
 		if !s.kernel.IsRunning() {
-			s.appliedState.Users = intersectAppliedUsers(s.appliedState.Users, merged)
-			s.updateUserState(merged)
+			s.appliedState.Users = s.stageUserState(merged, "")
 			if s.lastConfig != nil && !s.rebuildUsers(merged) {
 				s.pullViaAPIWithOptions(ctx, true)
 			}
@@ -1413,8 +1497,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			}
 		}
 
-		s.appliedState.Users = intersectAppliedUsers(s.appliedState.Users, merged)
-		s.updateUserState(merged)
+		s.appliedState.Users = s.stageUserState(merged, "")
 		var added int
 		var err error
 		if hasUUIDChange {
@@ -1433,6 +1516,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 				return
 			}
 		} else {
+			s.publishUserPolicy(merged)
 			s.appliedState.Users = cloneUsersNonNil(merged)
 		}
 		if s.nodeLog != nil && added > 0 {
@@ -1447,7 +1531,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
 
 		if !s.kernel.IsRunning() {
-			s.updateUserState(filtered)
+			s.stageUserState(filtered, "")
 			if len(s.appliedState.Users) > 0 {
 				pruned := subtractUsers(s.appliedState.Users, deltaUsers)
 				if len(pruned) == 0 {
@@ -1469,8 +1553,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 
-		s.appliedState.Users = intersectAppliedUsers(s.appliedState.Users, filtered)
-		s.updateUserState(filtered)
+		s.appliedState.Users = s.stageUserState(filtered, "")
 		removed, err := s.kernel.RemoveUsers(deltaUsers)
 		if err != nil {
 			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
@@ -1483,6 +1566,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 				return
 			}
 		} else {
+			s.publishUserPolicy(filtered)
 			s.appliedState.Users = cloneUsersNonNil(filtered)
 		}
 		if s.nodeLog != nil && removed > 0 {
@@ -1880,14 +1964,24 @@ func (s *Service) reportDevices() {
 // ─── Runtime validation ─────────────────────────────────────────────────
 
 func validateNodeRuntime(cfg *config.Config, kcfgSupported []string, spec *model.NodeSpec, tls kernel.TLSCert) error {
+	if err := validateCandidateFields(cfg, kcfgSupported, spec); err != nil {
+		return err
+	}
+	return validateTLSRequirements(spec, tls, cfgKernelType(cfg))
+}
+
+// Certificate requirements are checked after preparing the candidate certificate.
+func validateCandidateFields(cfg *config.Config, kcfgSupported []string, spec *model.NodeSpec) error {
 	if spec == nil {
 		return fmt.Errorf("node spec is nil")
 	}
 	if !containsString(kcfgSupported, spec.Protocol) {
 		return fmt.Errorf("protocol %q is not supported by kernel %q", spec.Protocol, cfg.Kernel.Type)
 	}
-	if err := validateTLSRequirements(spec, tls, cfgKernelType(cfg)); err != nil {
-		return err
+	if spec.TLS == 2 {
+		if err := validateRealityRequirements(spec, cfgKernelType(cfg)); err != nil {
+			return err
+		}
 	}
 	if err := validateRuntimeCertConfig(spec); err != nil {
 		return err

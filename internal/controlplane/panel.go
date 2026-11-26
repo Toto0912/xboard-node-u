@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -19,7 +20,8 @@ type PanelControlPlane struct {
 }
 
 type panelPushClient struct {
-	inner *panel.WSClient
+	inner    *panel.WSClient
+	endpoint string
 }
 
 func NewPanelControlPlane(panelCfg config.PanelConfig, wsCfg config.WSConfig, kcfg config.KernelConfig) *PanelControlPlane {
@@ -38,8 +40,8 @@ func (p *PanelControlPlane) SupportsDeviceReports() bool { return true }
 func (p *PanelControlPlane) ResetConfigETag()            { p.client.ResetConfigETag() }
 func (p *PanelControlPlane) ResetUserETag()              { p.client.ResetUserETag() }
 
-func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error) {
-	hs, err := p.client.Handshake()
+func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses *StatusMailbox) (Bootstrap, error) {
+	hs, err := p.client.HandshakeContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("handshake: %w", err)
 	}
@@ -51,14 +53,14 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	}
 
 	nlog.Core().Info("websocket disabled, using REST API")
-	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
+	configSnapshot, cfgETag, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial config fetch: %w", err)
 	}
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("initial config is nil")
 	}
-	users, userETag, err := p.client.GetUsersWithETag()
+	users, userETag, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial user fetch: %w", err)
 	}
@@ -79,12 +81,20 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 }
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
+	configSnapshot, cfgETag, err := p.client.GetConfigContext(ctx)
 	if err != nil {
+		if errors.Is(err, panel.ErrNodeRevoked) {
+			p.client.ResetETags()
+			return Snapshot{Users: []model.UserSpec{}}, nil
+		}
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
 	}
-	users, userETag, err := p.client.GetUsersWithETag()
+	users, userETag, err := p.client.GetUsersContext(ctx)
 	if err != nil {
+		if errors.Is(err, panel.ErrNodeRevoked) {
+			p.client.ResetETags()
+			return Snapshot{Users: []model.UserSpec{}}, nil
+		}
 		return Snapshot{}, fmt.Errorf("poll users: %w", err)
 	}
 	select {
@@ -94,7 +104,7 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	}
 	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
+		return Snapshot{Users: model.UserSpecsFromPanel(users)}, fmt.Errorf("poll config normalize: %w", err)
 	}
 	return Snapshot{
 		Config:       nodeSpec,
@@ -104,8 +114,8 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	}, nil
 }
 
-func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
-	hs, err := p.client.Handshake()
+func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses *StatusMailbox) (PushClient, error) {
+	hs, err := p.client.HandshakeContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
@@ -119,6 +129,8 @@ func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[s
 	}
 	return nil, nil
 }
+
+func (p *PanelControlPlane) CloseIdleConnections() { p.client.CloseIdleConnections() }
 
 func (p *PanelControlPlane) BatchClient() *panel.Client { return p.client }
 
@@ -137,7 +149,7 @@ func (p *PanelControlPlane) Metrics() APIMetrics {
 	return APIMetrics{Success: api.Success, Failure: api.Failure}
 }
 
-func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange, wsURL string) PushClient {
+func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{}, events chan<- Event, statuses *StatusMailbox, wsURL string) PushClient {
 	cfg := panel.WSClientConfig{
 		StatusInterval:   time.Duration(p.wsCfg.StatusInterval) * time.Second,
 		HandshakeTimeout: time.Duration(p.wsCfg.HandshakeTimeout) * time.Second,
@@ -159,21 +171,15 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 			case events <- translated:
 			default:
 				nlog.Core().Warn("ws event channel full, dropping event", "type", translated.Type)
-				select {
-				case statuses <- StatusChange{Connected: true, NeedsResync: true}:
-				default:
-				}
+				statuses.Publish(StatusChange{Connected: true, NeedsResync: true})
 			}
 		},
 		func(status panel.WSStatusChange) {
-			select {
-			case statuses <- StatusChange{Connected: status.Connected}:
-			default:
-			}
+			statuses.Publish(StatusChange{Connected: status.Connected})
 		},
 		metricsFn,
 	)
-	return &panelPushClient{inner: inner}
+	return &panelPushClient{inner: inner, endpoint: wsURL}
 }
 
 func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, error) {
@@ -197,6 +203,8 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 	}
 	return translated, nil
 }
+
+func (p *panelPushClient) Endpoint() string { return p.endpoint }
 
 func (p *panelPushClient) Run(ctx context.Context) { p.inner.Run(ctx) }
 func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected() }

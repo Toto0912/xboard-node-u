@@ -1337,3 +1337,16 @@ index c927d5e..4769e04 100644
 -	server.accepting = false
  	return server.conn.Close()
  }
+diff --git a/common/mux/writer.go b/common/mux/writer.go
+--- a/common/mux/writer.go
++++ b/common/mux/writer.go
+@@ -22,6 +22,9 @@ func (w *MutexWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+ 	return w.Writer.WriteMultiBuffer(mb)
+ }
+ 
++// Interrupt the underlying pipe without waiting for a blocked write to release the mutex.
++func (w *MutexWriter) Interrupt() { common.Interrupt(w.Writer) }
++
+ type Writer struct {
+ 	dest         net.Destination
+ 	writer       buf.Writer

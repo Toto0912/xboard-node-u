@@ -143,6 +143,9 @@ func NodeSpecFromPanelValidated(nc *panel.NodeConfig, kcfg config.KernelConfig) 
 			kind = spec.KernelType
 		}
 		kind, _ = normalizeKernelType(kind) // Already checked by ValidateNodeSpec.
+		if spec.Protocol == "shadowsocks" && strings.EqualFold(strings.TrimSpace(spec.Cipher), "2022-blake3-chacha20-poly1305") {
+			return nil, fmt.Errorf("managed Shadowsocks multi-user inbounds support SS2022 AES-128-GCM and AES-256-GCM; %s cannot use SS2022 ChaCha20 with per-user credentials", kind)
+		}
 		if kind == "xray" {
 			switch strings.ToLower(strings.TrimSpace(spec.Network)) {
 			case "h2", "h3", "http", "quic":

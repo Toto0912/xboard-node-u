@@ -288,7 +288,9 @@ func compileCustomRouteRule(rule model.CustomRouteRule) []M {
 		if len(portRanges) > 0 {
 			entry["port_range"] = portRanges
 		}
-		compiled = append(compiled, entry)
+		if len(ports) > 0 || len(portRanges) > 0 {
+			compiled = append(compiled, entry)
+		}
 	}
 	if len(rule.Match.Networks) > 0 {
 		compiled = append(compiled, M{
@@ -311,7 +313,9 @@ func compileCustomRouteRule(rule model.CustomRouteRule) []M {
 		if len(portRanges) > 0 {
 			entry["source_port_range"] = portRanges
 		}
-		compiled = append(compiled, entry)
+		if len(ports) > 0 || len(portRanges) > 0 {
+			compiled = append(compiled, entry)
+		}
 	}
 	return compiled
 }
@@ -455,6 +459,11 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		return buildVLESS(base, nc, users, tc)
 	case "trojan":
 		return buildTrojan(base, nc, users, tc)
+	case "hysteria2":
+		canonical := *nc
+		canonical.Protocol, canonical.Version = "hysteria", 2
+		base["tag"] = "hysteria-in"
+		return buildHysteria(base, &canonical, users, tc)
 	case "hysteria":
 		return buildHysteria(base, nc, users, tc)
 	case "tuic":
@@ -935,15 +944,18 @@ func buildRealityConfig(nc *model.NodeSpec) M {
 	}
 
 	if dest != "" {
-		handshake := M{"server": dest, "server_port": 443}
-		if parts := strings.SplitN(dest, ":", 2); len(parts) == 2 {
-			handshake["server"] = parts[0]
-			if p, err := strconv.Atoi(parts[1]); err == nil {
-				handshake["server_port"] = p
-			}
-		} else if settings.ServerPort > 0 {
-			handshake["server_port"] = settings.ServerPort
+		host, port := dest, settings.ServerPort
+		if port <= 0 {
+			port = 443
 		}
+		if h, p, err := net.SplitHostPort(dest); err == nil {
+			if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= 65535 {
+				host, port = h, n
+			}
+		} else if strings.HasPrefix(dest, "[") && strings.HasSuffix(dest, "]") && net.ParseIP(dest[1:len(dest)-1]) != nil {
+			host = dest[1 : len(dest)-1]
+		}
+		handshake := M{"server": host, "server_port": port}
 		reality["handshake"] = handshake
 	}
 

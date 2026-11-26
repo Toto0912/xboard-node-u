@@ -1,7 +1,6 @@
 package xray
 
 import (
-	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
@@ -11,7 +10,7 @@ import (
 
 func newTestDispatcher() *LimitDispatcher {
 	return &LimitDispatcher{
-		limitedIPs: make(map[string]map[string]int),
+		activeIPs: make(map[string]map[string]int),
 	}
 }
 
@@ -106,21 +105,9 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	email2 := userEmail(2)
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
 
-	ic1 := &ipCounter{}
-	r1 := &atomic.Int64{}
-	r1.Store(1)
-	ic1.ips.Store("1.1.1.1", r1)
-	r2 := &atomic.Int64{}
-	r2.Store(1)
-	ic1.ips.Store("2.2.2.2", r2)
-	ld.unlimitedIPs.Store(email1, ic1)
-
-	ic2 := &ipCounter{}
-	r3 := &atomic.Int64{}
-	r3.Store(1)
-	ic2.ips.Store("3.3.3.3", r3)
-	ld.unlimitedIPs.Store(email2, ic2)
-
+	ld.checkDeviceLimit(email1, "1.1.1.1", true)
+	ld.checkDeviceLimit(email1, "2.2.2.2", true)
+	ld.checkDeviceLimit(email2, "3.3.3.3", true)
 	ld.connCount.Store(5)
 
 	aliveIPs, connCount := ld.GetConnectionState()
@@ -140,17 +127,17 @@ func TestLimitDispatcher_ResetConns(t *testing.T) {
 	ld := newTestDispatcher()
 
 	ld.mu.Lock()
-	ld.limitedIPs["user@1"] = map[string]int{"1.1.1.1": 1}
+	ld.activeIPs["user@1"] = map[string]int{"1.1.1.1": 1}
 	ld.mu.Unlock()
 	ld.connCount.Store(3)
 
 	ld.ResetConns()
 
 	ld.mu.RLock()
-	ipCount := len(ld.limitedIPs)
+	ipCount := len(ld.activeIPs)
 	ld.mu.RUnlock()
 	if ipCount != 0 {
-		t.Error("limitedIPs should be empty after reset")
+		t.Error("activeIPs should be empty after reset")
 	}
 
 	if ld.connCount.Load() != 0 {
@@ -165,7 +152,7 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 	// No device limit set for this user
 	ld.UpdateLimits(map[string]int{email: 1}, nil, nil)
 
-	// Should use fast path (sync.Map), no lock needed
+	// Unrestricted users still contribute device state.
 	for i := 0; i < 100; i++ {
 		ip := "10.0.0." + string(rune('0'+i%10))
 		if ld.checkDeviceLimit(email, ip, true) {
@@ -173,18 +160,12 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 		}
 	}
 
-	// Verify IPs are tracked in unlimitedIPs
-	v, ok := ld.unlimitedIPs.Load(email)
-	if !ok {
-		t.Error("unlimited user should have entry in unlimitedIPs")
+	ips, _ := ld.GetConnectionState()
+	if len(ips[1]) != 10 {
+		t.Errorf("unexpected live devices: %v", ips)
 	}
-	ic := v.(*ipCounter)
-	ips := ic.aliveIPs()
-	if len(ips) == 0 {
-		t.Error("should have tracked some IPs")
-	}
-}
 
+}
 
 func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	ld := newTestDispatcher()

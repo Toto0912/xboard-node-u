@@ -56,6 +56,7 @@ const (
 //   - instance.Start() and instance.Close() run OUTSIDE the lock.
 //   - running (atomic) gates fast-path checks in IsRunning / GetConnections.
 type Xray struct {
+	resourceCtx context.Context
 	cfg         config.KernelConfig
 	lifecycleMu sync.Mutex
 
@@ -73,6 +74,8 @@ type Xray struct {
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
 	speedLimitFunc  func(string) *rate.Limiter
+	userPolicy      atomic.Pointer[kernel.UserPolicy]
+	bandwidthEmails map[string]struct{}
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -81,8 +84,9 @@ type Xray struct {
 
 func New(cfg config.KernelConfig) *Xray {
 	return &Xray{
-		cfg:        cfg,
-		cumTraffic: make(map[int][2]int64),
+		cfg:         cfg,
+		resourceCtx: context.Background(),
+		cumTraffic:  make(map[int][2]int64),
 	}
 }
 
@@ -119,9 +123,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 
 func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
-	x.ensureGeoData(nodeConfig)
-
-	pbConfig, err := parseConfig(x.cfg, nodeConfig, users, tls, false)
+	pbConfig, err := parseConfig(x.resourceCtx, x.cfg, nodeConfig, users, tls, false)
 	if err != nil {
 		return err
 	}
@@ -137,12 +139,19 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 		return fmt.Errorf("create xray: %w", err)
 	}
 
+	if ld != nil {
+		ld.managedTag = nodeConfig.Protocol + "-in"
+		ld.userPolicy = &x.userPolicy
+	}
+
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	x.mu.Lock()
 	old := x.instance
+	lookup := x.speedLimitFunc
 	previousNode, previousUsers, previousTLS := x.nodeConfig, x.users, x.tls
 	x.mu.Unlock()
 	x.stopLocked()
+	x.installBandwidth(inst, users, lookup)
 	if err := startWithTimeout(inst, startTimeout); err != nil {
 		inst.Close()
 		if old != nil {
@@ -172,7 +181,6 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	x.mu.Unlock()
 
 	x.updateDispatcherLimits(users)
-	x.updateBandwidthLimits(users)
 
 	nlog.Core().Info("xray started",
 		"users", len(users),
@@ -186,6 +194,8 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 // instance restart for most transport/TLS settings, it triggers a full restart
 // if any kernel-affecting fields (hash mismatch) have changed.
 func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
@@ -202,7 +212,7 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	x.mu.Unlock()
 
 	nlog.Core().Info("xray: configuration changed, performing full restart")
-	return x.Start(nodeConfig, users, tls)
+	return x.startLocked(nodeConfig, users, tls)
 }
 
 // Stop closes the instance synchronously so no listener outlives its service.
@@ -226,38 +236,7 @@ func (x *Xray) stopLocked() {
 		nlog.Core().Warn("xray: session drain timed out; reporting available counters")
 	}
 	x.mu.Lock()
-	// Read all user counters before the instance releases them, including users
-	// removed from the active roster since the previous periodic sample.
-	if mgr, ok := inst.GetFeature(stats.ManagerType()).(interface {
-		VisitCounters(func(string, stats.Counter) bool)
-	}); ok {
-		mgr.VisitCounters(func(name string, counter stats.Counter) bool {
-			email, direction, ok := strings.Cut(name, ">>>traffic>>>")
-			const prefix = "user>>>user@"
-			if !ok || !strings.HasPrefix(email, prefix) {
-				return true
-			}
-			id, err := strconv.Atoi(email[len(prefix):])
-			if err != nil || id <= 0 {
-				return true
-			}
-			cum := x.cumTraffic[id]
-			switch direction {
-			case "uplink":
-				cum[0] += counter.Set(0)
-			case "downlink":
-				cum[1] += counter.Set(0)
-			default:
-				return true
-			}
-			if cum != [2]int64{} {
-				x.cumTraffic[id] = cum
-			}
-			return true
-		})
-	} else {
-		_, _ = x.aggregateStats()
-	}
+	_, _ = x.aggregateStats()
 	x.sessions = nil
 	x.instance = nil
 	x.limitDispatcher = nil
@@ -320,11 +299,15 @@ func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
 // per-user limiter callback used by the service layer. Unlike the old no-op
 // behavior, xray now consumes this callback to support dynamic speed updates.
 func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
 	x.mu.Lock()
 	x.speedLimitFunc = fn
 	x.mu.Unlock()
 	x.updateBandwidthLimits(nil)
 }
+
+func (x *Xray) SetUserPolicy(p *kernel.UserPolicy) { x.userPolicy.Store(p) }
 
 // SetDeviceLimitFunc is a no-op for xray — device limits are already
 // gate-kept by LimitDispatcher.checkDeviceLimit at Dispatch time.
@@ -347,6 +330,8 @@ func (x *Xray) ClearGlobalDevices() {}
 // existing users, so this method always merges properties and refreshes the
 // dispatcher limits — even when no brand-new users need to be added.
 func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -373,6 +358,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	if len(toAdd) == 0 {
 		// No new kernel users, but properties (limits) may have changed.
 		x.users = merged
+		x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, merged)
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
 		x.updateBandwidthLimits(merged)
@@ -385,7 +371,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: AddUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, merged, t); err != nil {
+		if err := x.startLocked(nc, merged, t); err != nil {
 			return 0, err
 		}
 		return len(toAdd), nil
@@ -419,6 +405,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	// Update bookkeeping with full merged list (new users + updated properties).
 	x.mu.Lock()
 	x.users = merged
+	x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, merged)
 	x.mu.Unlock()
 	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
@@ -430,6 +417,8 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
 // Truly hitless for supported protocols — remaining connections unaffected.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -455,7 +444,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	if len(kept) == 0 {
 		x.mu.Unlock()
-		x.Stop()
+		x.stopLocked()
 		return removed, nil
 	}
 
@@ -464,7 +453,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: RemoveUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, kept, t); err != nil {
+		if err := x.startLocked(nc, kept, t); err != nil {
 			return 0, err
 		}
 		return removed, nil
@@ -493,6 +482,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	x.mu.Lock()
 	x.users = kept
+	x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, kept)
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
@@ -505,6 +495,8 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 // changed, updates the dispatcher without restarting. Otherwise uses
 // UserManager for hitless add/remove where supported.
 func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
@@ -529,7 +521,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		nc, t := x.nodeConfig, x.tls
 		x.mu.Unlock()
 		nlog.Core().Debug("xray: UpdateUsers fallback to restart", "reason", umErr)
-		if err = x.Start(nc, users, t); err != nil {
+		if err = x.startLocked(nc, users, t); err != nil {
 			return 0, 0, err
 		}
 		return
@@ -572,6 +564,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	x.mu.Lock()
 	x.users = users
+	x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, users)
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -698,14 +691,14 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 
 // parseCipherType maps a cipher name string to the xray CipherType enum.
 func parseCipherType(cipher string) shadowsocks.CipherType {
-	switch cipher {
-	case "aes-128-gcm":
+	switch strings.ToLower(cipher) {
+	case "aes-128-gcm", "aead_aes_128_gcm":
 		return shadowsocks.CipherType_AES_128_GCM
-	case "aes-256-gcm":
+	case "aes-256-gcm", "aead_aes_256_gcm":
 		return shadowsocks.CipherType_AES_256_GCM
-	case "chacha20-ietf-poly1305", "chacha20-poly1305":
+	case "chacha20-ietf-poly1305", "chacha20-poly1305", "aead_chacha20_poly1305":
 		return shadowsocks.CipherType_CHACHA20_POLY1305
-	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
+	case "xchacha20-ietf-poly1305", "xchacha20-poly1305", "aead_xchacha20_poly1305":
 		return shadowsocks.CipherType_XCHACHA20_POLY1305
 	case "none", "plain":
 		return shadowsocks.CipherType_UNKNOWN
@@ -733,46 +726,52 @@ func hexEncode(dst, src []byte) {
 	}
 }
 
-// ensureGeoData downloads geo databases when routes reference geoip/geosite.
-func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
-	needIP, needSite := kernel.NeedsGeoIP(nc.Routes), kernel.NeedsGeoSite(nc.Routes)
-	if !needIP && !needSite {
-		return
-	}
-	dir := x.cfg.GeoDataDir
-	if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
-		nlog.Core().Warn("geo database unavailable", "error", err)
-	}
+// SetResourceContext ties a node's wait for shared GeoData to its lifetime.
+func (x *Xray) SetResourceContext(ctx context.Context) {
+	x.lifecycleMu.Lock()
+	defer x.lifecycleMu.Unlock()
+	x.resourceCtx = ctx
 }
 
 // PreflightConfig validates available resources without downloading assets in
 // the machine loop. Start obtains missing GEO databases before building every rule.
 func PreflightConfig(cfg config.KernelConfig, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	candidate := *spec
-	if kernel.NeedsGeoIP(spec.Routes) || kernel.NeedsGeoSite(spec.Routes) {
-		_, ipErr := os.Stat(filepath.Join(cfg.GeoDataDir, "geoip.dat"))
-		_, siteErr := os.Stat(filepath.Join(cfg.GeoDataDir, "geosite.dat"))
-		candidate.Routes = slices.DeleteFunc(slices.Clone(spec.Routes), func(rule model.RouteRule) bool {
-			one := []model.RouteRule{rule}
-			return (os.IsNotExist(ipErr) && kernel.NeedsGeoIP(one)) ||
-				(os.IsNotExist(siteErr) && kernel.NeedsGeoSite(one))
-		})
-	}
-	_, err := parseConfig(cfg, &candidate, users, tls, true)
+	_, err := parseConfig(context.Background(), cfg, spec, users, tls, true)
 	return err
 }
 
 // Xray resolves GEO paths through a process-wide environment variable during parsing.
 var parseMu sync.Mutex
 
-func parseConfig(cfg config.KernelConfig, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert, preview bool) (*xrayCore.Config, error) {
-	data, err := marshalConfig(cfg, spec, users, tls)
+func parseConfig(ctx context.Context, cfg config.KernelConfig, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert, preview bool) (*xrayCore.Config, error) {
+	built := buildConfig(cfg, spec, users, tls)
+	routing, _ := built["routing"].(M)
+	rules, _ := routing["rules"].([]M)
+	var needIP, needSite bool
+	for _, rule := range rules {
+		ip, site := nativeGeoNeeds(rule)
+		needIP = needIP || ip
+		needSite = needSite || site
+	}
+	if needIP || needSite {
+		if preview {
+			_, ipErr := os.Stat(filepath.Join(cfg.GeoDataDir, "geoip.dat"))
+			_, siteErr := os.Stat(filepath.Join(cfg.GeoDataDir, "geosite.dat"))
+			routing["rules"] = slices.DeleteFunc(rules, func(rule M) bool {
+				ip, site := nativeGeoNeeds(rule)
+				return (ip && os.IsNotExist(ipErr)) || (site && os.IsNotExist(siteErr))
+			})
+		} else if err := geodata.EnsureContext(ctx, cfg.GeoDataDir, needIP, needSite, "xray"); err != nil {
+			return nil, fmt.Errorf("prepare routing data: %w", err)
+		}
+	}
+	data, err := marshalBuiltConfig(built, spec)
 	if err != nil {
 		return nil, err
 	}
 	parseMu.Lock()
 	defer parseMu.Unlock()
-	if kernel.NeedsGeoIP(spec.Routes) || kernel.NeedsGeoSite(spec.Routes) {
+	if needIP || needSite {
 		const assetEnv = "XRAY_LOCATION_ASSET"
 		if preview {
 			if previous, ok := os.LookupEnv(assetEnv); ok {
@@ -794,7 +793,13 @@ func parseConfig(cfg config.KernelConfig, spec *model.NodeSpec, users []model.Us
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
 func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) ([]byte, error) {
-	cfgMap := buildConfig(cfg, nc, users, tls)
+	return marshalBuiltConfig(buildConfig(cfg, nc, users, tls), nc)
+}
+
+func marshalBuiltConfig(cfgMap M, nc *model.NodeSpec) ([]byte, error) {
+	if in, _ := cfgMap["inbounds"].([]M); len(in) == 0 {
+		return nil, fmt.Errorf("xray cannot construct an inbound for %s version %d", nc.Protocol, nc.Version)
+	}
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
@@ -827,6 +832,35 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	sm := x.instance.GetFeature(stats.ManagerType())
 	if sm == nil {
 		return nil, nil
+	}
+	if mgr, ok := sm.(interface {
+		VisitCounters(func(string, stats.Counter) bool)
+	}); ok {
+		mgr.VisitCounters(func(name string, counter stats.Counter) bool {
+			email, direction, ok := strings.Cut(name, ">>>traffic>>>")
+			const prefix = "user>>>user@"
+			if !ok || !strings.HasPrefix(email, prefix) {
+				return true
+			}
+			id, err := strconv.Atoi(email[len(prefix):])
+			if err != nil || id <= 0 {
+				return true
+			}
+			cum := x.cumTraffic[id]
+			switch direction {
+			case "uplink":
+				cum[0] += counter.Set(0)
+			case "downlink":
+				cum[1] += counter.Set(0)
+			default:
+				return true
+			}
+			if cum != [2]int64{} {
+				x.cumTraffic[id] = cum
+			}
+			return true
+		})
+		return maps.Clone(x.cumTraffic), nil
 	}
 	mgr, ok := sm.(stats.Manager)
 	if !ok {
@@ -861,8 +895,14 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	inst := x.instance
 	fn := x.speedLimitFunc
-	currentUsers := x.users
+	if users == nil {
+		users = x.users
+	}
 	x.mu.Unlock()
+	x.installBandwidth(inst, users, fn)
+}
+
+func (x *Xray) installBandwidth(inst *xrayCore.Instance, users []model.UserSpec, fn func(string) *rate.Limiter) {
 	if inst == nil {
 		return
 	}
@@ -874,12 +914,12 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	if !ok {
 		return
 	}
-	bm.Reset()
-	if users == nil {
-		users = currentUsers
-	}
+	// Preserve mappings for unchanged users throughout the update. Resetting
+	// the entire manager briefly removes their caps on otherwise idle reloads.
+	next := make(map[string]struct{}, len(users))
 	for _, u := range users {
 		email := userEmail(u.ID)
+		next[email] = struct{}{}
 		if fn != nil {
 			bm.SetUserLimiter(email, fn(u.UUID))
 			continue
@@ -887,6 +927,12 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 		bps := int64(u.SpeedLimit) * 1_000_000 / 8
 		bm.SetUserLimit(email, bps)
 	}
+	for email := range x.bandwidthEmails {
+		if _, ok := next[email]; !ok {
+			bm.SetUserLimiter(email, nil)
+		}
+	}
+	x.bandwidthEmails = next
 }
 
 // updateDispatcherLimits configures the LimitDispatcher with per-user

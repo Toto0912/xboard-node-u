@@ -22,6 +22,7 @@ import (
 )
 
 var (
+	ErrNodeRevoked = errors.New("panel revoked node binding")
 	trafficMapPool = sync.Pool{New: func() interface{} { return make(map[string][2]int64) }}
 	aliveMapPool   = sync.Pool{New: func() interface{} { return make(map[string][]string) }}
 	onlineMapPool  = sync.Pool{New: func() interface{} { return make(map[string]int) }}
@@ -46,6 +47,8 @@ type Client struct {
 	apiSuccess atomic.Uint64
 	apiFailure atomic.Uint64
 }
+
+func (c *Client) CloseIdleConnections() { c.httpClient.CloseIdleConnections() }
 
 // NewClient creates a new panel API client.
 func NewClient(cfg config.PanelConfig) *Client {
@@ -100,7 +103,11 @@ func (c *Client) ResetUserETag() {
 
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
 func (c *Client) Handshake() (*HandshakeResponse, error) {
-	resp, err := c.doRequest("POST", "/api/v2/server/handshake", nil, "")
+	return c.HandshakeContext(context.Background())
+}
+
+func (c *Client) HandshakeContext(ctx context.Context) (*HandshakeResponse, error) {
+	resp, err := c.doRequestContext(ctx, "POST", "/api/v2/server/handshake", nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
@@ -256,11 +263,15 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 
 // GetConfigWithETag fetches node configuration and returns any new ETag without saving it yet.
 func (c *Client) GetConfigWithETag() (*NodeConfig, string, error) {
+	return c.GetConfigContext(context.Background())
+}
+
+func (c *Client) GetConfigContext(ctx context.Context) (*NodeConfig, string, error) {
 	c.etagMu.Lock()
 	etag := c.configETag
 	c.etagMu.Unlock()
 
-	resp, err := c.doRequest("GET", c.configPath(), nil, etag)
+	resp, err := c.doRequestContext(ctx, "GET", c.configPath(), nil, etag)
 	if err != nil {
 		return nil, "", fmt.Errorf("get config: %w", err)
 	}
@@ -268,6 +279,9 @@ func (c *Client) GetConfigWithETag() (*NodeConfig, string, error) {
 
 	if resp.StatusCode == http.StatusNotModified {
 		return nil, "", nil
+	}
+	if c.machineID == 0 && resp.StatusCode == http.StatusGone && resp.Header.Get("X-Xboard-Node-State") == "revoked" {
+		return nil, "", ErrNodeRevoked
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("GET %s: HTTP %d %s", c.configPath(), resp.StatusCode, http.StatusText(resp.StatusCode))
@@ -312,11 +326,15 @@ func (c *Client) GetUsers() ([]User, error) {
 
 // GetUsersWithETag fetches available users and returns any new ETag without saving it yet.
 func (c *Client) GetUsersWithETag() ([]User, string, error) {
+	return c.GetUsersContext(context.Background())
+}
+
+func (c *Client) GetUsersContext(ctx context.Context) ([]User, string, error) {
 	c.etagMu.Lock()
 	etag := c.userETag
 	c.etagMu.Unlock()
 
-	resp, err := c.doRequest("GET", c.userPath(), nil, etag)
+	resp, err := c.doRequestContext(ctx, "GET", c.userPath(), nil, etag)
 	if err != nil {
 		return nil, "", fmt.Errorf("get users: %w", err)
 	}
@@ -324,6 +342,9 @@ func (c *Client) GetUsersWithETag() ([]User, string, error) {
 
 	if resp.StatusCode == http.StatusNotModified {
 		return nil, "", nil
+	}
+	if c.machineID == 0 && resp.StatusCode == http.StatusGone && resp.Header.Get("X-Xboard-Node-State") == "revoked" {
+		return nil, "", ErrNodeRevoked
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("GET %s: HTTP %d %s", c.userPath(), resp.StatusCode, http.StatusText(resp.StatusCode))
@@ -394,7 +415,11 @@ var ErrMachineUnauthorized = errors.New("machine authorization rejected")
 
 // GetMachineNodes fetches the list of active nodes bound to this machine.
 func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
-	resp, err := c.doRequest("POST", "/api/v2/server/machine/nodes", nil, "")
+	return c.GetMachineNodesContext(context.Background())
+}
+
+func (c *Client) GetMachineNodesContext(ctx context.Context) (*MachineNodesResponse, error) {
+	resp, err := c.doRequestContext(ctx, "POST", "/api/v2/server/machine/nodes", nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("get machine nodes: %w", err)
 	}
@@ -427,6 +452,10 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 // ReportMachineStatus sends machine-level load metrics to the panel.
 // netIn/netOut are bytes/sec; negative values mean "unavailable" (first sample).
 func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64) error {
+	return c.ReportMachineStatusContext(context.Background(), cpu, mem, swap, disk, netIn, netOut)
+}
+
+func (c *Client) ReportMachineStatusContext(ctx context.Context, cpu float64, mem, swap, disk [2]uint64, netIn, netOut float64) error {
 	payload := map[string]interface{}{
 		"cpu":  cpu,
 		"mem":  map[string]interface{}{"total": mem[0], "used": mem[1]},
@@ -436,7 +465,7 @@ func (c *Client) ReportMachineStatus(cpu float64, mem, swap, disk [2]uint64, net
 	if netIn >= 0 && netOut >= 0 {
 		payload["net"] = map[string]interface{}{"in_speed": netIn, "out_speed": netOut}
 	}
-	return c.postJSON("/api/v2/server/machine/status", payload)
+	return c.postJSONContext(ctx, "/api/v2/server/machine/status", payload)
 }
 
 // injectAuth writes authentication fields into a payload map.
@@ -475,6 +504,10 @@ func (c *Client) authQuery() url.Values {
 
 // postJSON marshals a map payload (with auth fields injected) and POSTs it.
 func (c *Client) postJSON(path string, payload map[string]interface{}) error {
+	return c.postJSONContext(context.Background(), path, payload)
+}
+
+func (c *Client) postJSONContext(ctx context.Context, path string, payload map[string]interface{}) error {
 	c.injectAuth(payload)
 
 	body, err := json.Marshal(payload)
@@ -482,7 +515,7 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	resp, err := c.doRequest("POST", path, body, "")
+	resp, err := c.doRequestContext(ctx, "POST", path, body, "")
 	if err != nil {
 		return fmt.Errorf("post %s: %w", path, err)
 	}

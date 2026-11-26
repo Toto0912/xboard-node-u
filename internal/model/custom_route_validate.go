@@ -31,6 +31,16 @@ func ValidateCustomRouteRules(rules []CustomRouteRule, kernelType string, availa
 		if rule.Disabled {
 			continue
 		}
+		if kernelType == "singbox" {
+			for _, field := range [][]string{rule.Match.Domains, rule.Match.DomainSuffixes, rule.Match.IPCIDRs, rule.Match.SourceCIDRs} {
+				for _, v := range field {
+					v = strings.TrimSpace(v)
+					if strings.HasPrefix(v, "geoip:") || strings.HasPrefix(v, "geosite:") {
+						return fmt.Errorf("custom_route_rules[%d]: sing-box requires a rule set for geo matches", i)
+					}
+				}
+			}
+		}
 		if !hasRouteMatch(rule.Match) {
 			return fmt.Errorf("custom_route_rules[%d].match is required", i)
 		}

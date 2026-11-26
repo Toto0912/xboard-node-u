@@ -54,13 +54,15 @@ type Orchestrator struct {
 	// and each node service drains the latest state when ready.
 	eventsMu  sync.RWMutex
 	mailboxes map[int]*controlplane.NodeMailbox
-	statuses  map[int]chan<- controlplane.StatusChange
+	statuses  map[int]*controlplane.StatusMailbox
 	kernels   map[int]config.KernelConfig
 
 	// Shared WS client (nil when WS is disabled).
 	ws            atomic.Pointer[panel.WSClient]
 	nextWSAttempt time.Time
 	wsCancel      context.CancelFunc
+	wsEndpoint    string
+	wsDispatchMu  sync.Mutex // serializes retirement with callbacks from a particular socket
 
 	// Discovery runs only in Run. WS callbacks invalidate any older snapshot
 	// under mu before waking the loop, including while a node is starting.
@@ -86,7 +88,7 @@ func New(cfg *config.Config) *Orchestrator {
 		client:        panel.NewClient(panelCfg),
 		nodes:         make(map[int]*nodeHandle),
 		mailboxes:     make(map[int]*controlplane.NodeMailbox),
-		statuses:      make(map[int]chan<- controlplane.StatusChange),
+		statuses:      make(map[int]*controlplane.StatusMailbox),
 		kernels:       make(map[int]config.KernelConfig),
 		discoveryWake: make(chan struct{}, 1),
 	}
@@ -94,6 +96,7 @@ func New(cfg *config.Config) *Orchestrator {
 
 // Run is the main loop. It blocks until ctx is cancelled.
 func (o *Orchestrator) Run(ctx context.Context) error {
+	defer o.client.CloseIdleConnections()
 	o.applyIntervals(panel.MachineBaseConfig{})
 	discoveryTicker := time.NewTicker(o.pullInterval)
 	statusTicker := time.NewTicker(o.pushInterval)
@@ -112,9 +115,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			if o.wsCancel != nil {
-				o.wsCancel()
-			}
+			o.retireWS()
 			o.stopChildren()
 			return nil
 
@@ -124,7 +125,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			discover()
 
 		case <-statusTicker.C:
-			o.reportMachineStatus()
+			o.reportMachineStatus(ctx)
 		}
 	}
 }
@@ -207,7 +208,7 @@ func (o *Orchestrator) launchNode(ctx context.Context, mn panel.MachineNode, gen
 	// The registerFn is called by MachinePanelControlPlane.Initial() to expose
 	// the node mailbox + status channel to the Service.
 	nodeID := mn.ID
-	registerFn := func(st chan<- controlplane.StatusChange) *controlplane.NodeMailbox {
+	registerFn := func(st *controlplane.StatusMailbox) *controlplane.NodeMailbox {
 		o.registerNode(nodeID, st)
 		return mb
 	}
@@ -295,7 +296,7 @@ func (o *Orchestrator) checkKernelSwitch(ctx context.Context, mn panel.MachineNo
 
 	// Use fresh ETags so a hint or a rejected candidate never confirms itself.
 	client := o.client.ForNode(mn.ID)
-	raw, _, err := client.GetConfigWithETag()
+	raw, _, err := client.GetConfigContext(ctx)
 	if err != nil || raw == nil {
 		nlog.Core().Warn("machine: kernel check could not confirm config", "node_id", mn.ID, "error", err)
 		return
@@ -314,7 +315,7 @@ func (o *Orchestrator) checkKernelSwitch(ctx context.Context, mn panel.MachineNo
 	spec, err := model.NodeSpecFromPanelValidated(raw, cfg.Kernel)
 	if err == nil {
 		var users []panel.User
-		users, _, err = client.GetUsersWithETag()
+		users, _, err = client.GetUsersContext(ctx)
 		if err == nil && users == nil {
 			err = fmt.Errorf("expected a full user list for kernel handoff")
 		}
@@ -397,11 +398,15 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	o.stopPending = false
 	o.mu.Unlock()
 	if stop {
+		o.retireWS()
+		o.nextWSAttempt = time.Time{}
 		o.stopChildren()
 	}
-	nodesResp, err := o.client.GetMachineNodes()
+	nodesResp, err := o.client.GetMachineNodesContext(ctx)
 	if err != nil {
 		if errors.Is(err, panel.ErrMachineUnauthorized) {
+			o.retireWS()
+			o.nextWSAttempt = time.Time{}
 			o.stopChildren()
 		}
 		nlog.Core().Warn("machine node discovery failed", "error", err)
@@ -418,9 +423,13 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 		o.applyIntervals(nodesResp.BaseConfig)
 		o.initialized = true
 	}
-	if o.ws.Load() == nil && !time.Now().Before(o.nextWSAttempt) {
-		o.nextWSAttempt = time.Now().Add(o.pullInterval)
-		o.tryStartWS(ctx)
+	if !time.Now().Before(o.nextWSAttempt) {
+		interval := time.Duration(o.cfg.WS.DiscoveryInterval) * time.Second
+		if interval <= 0 || o.ws.Load() == nil {
+			interval = o.pullInterval
+		}
+		o.nextWSAttempt = time.Now().Add(interval)
+		o.tryStartWS(ctx, generation)
 	}
 	if len(nodesResp.Nodes) == 0 {
 		o.stopChildren()
@@ -451,9 +460,9 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 
 // ─── Machine status reporting ────────────────────────────────────────────
 
-func (o *Orchestrator) reportMachineStatus() {
+func (o *Orchestrator) reportMachineStatus(ctx context.Context) {
 	s := monitor.Collect()
-	if err := o.client.ReportMachineStatus(
+	if err := o.client.ReportMachineStatusContext(ctx,
 		s.CPU,
 		[2]uint64{s.MemTotal, s.MemUsed},
 		[2]uint64{s.SwapTotal, s.SwapUsed},
@@ -466,17 +475,29 @@ func (o *Orchestrator) reportMachineStatus() {
 
 // ─── WS mux ─────────────────────────────────────────────────────────────
 
-func (o *Orchestrator) tryStartWS(ctx context.Context) {
-	hs, err := o.client.Handshake()
+func (o *Orchestrator) tryStartWS(ctx context.Context, generation uint64) {
+	hs, err := o.client.HandshakeContext(ctx)
 	if err != nil {
 		nlog.Core().Warn("machine ws handshake failed, REST only", "error", err)
 		return
 	}
+	o.wsDispatchMu.Lock()
+	defer o.wsDispatchMu.Unlock()
+	o.mu.Lock()
+	valid := generation == o.generation && !o.stopPending && ctx.Err() == nil
+	o.mu.Unlock()
+	if !valid {
+		return
+	}
 	if !hs.WebSocket.Enabled || hs.WebSocket.WSURL == "" {
-		nlog.Core().Info("machine: ws disabled by panel, REST only")
+		o.retireWSLocked()
 		return
 	}
 
+	if o.ws.Load() != nil && o.wsEndpoint == hs.WebSocket.WSURL {
+		return
+	}
+	o.retireWSLocked()
 	wsCfg := panel.WSClientConfig{
 		StatusInterval:   time.Duration(o.cfg.WS.StatusInterval) * time.Second,
 		HandshakeTimeout: time.Duration(o.cfg.WS.HandshakeTimeout) * time.Second,
@@ -485,22 +506,56 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		MachineID:        o.cfg.Machine.MachineID,
 	}
 
-	ws := panel.NewWSClient(
+	var ws *panel.WSClient
+	ws = panel.NewWSClient(
 		hs.WebSocket.WSURL,
 		o.cfg.Machine.Token,
 		0, // no single node_id
 		wsCfg,
-		o.onWSEvent,
-		o.onWSStatus,
+		func(event panel.WSEvent) {
+			o.wsDispatchMu.Lock()
+			defer o.wsDispatchMu.Unlock()
+			if o.ws.Load() != ws {
+				return
+			}
+			if event.Type == panel.WSEventMachineRevoked {
+				o.retireWSLocked()
+			}
+			o.onWSEvent(event)
+		},
+		func(status panel.WSStatusChange) {
+			o.wsDispatchMu.Lock()
+			defer o.wsDispatchMu.Unlock()
+			if o.ws.Load() == ws {
+				o.onWSStatus(status)
+			}
+		},
 		nil, // per-node status is sent via machineNodePush
 	)
 
 	wsCtx, wsCancel := context.WithCancel(ctx)
 	o.wsCancel = wsCancel
+	o.wsEndpoint = hs.WebSocket.WSURL
 	o.ws.Store(ws)
 	go ws.Run(wsCtx)
 
 	nlog.Core().Info("machine: ws mux started")
+}
+
+func (o *Orchestrator) retireWS() {
+	o.wsDispatchMu.Lock()
+	defer o.wsDispatchMu.Unlock()
+	o.retireWSLocked()
+}
+
+func (o *Orchestrator) retireWSLocked() {
+	if o.ws.Swap(nil) == nil {
+		return
+	}
+	o.wsCancel()
+	o.wsCancel = nil
+	o.wsEndpoint = ""
+	o.broadcastStatus(false)
 }
 
 // onWSEvent routes a WS event to the correct node's channel.
@@ -569,32 +624,31 @@ func (o *Orchestrator) wakeDiscovery() {
 
 // onWSStatus broadcasts WS connectivity changes to all registered nodes.
 func (o *Orchestrator) onWSStatus(status panel.WSStatusChange) {
-	o.eventsMu.Lock()
-	lostConnection := o.wsConnected && !status.Connected
-	o.wsConnected = status.Connected
-	change := controlplane.StatusChange{Connected: status.Connected}
-	for _, ch := range o.statuses {
-		select {
-		case ch <- change:
-		default:
-		}
-	}
-	o.eventsMu.Unlock()
-	if lostConnection {
-		// Older panels may close the socket without an explicit revocation.
+	changed := o.broadcastStatus(status.Connected)
+	if changed {
+		// Membership may have changed while the socket was unavailable.
 		o.requestDiscovery(false)
 	}
 }
 
-func (o *Orchestrator) registerNode(nodeID int, st chan<- controlplane.StatusChange) {
+func (o *Orchestrator) broadcastStatus(connected bool) bool {
+	o.eventsMu.Lock()
+	defer o.eventsMu.Unlock()
+	changed := o.wsConnected != connected
+	o.wsConnected = connected
+	change := controlplane.StatusChange{Connected: connected}
+	for _, ch := range o.statuses {
+		ch.Publish(change)
+	}
+	return changed
+}
+
+func (o *Orchestrator) registerNode(nodeID int, st *controlplane.StatusMailbox) {
 	o.eventsMu.Lock()
 	o.statuses[nodeID] = st
 	if o.wsConnected {
 		// A socket can connect while the child is fetching its initial snapshot.
-		select {
-		case st <- controlplane.StatusChange{Connected: true}:
-		default:
-		}
+		st.Publish(controlplane.StatusChange{Connected: true})
 	}
 	o.eventsMu.Unlock()
 }

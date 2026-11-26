@@ -25,8 +25,9 @@ type Event struct {
 }
 
 type StatusChange struct {
-	Connected   bool
-	NeedsResync bool
+	Connected     bool
+	NeedsResync   bool
+	SawDisconnect bool
 }
 
 type APIMetrics struct {
@@ -70,9 +71,9 @@ type PushClient interface {
 }
 
 type Source interface {
-	Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error)
+	Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses *StatusMailbox) (Bootstrap, error)
 	Poll(ctx context.Context) (Snapshot, error)
-	Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error)
+	Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses *StatusMailbox) (PushClient, error)
 	Metrics() APIMetrics
 	SupportsPolling() bool
 	SupportsDiscovery() bool

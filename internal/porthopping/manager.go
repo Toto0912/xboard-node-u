@@ -40,8 +40,9 @@ func NewSpec(listen, portRange string, port int) (*Spec, error) {
 }
 
 type Manager struct {
-	owner string
-	dir   string
+	owner         string
+	dir           string
+	listenerInode string
 }
 
 func stateDirectory() string {

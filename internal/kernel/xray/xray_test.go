@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,13 +71,9 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	email2 := userEmail(2)
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
 	ld.mu.Lock()
-	ld.limitedIPs[email1] = map[string]int{"1.1.1.1": 1}
+	ld.activeIPs[email1] = map[string]int{"1.1.1.1": 1}
 	ld.mu.Unlock()
-	ref := &atomic.Int64{}
-	ref.Store(1)
-	ic := &ipCounter{}
-	ic.ips.Store("2.2.2.2", ref)
-	ld.unlimitedIPs.Store(email2, ic)
+	ld.checkDeviceLimit(email2, "2.2.2.2", true)
 	ld.connCount.Store(7)
 
 	x, mgr := newStatsBackedXray(t, users, ld)
@@ -170,7 +165,6 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	}
 }
 
-
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
@@ -181,7 +175,6 @@ func TestXrayCapabilities(t *testing.T) {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -197,7 +190,6 @@ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 		t.Fatal("expected patched bandwidth feature to receive user limiter")
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -221,7 +213,6 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	}
 }
 
-
 func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -236,7 +227,6 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 		t.Fatal("expected fallback limiter derived from user speed")
 	}
 }
-
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
@@ -462,6 +452,9 @@ func TestXrayVLESSUUIDChangeKeepsOtherUserConnectionAlive(t *testing.T) {
 		t.Fatalf("UpdateUsers counts = (+%d, -%d), want (+1, -1)", added, removed)
 	}
 
+	if err := x.Reload(nc, []model.UserSpec{{ID: 1, UUID: uuid1}, {ID: 2, UUID: uuid2New}}, kernel.TLSCert{}); err != nil {
+		t.Fatal(err)
+	}
 	x.mu.Lock()
 	instAfter := x.instance
 	x.mu.Unlock()

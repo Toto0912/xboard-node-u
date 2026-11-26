@@ -106,7 +106,8 @@ type WSClient struct {
 	onStatus func(WSStatusChange)
 	onPing   func() map[string]interface{}
 
-	cfg WSClientConfig
+	cfg      WSClientConfig
+	readIdle time.Duration // three panel heartbeat periods, with scheduling margin
 
 	connected atomic.Bool
 
@@ -137,6 +138,7 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 		token:    token,
 		nodeID:   nodeID,
 		cfg:      cfg,
+		readIdle: 3 * time.Minute,
 		onEvent:  onEvent,
 		onStatus: onStatus,
 		onPing:   onPing,
@@ -182,7 +184,7 @@ func (w *WSClient) Run(ctx context.Context) {
 		}
 
 		// Apply exponential backoff with jitter to prevent thundering herd.
-		jitter := time.Duration(rand.Int63n(int64(backoff / 5)))
+		jitter := time.Duration(rand.Int63n(max(1, int64(backoff/5))))
 		wait := backoff + jitter
 
 		timer := time.NewTimer(wait)
@@ -233,8 +235,8 @@ func (w *WSClient) connect(ctx context.Context) error {
 	if err := conn.ReadJSON(&firstMsg); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
-	_ = conn.SetReadDeadline(time.Time{})
-	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "data", string(firstMsg.Data))
+	_ = conn.SetReadDeadline(time.Now().Add(w.readIdle))
+	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "bytes", len(firstMsg.Data))
 
 	if firstMsg.Event == "error" {
 		var errData struct {
@@ -280,7 +282,11 @@ func (w *WSClient) connect(ctx context.Context) error {
 				}
 				return
 			}
-			nlog.Core().Debug("ws recv", "event", msg.Event, "data", string(msg.Data))
+			_ = conn.SetReadDeadline(time.Now().Add(w.readIdle))
+			if ctx.Err() != nil {
+				return
+			}
+			nlog.Core().Debug("ws recv", "event", msg.Event, "bytes", len(msg.Data))
 			w.handleMessage(msg)
 			if msg.Event == "ping" {
 				select {
@@ -291,6 +297,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 			}
 		}
 	}()
+	defer func() { _ = conn.Close(); <-done }()
 
 	for {
 		select {
@@ -298,7 +305,6 @@ func (w *WSClient) connect(ctx context.Context) error {
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			conn.WriteMessage(websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			<-done
 			return nil
 
 		case err := <-errCh:
@@ -322,7 +328,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 
 		case msg := <-writeCh:
 			// Perform the actual network write asynchronously in this loop.
-			nlog.Core().Debug("ws send", "event", msg.Event, "data", string(msg.Data))
+			nlog.Core().Debug("ws send", "event", msg.Event, "bytes", len(msg.Data))
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return fmt.Errorf("write: %w", err)

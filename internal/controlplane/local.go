@@ -18,7 +18,7 @@ func (l *LocalControlPlane) SupportsDiscovery() bool             { return false 
 func (l *LocalControlPlane) SupportsReporting() bool             { return false }
 func (l *LocalControlPlane) SupportsDeviceReports() bool         { return false }
 
-func (l *LocalControlPlane) Initial(ctx context.Context, _ func() map[string]interface{}, _ chan<- Event, _ chan<- StatusChange) (Bootstrap, error) {
+func (l *LocalControlPlane) Initial(ctx context.Context, _ func() map[string]interface{}, _ chan<- Event, _ *StatusMailbox) (Bootstrap, error) {
 	select {
 	case <-ctx.Done():
 		return Bootstrap{}, ctx.Err()
@@ -45,7 +45,7 @@ func (l *LocalControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	}
 }
 
-func (l *LocalControlPlane) Discover(ctx context.Context, _ func() map[string]interface{}, _ chan<- Event, _ chan<- StatusChange) (PushClient, error) {
+func (l *LocalControlPlane) Discover(ctx context.Context, _ func() map[string]interface{}, _ chan<- Event, _ *StatusMailbox) (PushClient, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()

@@ -155,6 +155,7 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
+func (f *fakeKernel) SetUserPolicy(*kernel.UserPolicy)                     {}
 func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
 func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string)           { _ = users }
 func (f *fakeKernel) ClearGlobalDevices()                                  {}
@@ -539,13 +540,13 @@ type zeroUserCertControlPlane struct {
 	bootstrap controlplane.Bootstrap
 }
 
-func (z *zeroUserCertControlPlane) Initial(context.Context, func() map[string]interface{}, chan<- controlplane.Event, chan<- controlplane.StatusChange) (controlplane.Bootstrap, error) {
+func (z *zeroUserCertControlPlane) Initial(context.Context, func() map[string]interface{}, chan<- controlplane.Event, *controlplane.StatusMailbox) (controlplane.Bootstrap, error) {
 	return z.bootstrap, nil
 }
 func (z *zeroUserCertControlPlane) Poll(context.Context) (controlplane.Snapshot, error) {
 	return controlplane.Snapshot{}, nil
 }
-func (z *zeroUserCertControlPlane) Discover(context.Context, func() map[string]interface{}, chan<- controlplane.Event, chan<- controlplane.StatusChange) (controlplane.PushClient, error) {
+func (z *zeroUserCertControlPlane) Discover(context.Context, func() map[string]interface{}, chan<- controlplane.Event, *controlplane.StatusMailbox) (controlplane.PushClient, error) {
 	return nil, nil
 }
 func (z *zeroUserCertControlPlane) Metrics() controlplane.APIMetrics {
@@ -592,7 +593,7 @@ type scriptedPollingSource struct {
 	resetUserCalls   int
 }
 
-func (p *scriptedPollingSource) Initial(context.Context, func() map[string]interface{}, chan<- controlplane.Event, chan<- controlplane.StatusChange) (controlplane.Bootstrap, error) {
+func (p *scriptedPollingSource) Initial(context.Context, func() map[string]interface{}, chan<- controlplane.Event, *controlplane.StatusMailbox) (controlplane.Bootstrap, error) {
 	return controlplane.Bootstrap{}, nil
 }
 func (p *scriptedPollingSource) Poll(context.Context) (controlplane.Snapshot, error) {
@@ -603,7 +604,7 @@ func (p *scriptedPollingSource) Poll(context.Context) (controlplane.Snapshot, er
 	p.mu.Unlock()
 	return fn(call)
 }
-func (p *scriptedPollingSource) Discover(context.Context, func() map[string]interface{}, chan<- controlplane.Event, chan<- controlplane.StatusChange) (controlplane.PushClient, error) {
+func (p *scriptedPollingSource) Discover(context.Context, func() map[string]interface{}, chan<- controlplane.Event, *controlplane.StatusMailbox) (controlplane.PushClient, error) {
 	return nil, nil
 }
 func (p *scriptedPollingSource) Metrics() controlplane.APIMetrics { return controlplane.APIMetrics{} }

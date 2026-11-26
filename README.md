@@ -7,7 +7,7 @@
 | sing-box | 1.14.4（含 Xboard 兼容补丁） |
 | Xray-core | 26.11.9（含 Xboard 兼容补丁） |
 
-当前版本为 **v2.4.1**，配套 Xboard-u v2.4.1。接入未提供批次流量上报的面板时，新节点仍可使用旧协议。
+当前版本为 **v2.4.2**，配套 Xboard-u v2.4.2。接入未提供批次流量上报的面板时，新节点仍可使用旧协议。
 
 两套内核已嵌入程序，无需另装内核。[变更记录](CHANGELOG.md)
 
@@ -16,6 +16,7 @@
 [v2.4 - lastest 二次开发功能说明](docs/v2.4%20-%20lastest%20二次开发功能说明.md)\
 [v1.0 - v2.3 二次开发功能说明](docs/v1.0%20-%20v2.3%20二次开发功能说明.md)
 
+- **v2.4.2 升级需额外操作**。使用 v2.4.1 旧安装器的 OpenRC 和 systemd 节点，请以 root 执行一次[首次迁移命令](docs/v2.4%20-%20lastest%20二次开发功能说明.md#存量节点首次迁移)，按提示输入 `v2.4.2` 即可完成本次升级。以后照常使用 `xbctl upgrade`。
 - v2.4.1 新增带回执的流量批次上报、机器子节点切换 XHTTP 时自动改用 Xray，并改进撤权同步、证书续签和 VLESS TCP 限速。
 - v2.3.0 新增 [HY2 端口跳跃与自动转发](docs/HY2-PORT-HOPPING.md)，两种内核、三种运行模式共用范围管理及规则清理。
 - v2.2.1 同步 Xray-core 官方最新正式版 **26.11.9**。
@@ -65,6 +66,12 @@ xbctl restart    # 重启服务
 xbctl log        # 查看日志
 xbctl upgrade    # 升级到最新正式版
 ```
+
+**从 v2.4.1 旧安装器首次升级**，请按[存量节点首次迁移](docs/v2.4%20-%20lastest%20二次开发功能说明.md#存量节点首次迁移)操作一次。此后照常执行 `xbctl upgrade`，在线升级会校验同一发行标签的文件，并刷新本机安装器（OpenRC 的 `install-alpine.sh`、systemd 已保存的 `install.sh`）。
+
+使用自编译程序时，通过 `--binary` 和 `--xbctl-binary` 指定本地文件。OpenRC 离线升级还需要 `--checksums`。
+
+systemd 节点保留绑定时，升级成功会启动服务。已移除最后一个绑定且服务已停止时，升级只更新文件，随后可重新绑定。升级失败会恢复原程序和升级前的运行状态。
 
 OpenRC 的升级备份保存在 `/etc/xboard-node/backups/alpine-*/`，直接运行 `install.sh upgrade` 的备份保存在 `/etc/xboard-node/backups/YYYYMMDD-HHMMSS/`。确认新版运行正常后，可按日期删除旧备份子目录。systemd 的 `xbctl upgrade` 成功后会自动清理 `/usr/local/bin/` 下的 `xboard-node.bak` 和 `xbctl.bak`。
 

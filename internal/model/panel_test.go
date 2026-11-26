@@ -105,3 +105,14 @@ func TestPanelTransportMigrationIsKernelSpecific(t *testing.T) {
 	}
 
 }
+
+func TestManagedSS2022ChaChaRequiresMultiUserAES(t *testing.T) {
+	for _, core := range []string{"singbox", "xray"} {
+		for cipher, wantErr := range map[string]bool{"2022-blake3-aes-128-gcm": false, "2022-blake3-aes-256-gcm": false, "2022-blake3-chacha20-poly1305": true, "chacha20-ietf-poly1305": false} {
+			_, e := NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 8388, Cipher: cipher}, config.KernelConfig{Type: core})
+			if (e != nil) != wantErr {
+				t.Fatalf("%s %s: %v", core, cipher, e)
+			}
+		}
+	}
+}

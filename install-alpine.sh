@@ -27,6 +27,7 @@ LOCAL_SUMS=
 YES=0
 PURGE=0
 RECONFIGURE=0
+EXPECT_EMPTY=0
 INTERACTIVE=0
 CONFIG_ARGS=0
 TMP=
@@ -57,6 +58,7 @@ Alpine / OpenRC 一键安装 xboard-node-u（以 root 执行）
   --token-file FILE                    从文件读取令牌（首行，不进入命令参数）
   --version latest|vX.Y.Z              默认最新正式版
   --reconfigure                       明确允许重新生成已有配置
+  --expect-empty                      仅升级时使用，绑定非空则中止
   --yes                               确认卸载
   --purge                             卸载时同时删除 /etc/xboard-node
   --binary FILE --xbctl-binary FILE --checksums FILE
@@ -74,6 +76,7 @@ parse() {
             --yes|-y) YES=1; shift ;;
             --purge) PURGE=1; shift ;;
             --reconfigure) RECONFIGURE=1; shift ;;
+            --expect-empty) EXPECT_EMPTY=1; shift ;;
             --help|-h|help) usage; exit 0 ;;
             --mode|--panel|--id|--kernel|--version|--token-file|--binary|--xbctl-binary|--checksums)
                 if [ "$#" -lt 2 ] || [ -z "$2" ]; then die "$1 缺少参数"; fi
@@ -166,6 +169,7 @@ stage_binary() {
     esac
     ASSET=xboard-node-linux-$ARCH
     CLI_ASSET=xbctl-linux-$ARCH
+    set -- "$ASSET" "$CLI_ASSET"
     if [ -n "$LOCAL_BINARY" ]; then
         if [ ! -f "$LOCAL_BINARY" ] || [ ! -f "$LOCAL_CLI" ] || [ ! -f "$LOCAL_SUMS" ]; then
             die '离线安装必须提供 --binary、--xbctl-binary 和 --checksums 文件'
@@ -173,6 +177,8 @@ stage_binary() {
         cp "$LOCAL_BINARY" "$TMP/$ASSET"
         cp "$LOCAL_CLI" "$TMP/$CLI_ASSET"
         cp "$LOCAL_SUMS" "$TMP/SHA256SUMS.txt"
+        [ -f "$0" ] || die '离线安装请先将脚本下载为文件，再使用 sh 执行'
+        cp "$0" "$TMP/install-alpine.sh"
         [ "$VERSION" != latest ] || VERSION=local
     else
         [ -z "$LOCAL_SUMS$LOCAL_CLI" ] || die '--checksums / --xbctl-binary 只能与 --binary 一起使用'
@@ -187,19 +193,27 @@ stage_binary() {
         BASE=https://github.com/$REPO/releases/download/$VERSION
         download "$BASE/$ASSET" "$TMP/$ASSET"
         download "$BASE/$CLI_ASSET" "$TMP/$CLI_ASSET"
+        download "$BASE/install-alpine.sh" "$TMP/install-alpine.sh"
         download "$BASE/SHA256SUMS.txt" "$TMP/SHA256SUMS.txt"
+        set -- "$@" install-alpine.sh
     fi
     tr -d '\r' < "$TMP/SHA256SUMS.txt" > "$TMP/checksums.normalized"
-    awk -v node="$ASSET" -v cli="$CLI_ASSET" '$2 == node || $2 == "*" node || $2 == cli || $2 == "*" cli {print}' "$TMP/checksums.normalized" > "$TMP/selected.sha256"
-    for name in "$ASSET" "$CLI_ASSET"; do
-        count=$(awk -v name="$name" '$2 == name || $2 == "*" name {n++} END {print n+0}' "$TMP/selected.sha256")
-        [ "$count" = 1 ] || die '校验清单缺失或重复'
+    for name in "$@"; do
+        awk -v name="$name" '$2 == name || $2 == "*" name {
+            n++; if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) bad=1
+            print $1 "  " name
+        } END {exit (n != 1 || bad)}' "$TMP/checksums.normalized" >> "$TMP/selected.sha256" || die "校验清单缺失、重复或格式错误：$name"
     done
     (cd "$TMP" && sha256sum -c selected.sha256) || die 'SHA256 校验失败，未安装程序'
     chmod 755 "$TMP/$ASSET" "$TMP/$CLI_ASSET"
     "$TMP/$ASSET" -v > "$TMP/version.txt" || die '程序无法在本机运行'
-    grep -q '^xboard-node ' "$TMP/version.txt" || die '程序版本输出不正确'
-    "$TMP/$CLI_ASSET" version >/dev/null || die 'xbctl 无法在本机运行'
+    node_version=$(awk 'NR==1 && $1=="xboard-node" { print $2 }' "$TMP/version.txt")
+    "$TMP/$CLI_ASSET" version > "$TMP/cli-version.txt" || die 'xbctl 无法在本机运行'
+    cli_version=$(awk 'NR==1 && $1=="xbctl" {print $2}' "$TMP/cli-version.txt")
+    [ -n "$node_version" ] || die '程序版本输出不正确'
+    if [ -z "$LOCAL_BINARY" ] && { [ "$VERSION" != "$node_version" ] || [ "$VERSION" != "$cli_version" ]; }; then
+        die '节点或 xbctl 的版本与发布标签不匹配'
+    fi
     backend=$("$TMP/$CLI_ASSET" service backend 2>/dev/null) || die '该版本 xbctl 不支持 OpenRC；请安装支持 Alpine 的新版 Release'
     [ "$backend" = openrc ] || die '此安装器要求正在运行的 OpenRC'
 }
@@ -437,6 +451,10 @@ finish() {
     exit "$result"
 }
 
+deployment_for() {
+    "$TMP/$CLI_ASSET" config health-port --config "$1" --credentials "$ROOT/credentials.env" --working-dir "$ROOT" --installed-config "$ROOT/config.yml"
+}
+
 install_or_upgrade() {
     WRITE_CONFIG=0
     if [ "$ACTION" = upgrade ]; then
@@ -459,8 +477,29 @@ install_or_upgrade() {
     TMP=$(mktemp -d /tmp/xboard-alpine.XXXXXX)
     stage_binary
     render_files
-    [ -f "$0" ] || die '请先将脚本下载为文件，再使用 sh 执行，以便保存升级入口'
+    target_config=$ROOT/config.yml
+    if [ "$WRITE_CONFIG" = 1 ]; then target_config=$TMP/config.yml; fi
+    if ! deployment=$(deployment_for "$target_config" 2>"$TMP/config-error"); then
+        status=0
+        if [ "$EXPECT_EMPTY" = 1 ]; then rc-service xboard-node status >/dev/null 2>&1 || status=$?; fi
+        # OpenRC returns 3 for a stopped service. Other failures do not prove it is stopped.
+        if [ "$status" != 3 ] || ! sha256sum "$target_config" "$ROOT/install-meta.json" > "$TMP/legacy-input.sha256" ||
+            ! "$TMP/$CLI_ASSET" config migrate-empty-v241 --config "$target_config" --meta "$ROOT/install-meta.json" --output "$TMP/config.yml"; then
+            cat "$TMP/config-error" >&2
+            die '节点配置无效，未更换文件'
+        fi
+        deployment=$(deployment_for "$TMP/config.yml") || die '迁移后的配置无效，未更换文件'
+        [ "$deployment" = empty ] || die '迁移后的绑定非空，未更换文件'
+        WRITE_CONFIG=1
+    fi
+    if [ "$EXPECT_EMPTY" = 1 ] && [ "$deployment" != empty ]; then die '当前仍有绑定，已中止升级'; fi
     snapshot
+    if [ -f "$TMP/legacy-input.sha256" ]; then
+        if [ "$WAS_RUNNING" = 1 ] || ! sha256sum -c "$TMP/legacy-input.sha256" >/dev/null; then
+            die '迁移期间节点状态或配置发生变化，未更换文件'
+        fi
+        info '已确认 v2.4.1 遗留的空绑定，升级时将保存显式空名单。'
+    fi
     MUTATING=1
     if [ "$WAS_RUNNING" = 1 ]; then rc-service xboard-node stop; fi
     # Check again just before removing stale files in case a legacy boot job raced us.
@@ -472,15 +511,19 @@ install_or_upgrade() {
     atomic_install "$TMP/launcher" "$LAUNCHER" 700
     atomic_install "$TMP/service" "$SERVICE" 755
     atomic_install "$TMP/logrotate" /etc/logrotate.d/xboard-node 644
-    # Copy a running installer safely before replacing its installed pathname.
-    cp "$0" "$TMP/installer"
-    atomic_install "$TMP/installer" "$MANAGER" 755
+    atomic_install "$TMP/install-alpine.sh" "$MANAGER" 755
     rm -f "$OLD_MANAGER"
     printf '%s\n' "$VERSION" > "$TMP/release"
     atomic_install "$TMP/release" "$VERSION_FILE" 600
     "$CLI" config metadata --config "$ROOT/config.yml" --meta "$TMP/install-meta.json" --version "$VERSION"
     atomic_install "$TMP/install-meta.json" "$ROOT/install-meta.json" 644
-    rc-update add xboard-node default
+    if [ "$deployment" = empty ]; then
+        MUTATING=0
+        info '当前没有节点绑定；程序已更新，服务保持停止，原开机配置已保留。'
+        info "回退备份：$BACKUP"
+        return
+    fi
+    if [ "$ACTION" != upgrade ]; then rc-update add xboard-node default; fi
     rc-service xboard-node zap >/dev/null 2>&1 || :
     rc-service xboard-node start
     # Require a stable real child, not just a live supervisor waiting to respawn.
@@ -497,7 +540,7 @@ install_or_upgrade() {
         tries=$((tries + 1))
     done
     MUTATING=0
-    info '安装完成：已配置 OpenRC 后台运行、异常重启和开机自启。'
+    info '安装完成，OpenRC 服务已通过启动检查。'
     cat "$TMP/version.txt"
     info '进程已启动；面板连接和节点下发情况请查看 xbctl service logs。'
     info '配置：/etc/xboard-node/config.yml；管理：xbctl status / service restart / upgrade'
@@ -529,6 +572,7 @@ uninstall() {
 
 main() {
     parse "$@"
+    if [ "$EXPECT_EMPTY" = 1 ] && [ "$ACTION" != upgrade ]; then die '--expect-empty 仅用于 upgrade'; fi
     case "$REPO" in */*) ;; *) die '仓库必须是 OWNER/REPOSITORY' ;; esac
     case "$REPO" in *[!a-zA-Z0-9_./-]*|*..*|/*|*/|*/*/*) die '仓库名称格式错误' ;; esac
     [ "$(id -u)" = 0 ] || die '请以 root 执行'
