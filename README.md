@@ -66,6 +66,8 @@ xbctl log        # 查看日志
 xbctl upgrade    # 升级到最新正式版
 ```
 
+OpenRC 的升级备份保存在 `/etc/xboard-node/backups/alpine-*/`，直接运行 `install.sh upgrade` 的备份保存在 `/etc/xboard-node/backups/YYYYMMDD-HHMMSS/`。确认新版运行正常后，可按日期删除旧备份子目录。systemd 的 `xbctl upgrade` 成功后会自动清理 `/usr/local/bin/` 下的 `xboard-node.bak` 和 `xbctl.bak`。
+
 ## 无面板独立运行（裸核运行）
 
 从本地配置读取节点和用户，无需连接面板。配置替换、客户端参数及与机器模式共存的写法见 [独立运行指南](docs/STANDALONE.md)。
