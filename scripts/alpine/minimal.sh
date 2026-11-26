@@ -28,7 +28,7 @@ log:
 health_port: 0
 CONFIG
 chmod 600 /etc/xboard-node/config.yml
-sh /src/install-alpine.sh upgrade --version v1.0.0 \
+sh /src/install-alpine.sh install --version v1.0.0 \
     --binary /release/xboard-node-linux-amd64 --xbctl-binary /release/xbctl-linux-amd64 --checksums /release/SHA256SUMS.txt
 command -v curl
 command -v logrotate
