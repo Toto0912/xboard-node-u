@@ -422,6 +422,18 @@ func TestManager_ACMERollbackAndRetryReloadsACMECertAndStopClears(t *testing.T) 
 		t.Fatalf("start file A: %v", err)
 	}
 
+	// The manager loads PEM before CertMagic asynchronously caches the managed certificate.
+	waitForManagedCert := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for len(m.activeACME.cache.AllMatchingCertificates("acmeb.example.com")) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("ACME certificate did not reach the managed cache")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
 	// Pre-seed ACME cert B into CertMagic FileStorage.
 	certB, keyB := generateLongLivedPair(t, "acmeb.example.com")
 	seedCertMagicStorage(t, dir, "acmeb.example.com", certB, keyB)
@@ -436,6 +448,7 @@ func TestManager_ACMERollbackAndRetryReloadsACMECertAndStopClears(t *testing.T) 
 	}
 
 	// Simulate kernel rollout failure -> Restore back to file A.
+	waitForManagedCert()
 	m.Restore(fileACfg, kernel.TLSCert{CertPEM: certA, KeyPEM: keyA})
 	if m.acmeStarted {
 		t.Fatal("expected Restore back to file mode to clear acmeStarted")
@@ -455,6 +468,7 @@ func TestManager_ACMERollbackAndRetryReloadsACMECertAndStopClears(t *testing.T) 
 	if !bytes.Equal(m.TLSCert().CertPEM, certB) {
 		t.Fatal("expected ACME B retry after Restore to load cert B, not stay on cert A")
 	}
+	waitForManagedCert()
 	m.Commit()
 }
 
