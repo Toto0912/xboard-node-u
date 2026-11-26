@@ -54,3 +54,34 @@ index d4535e7..341de65 100644
  			if err != nil {
  				stream.CancelRead(0)
  				stream.Close()
+diff --git a/hysteria2/service.go b/hysteria2/service.go
+--- a/hysteria2/service.go
++++ b/hysteria2/service.go
+@@ -68,6 +68,7 @@ type Service[U comparable] struct {
+ 	geckoMaxPacketSize    int
+ 	tlsConfig             aTLS.ServerConfig
+ 	quicConfig            *quic.Config
++	userAccess            sync.RWMutex
+ 	userMap               map[string]U
+ 	udpDisabled           bool
+ 	udpTimeout            time.Duration
+@@ -153,7 +154,9 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
+ 	for i, user := range userList {
+ 		userMap[passwordList[i]] = user
+ 	}
++	s.userAccess.Lock()
+ 	s.userMap = userMap
++	s.userAccess.Unlock()
+ }
+ 
+ func (s *Service[U]) Start(conn net.PacketConn) error {
+@@ -280,7 +283,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 			return
+ 		}
+ 		request := protocol.AuthRequestFromHeader(r.Header)
++		s.userAccess.RLock()
+ 		user, loaded := s.userMap[request.Auth]
++		s.userAccess.RUnlock()
+ 		if !loaded {
+ 			s.masqueradeHandler.ServeHTTP(w, r)
+ 			return

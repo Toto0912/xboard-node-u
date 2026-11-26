@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-type dependency struct{ name, commit, patch string }
+type dependency struct{ name, commit, patch, previouslyPatchedFile string }
 
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
@@ -57,24 +57,30 @@ func prepare(dep dependency) error {
 	if _, err := git(dir, "apply", "--reverse", "--check", patch); err == nil {
 		return nil
 	}
-	status, err := git(dir, "status", "--porcelain")
+	args := []string{"apply"}
+	statusArgs := []string{"status", "--porcelain"}
+	// A v2.4.1 checkout may already carry the TUIC part of the patch.
+	if file := dep.previouslyPatchedFile; file != "" {
+		if _, err := git(dir, "apply", "--reverse", "--check", "--include="+file, patch); err == nil {
+			args = append(args, "--exclude="+file)
+			statusArgs = append(statusArgs, "--", ".", ":(exclude)"+file)
+		}
+	}
+	status, err := git(dir, statusArgs...)
 	if err != nil {
 		return err
 	}
 	if status != "" {
 		return fmt.Errorf("%s contains changes; refusing to overwrite them", dep.name)
 	}
-	if _, err := git(dir, "apply", "--check", patch); err != nil {
-		return err
-	}
-	_, err = git(dir, "apply", patch)
+	_, err = git(dir, append(args, patch)...)
 	return err
 }
 
 func main() {
 	for _, dep := range []dependency{
-		{"sing-vmess", "a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017", "sing-vmess-user-snapshot.patch"},
-		{"sing-quic", "7e0a5869a5f49ed0a685143345dfda0448bbc708", "sing-quic-tuic-users.patch"},
+		{"sing-vmess", "a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017", "sing-vmess-user-snapshot.patch", ""},
+		{"sing-quic", "7e0a5869a5f49ed0a685143345dfda0448bbc708", "sing-quic-tuic-users.patch", "tuic/service.go"},
 	} {
 		if err := prepare(dep); err != nil {
 			fmt.Fprintln(os.Stderr, err)

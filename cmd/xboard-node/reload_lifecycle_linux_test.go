@@ -153,6 +153,7 @@ func TestReloadRotatesOwnedFilesAndReceivesTerminationDuringDrain(t *testing.T) 
 	if sessions.Load() != 2 {
 		t.Fatal("invalid reload restarted children")
 	}
+	var activeLog string
 	for i := 0; i < 4; i++ {
 		l = reserve()
 		next := l.Addr().(*net.TCPAddr).Port
@@ -186,6 +187,7 @@ func TestReloadRotatesOwnedFilesAndReceivesTerminationDuringDrain(t *testing.T) 
 			t.Fatal(resp.StatusCode)
 		}
 		port = next
+		activeLog = filepath.Join(dir, log)
 	}
 	before := sessions.Load()
 	hold.Store(true)
@@ -208,6 +210,12 @@ func TestReloadRotatesOwnedFilesAndReceivesTerminationDuringDrain(t *testing.T) 
 	if os.Getenv("XB_TEST_HOLD_REPORT_TIMEOUT") == "1" {
 		exitBudget = 40 * time.Second
 	} else {
+		// Signal delivery is asynchronous. Keep the report in flight until
+		// the child has received SIGTERM, as required by this scenario.
+		waitFor(func() bool {
+			d, _ := os.ReadFile(activeLog)
+			return strings.Contains(string(d), "shutting down")
+		}, "child did not receive SIGTERM during drain")
 		unblock()
 	}
 	select {
