@@ -543,3 +543,85 @@ func TestInheritFrom_AutoTLSInheritedWhenChildHasNoCertConfig(t *testing.T) {
 		t.Error("auto_tls should be inherited when child has no cert config")
 	}
 }
+
+func TestExpandNodesIsolatesCertDir(t *testing.T) {
+	// Case A: Defaults populated on parent config before ExpandNodes.
+	base := t.TempDir()
+	cfg := &Config{
+		Panel: PanelConfig{URL: "https://panel.example.com", Token: "tok"},
+		Nodes: []NodeEntry{
+			{NodeID: 101},
+			{NodeID: 102},
+			{NodeID: 103, Kernel: &KernelOverride{LogLevel: "debug"}}, // Kernel override without ConfigDir
+			{NodeID: 104, Cert: &CertConfig{CertMode: "file", CertDir: "/custom/node104/certs"}},
+		},
+	}
+	cfg.setDefaultsFrom(base)
+	nodes := cfg.ExpandNodes()
+	if len(nodes) != 4 {
+		t.Fatalf("ExpandNodes len = %d, want 4", len(nodes))
+	}
+
+	seen := map[string]int{}
+	for _, n := range nodes {
+		if n.Cert.CertDir == "" {
+			t.Fatalf("node %d got empty CertDir", n.Panel.NodeID)
+		}
+		if prev, dup := seen[n.Cert.CertDir]; dup {
+			t.Fatalf("node %d shares CertDir %q with node %d", n.Panel.NodeID, n.Cert.CertDir, prev)
+		}
+		seen[n.Cert.CertDir] = n.Panel.NodeID
+	}
+	if got := nodes[3].Cert.CertDir; got != "/custom/node104/certs" {
+		t.Fatalf("explicit node 104 CertDir = %q, want /custom/node104/certs", got)
+	}
+
+	// Case B: Parent explicitly sets custom CertDir -> derived per node unless overridden.
+	cfgB := &Config{
+		Panel:  PanelConfig{URL: "https://panel.example.com", Token: "tok"},
+		Kernel: KernelConfig{ConfigDir: filepath.Join(base, "k")},
+		Cert:   CertConfig{CertDir: filepath.Join(base, "shared-certs")},
+		Nodes: []NodeEntry{
+			{NodeID: 201},
+			{NodeID: 202},
+		},
+	}
+	nodesB := cfgB.ExpandNodes()
+	if nodesB[0].Cert.CertDir == nodesB[1].Cert.CertDir {
+		t.Fatalf("expected distinct CertDirs when parent CertDir is explicit, both got %q", nodesB[0].Cert.CertDir)
+	}
+
+	// Case C: Nodes set BOTH Kernel (omitting ConfigDir) AND Cert (omitting CertDir) -> distinct dirs.
+	cfgC := &Config{
+		Panel: PanelConfig{URL: "https://panel.example.com", Token: "tok"},
+		Nodes: []NodeEntry{
+			{NodeID: 301, Kernel: &KernelOverride{LogLevel: "warn"}, Cert: &CertConfig{CertMode: "file"}},
+			{NodeID: 302, Kernel: &KernelOverride{LogLevel: "error"}, Cert: &CertConfig{CertMode: "none"}},
+		},
+	}
+	cfgC.setDefaultsFrom(base)
+	nodesC := cfgC.ExpandNodes()
+	if nodesC[0].Kernel.ConfigDir == nodesC[1].Kernel.ConfigDir {
+		t.Fatalf("expected distinct Kernel.ConfigDir when both nodes omit config_dir, got %q", nodesC[0].Kernel.ConfigDir)
+	}
+	if nodesC[0].Cert.CertDir == nodesC[1].Cert.CertDir {
+		t.Fatalf("expected distinct Cert.CertDir when both nodes set kernel+cert without dirs, got %q", nodesC[0].Cert.CertDir)
+	}
+}
+
+func TestValidateRejectsDuplicateNodeCertDir(t *testing.T) {
+	base := t.TempDir()
+	sharedDir := filepath.Join(base, "shared")
+	cfg := &Config{
+		Panel:  PanelConfig{URL: "https://panel.example.com", Token: "tok"},
+		Kernel: KernelConfig{Type: "singbox"},
+		Nodes: []NodeEntry{
+			{NodeID: 1, Cert: &CertConfig{CertMode: "content", CertDir: sharedDir}},
+			{NodeID: 2, Cert: &CertConfig{CertMode: "none", CertDir: sharedDir}},
+		},
+	}
+	cfg.setDefaultsFrom(base)
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected validate() to reject duplicate node CertDir")
+	}
+}

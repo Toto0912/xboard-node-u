@@ -35,6 +35,8 @@ func (p *PanelControlPlane) SupportsPolling() bool       { return true }
 func (p *PanelControlPlane) SupportsDiscovery() bool     { return true }
 func (p *PanelControlPlane) SupportsReporting() bool     { return true }
 func (p *PanelControlPlane) SupportsDeviceReports() bool { return true }
+func (p *PanelControlPlane) ResetConfigETag()            { p.client.ResetConfigETag() }
+func (p *PanelControlPlane) ResetUserETag()              { p.client.ResetUserETag() }
 
 func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error) {
 	hs, err := p.client.Handshake()
@@ -49,14 +51,14 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	}
 
 	nlog.Core().Info("websocket disabled, using REST API")
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial config fetch: %w", err)
 	}
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("initial config is nil")
 	}
-	users, err := p.client.GetUsers()
+	users, userETag, err := p.client.GetUsersWithETag()
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial user fetch: %w", err)
 	}
@@ -64,16 +66,24 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial config normalize: %w", err)
 	}
+	if bootstrap.PushInterval == 0 && configSnapshot.BaseConfig.PushInterval > 0 {
+		bootstrap.PushInterval = configSnapshot.BaseConfig.PushInterval
+	}
+	if bootstrap.PullInterval == 0 && configSnapshot.BaseConfig.PullInterval > 0 {
+		bootstrap.PullInterval = configSnapshot.BaseConfig.PullInterval
+	}
+	bootstrap.CommitConfig = func() { p.client.CommitConfigETag(cfgETag) }
+	bootstrap.CommitUsers = func() { p.client.CommitUserETag(userETag) }
 	bootstrap.Users = model.UserSpecsFromPanel(users)
 	return bootstrap, nil
 }
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
 	}
-	users, err := p.client.GetUsers()
+	users, userETag, err := p.client.GetUsersWithETag()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll users: %w", err)
 	}
@@ -86,7 +96,12 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return Snapshot{
+		Config:       nodeSpec,
+		Users:        model.UserSpecsFromPanel(users),
+		CommitConfig: func() { p.client.CommitConfigETag(cfgETag) },
+		CommitUsers:  func() { p.client.CommitUserETag(userETag) },
+	}, nil
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
@@ -104,6 +119,8 @@ func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[s
 	}
 	return nil, nil
 }
+
+func (p *PanelControlPlane) BatchClient() *panel.Client { return p.client }
 
 func (p *PanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
@@ -169,7 +186,11 @@ func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, err
 		}
 	}
 	if event.Users != nil {
-		translated.Users = model.UserSpecsFromPanel(event.Users)
+		specs := model.UserSpecsFromPanel(event.Users)
+		if specs == nil {
+			specs = []model.UserSpec{}
+		}
+		translated.Users = specs
 	}
 	if event.DeltaUsers != nil {
 		translated.DeltaUsers = model.UserSpecsFromPanel(event.DeltaUsers)

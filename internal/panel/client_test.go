@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -17,6 +18,45 @@ func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
 		NodeID: 1,
 	})
 	return ts, client
+}
+
+func TestAPIMetricsCountEachHTTPRequestOnce(t *testing.T) {
+	report := func(c *Client) error {
+		return c.Report(nil, nil, nil, 0, [2]uint64{}, [2]uint64{}, [2]uint64{}, nil)
+	}
+	batch := func(c *Client) error {
+		return c.SendTrafficBatch(t.Context(), TrafficBatch{ID: "fixture"})
+	}
+	for _, tc := range []struct {
+		name    string
+		request func(*Client) error
+		status  int
+		body    string
+		wantErr bool
+		want    APIMetrics
+	}{
+		{"report", report, 200, "", false, APIMetrics{Success: 1}},
+		{"report rejected", report, 503, "", true, APIMetrics{Failure: 1}},
+		{"handshake", func(c *Client) error { _, err := c.Handshake(); return err }, 200, "{}", false, APIMetrics{Success: 1}},
+		{"discovery", func(c *Client) error { _, err := c.GetMachineNodes(); return err }, 200, `{"nodes":[]}`, false, APIMetrics{Success: 1}},
+		{"unchanged users", func(c *Client) error { _, err := c.GetUsers(); return err }, 304, "", false, APIMetrics{Success: 1}},
+		{"traffic batch", batch, 200, `{"batch_id":"fixture"}`, false, APIMetrics{Success: 1}},
+		{"invalid receipt on successful HTTP response", batch, 200, "{}", true, APIMetrics{Success: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					io.WriteString(w, tc.body)
+				}
+			})
+			defer server.Close()
+			err := tc.request(client)
+			if (err != nil) != tc.wantErr || client.SnapshotMetrics() != tc.want {
+				t.Fatalf("request error=%v, metrics=%+v, want error=%t metrics=%+v", err, client.SnapshotMetrics(), tc.wantErr, tc.want)
+			}
+		})
+	}
 }
 
 func TestGetConfig_Success(t *testing.T) {
@@ -149,6 +189,41 @@ func TestGetUsers_NotModified(t *testing.T) {
 	}
 	if users != nil {
 		t.Error("expected nil for 304")
+	}
+}
+
+func TestResetUserETag_ClearsIfNoneMatch(t *testing.T) {
+	var seenHeaders []string
+	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = append(seenHeaders, r.Header.Get("If-None-Match"))
+		w.Header().Set("ETag", `"u-etag-1"`)
+		json.NewEncoder(w).Encode(UsersResponse{Users: []User{{ID: 1, UUID: "u1"}}})
+	})
+	defer ts.Close()
+
+	_, etag, err := client.GetUsersWithETag()
+	if err != nil {
+		t.Fatalf("GetUsersWithETag: %v", err)
+	}
+	client.CommitUserETag(etag)
+	_, _, err = client.GetUsersWithETag()
+	if err != nil {
+		t.Fatalf("second GetUsersWithETag: %v", err)
+	}
+	client.ResetUserETag()
+	_, _, err = client.GetUsersWithETag()
+	if err != nil {
+		t.Fatalf("third GetUsersWithETag: %v", err)
+	}
+
+	want := []string{"", `"u-etag-1"`, ""}
+	if len(seenHeaders) != len(want) {
+		t.Fatalf("seenHeaders len = %d, want %d (%v)", len(seenHeaders), len(want), seenHeaders)
+	}
+	for i := range want {
+		if seenHeaders[i] != want[i] {
+			t.Fatalf("header[%d] = %q, want %q (all=%v)", i, seenHeaders[i], want[i], seenHeaders)
+		}
 	}
 }
 

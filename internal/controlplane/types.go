@@ -35,6 +35,8 @@ type APIMetrics struct {
 }
 
 type Bootstrap struct {
+	CommitConfig func()
+	CommitUsers  func()
 	PushInterval int
 	PullInterval int
 	Push         PushClient
@@ -44,8 +46,10 @@ type Bootstrap struct {
 }
 
 type Snapshot struct {
-	Config *model.NodeSpec
-	Users  []model.UserSpec
+	Config       *model.NodeSpec
+	Users        []model.UserSpec
+	CommitConfig func()
+	CommitUsers  func()
 }
 
 type ReportPayload struct {

@@ -6,7 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	inboundWorker "github.com/xtls/xray-core/app/proxyman/inbound"
+	"maps"
 	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +62,7 @@ type Xray struct {
 	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
 	// lastKernelHash, and cumTraffic. Never held during slow I/O.
 	mu              sync.Mutex
+	sessions        *kernel.SessionDrain
 	instance        *xrayCore.Instance
 	limitDispatcher *LimitDispatcher
 	users           []model.UserSpec
@@ -115,19 +121,16 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
 
-	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
+	pbConfig, err := parseConfig(x.cfg, nodeConfig, users, tls, false)
 	if err != nil {
 		return err
 	}
 
-	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("parse xray config: %w", err)
-	}
-
 	// ── Phase 2: Create instance (global lock for LD capture) ───────────
 	xrayCreationMu.Lock()
-	inst, err := xrayCore.New(pbConfig)
+	sessions := new(kernel.SessionDrain)
+	ctx := context.WithValue(context.Background(), inboundWorker.SessionTrackerKey{}, sessions.Begin)
+	inst, err := xrayCore.NewWithContext(ctx, pbConfig)
 	ld := globalLimitDispatcher.Load()
 	xrayCreationMu.Unlock()
 	if err != nil {
@@ -136,27 +139,18 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	x.mu.Lock()
-	old, oldLD := x.instance, x.limitDispatcher
+	old := x.instance
 	previousNode, previousUsers, previousTLS := x.nodeConfig, x.users, x.tls
-	if old != nil {
-		_, _ = x.aggregateStats()
-		x.instance = nil
-		x.limitDispatcher = nil
-		x.running.Store(false)
-	}
 	x.mu.Unlock()
-	if old != nil {
-		// Release listeners before rebinding the same port. SO_REUSEPORT is not
-		// available for every Xray transport and cannot guarantee an atomic swap.
-		_ = old.Close()
-		if oldLD != nil {
-			oldLD.ResetConns()
-		}
-	}
+	x.stopLocked()
 	if err := startWithTimeout(inst, startTimeout); err != nil {
 		inst.Close()
 		if old != nil {
-			if restoreErr := x.startLocked(previousNode, previousUsers, previousTLS); restoreErr != nil {
+			allowed := model.IntersectUsers(previousUsers, users)
+			if len(allowed) == 0 {
+				return err
+			}
+			if restoreErr := x.startLocked(previousNode, allowed, previousTLS); restoreErr != nil {
 				return fmt.Errorf("restart failed: %v; restore previous config: %w", err, restoreErr)
 			}
 		}
@@ -166,6 +160,7 @@ func (x *Xray) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, t
 	// ── Phase 4: Swap old → new (brief kernel lock) ─────────────────────
 	x.mu.Lock()
 	x.instance = inst
+	x.sessions = sessions
 	x.limitDispatcher = ld
 	x.users = users
 	x.nodeConfig = nodeConfig
@@ -214,11 +209,56 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 func (x *Xray) Stop() {
 	x.lifecycleMu.Lock()
 	defer x.lifecycleMu.Unlock()
+	x.stopLocked()
+}
+
+func (x *Xray) stopLocked() {
 	x.running.Store(false)
 
 	x.mu.Lock()
-	inst := x.instance
+	inst, sessions := x.instance, x.sessions
 	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if inst == nil {
+		return
+	}
+	if !sessions.CloseAndWait() {
+		nlog.Core().Warn("xray: session drain timed out; reporting available counters")
+	}
+	x.mu.Lock()
+	// Read all user counters before the instance releases them, including users
+	// removed from the active roster since the previous periodic sample.
+	if mgr, ok := inst.GetFeature(stats.ManagerType()).(interface {
+		VisitCounters(func(string, stats.Counter) bool)
+	}); ok {
+		mgr.VisitCounters(func(name string, counter stats.Counter) bool {
+			email, direction, ok := strings.Cut(name, ">>>traffic>>>")
+			const prefix = "user>>>user@"
+			if !ok || !strings.HasPrefix(email, prefix) {
+				return true
+			}
+			id, err := strconv.Atoi(email[len(prefix):])
+			if err != nil || id <= 0 {
+				return true
+			}
+			cum := x.cumTraffic[id]
+			switch direction {
+			case "uplink":
+				cum[0] += counter.Set(0)
+			case "downlink":
+				cum[1] += counter.Set(0)
+			default:
+				return true
+			}
+			if cum != [2]int64{} {
+				x.cumTraffic[id] = cum
+			}
+			return true
+		})
+	} else {
+		_, _ = x.aggregateStats()
+	}
+	x.sessions = nil
 	x.instance = nil
 	x.limitDispatcher = nil
 	x.mu.Unlock()
@@ -246,11 +286,12 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 // available. The dispatcher intentionally no longer wraps transport links,
 // so traffic accounting must come from xray-core itself.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	if !x.running.Load() {
-		return nil, nil, 0, nil
-	}
-
 	x.mu.Lock()
+	if !x.running.Load() || x.instance == nil {
+		traffic = maps.Clone(x.cumTraffic)
+		x.mu.Unlock()
+		return traffic, nil, 0, nil
+	}
 	ld := x.limitDispatcher
 	traffic, err = x.aggregateStats()
 	x.mu.Unlock()
@@ -356,17 +397,23 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 
 	ctx := context.Background()
 	added := 0
+	var errs []string
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
 			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
+			errs = append(errs, fmt.Sprintf("user %d: %v", u.ID, err))
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
 			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
+			errs = append(errs, fmt.Sprintf("user %d: %v", u.ID, err))
 			continue
 		}
 		added++
+	}
+	if len(errs) > 0 {
+		return added, fmt.Errorf("xray add users failed: %s", strings.Join(errs, "; "))
 	}
 
 	// Update bookkeeping with full merged list (new users + updated properties).
@@ -426,13 +473,22 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	ctx := context.Background()
 	actualRemoved := 0
+	var errs []string
 	for _, u := range users {
 		email := userEmail(u.ID)
 		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
+			if isXrayUserNotFoundErr(err) {
+				nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
+				continue
+			}
+			nlog.Core().Warn("xray: RemoveUser failed", "user", u.ID, "error", err)
+			errs = append(errs, fmt.Sprintf("user %d: %v", u.ID, err))
 			continue
 		}
 		actualRemoved++
+	}
+	if len(errs) > 0 {
+		return actualRemoved, fmt.Errorf("xray remove users failed: %s", strings.Join(errs, "; "))
 	}
 
 	x.mu.Lock()
@@ -484,23 +540,34 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	x.mu.Unlock()
 
 	ctx := context.Background()
+	var errs []string
 
 	// Remove first, then add (order matters for UUID changes on same ID)
 	for _, u := range toRemove {
 		email := userEmail(u.ID)
 		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+			if isXrayUserNotFoundErr(err) {
+				nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+				continue
+			}
+			nlog.Core().Warn("xray: RemoveUser failed in UpdateUsers", "user", u.ID, "error", err)
+			errs = append(errs, fmt.Sprintf("remove user %d: %v", u.ID, err))
 		}
 	}
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
 			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
+			errs = append(errs, fmt.Sprintf("build user %d: %v", u.ID, err))
 			continue
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
 			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+			errs = append(errs, fmt.Sprintf("add user %d: %v", u.ID, err))
 		}
+	}
+	if len(errs) > 0 {
+		return 0, 0, fmt.Errorf("xray update users failed: %s", strings.Join(errs, "; "))
 	}
 
 	x.mu.Lock()
@@ -511,6 +578,14 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
+}
+
+func isXrayUserNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist")
 }
 
 var _ kernel.Kernel = (*Xray)(nil)
@@ -668,7 +743,53 @@ func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 	if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
 		nlog.Core().Warn("geo database unavailable", "error", err)
 	}
-	os.Setenv("XRAY_LOCATION_ASSET", dir)
+}
+
+// PreflightConfig validates available resources without downloading assets in
+// the machine loop. Start obtains missing GEO databases before building every rule.
+func PreflightConfig(cfg config.KernelConfig, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	candidate := *spec
+	if kernel.NeedsGeoIP(spec.Routes) || kernel.NeedsGeoSite(spec.Routes) {
+		_, ipErr := os.Stat(filepath.Join(cfg.GeoDataDir, "geoip.dat"))
+		_, siteErr := os.Stat(filepath.Join(cfg.GeoDataDir, "geosite.dat"))
+		candidate.Routes = slices.DeleteFunc(slices.Clone(spec.Routes), func(rule model.RouteRule) bool {
+			one := []model.RouteRule{rule}
+			return (os.IsNotExist(ipErr) && kernel.NeedsGeoIP(one)) ||
+				(os.IsNotExist(siteErr) && kernel.NeedsGeoSite(one))
+		})
+	}
+	_, err := parseConfig(cfg, &candidate, users, tls, true)
+	return err
+}
+
+// Xray resolves GEO paths through a process-wide environment variable during parsing.
+var parseMu sync.Mutex
+
+func parseConfig(cfg config.KernelConfig, spec *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert, preview bool) (*xrayCore.Config, error) {
+	data, err := marshalConfig(cfg, spec, users, tls)
+	if err != nil {
+		return nil, err
+	}
+	parseMu.Lock()
+	defer parseMu.Unlock()
+	if kernel.NeedsGeoIP(spec.Routes) || kernel.NeedsGeoSite(spec.Routes) {
+		const assetEnv = "XRAY_LOCATION_ASSET"
+		if preview {
+			if previous, ok := os.LookupEnv(assetEnv); ok {
+				defer os.Setenv(assetEnv, previous)
+			} else {
+				defer os.Unsetenv(assetEnv)
+			}
+		}
+		if err := os.Setenv(assetEnv, cfg.GeoDataDir); err != nil {
+			return nil, err
+		}
+	}
+	parsed, err := serial.LoadJSONConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse xray config: %w", err)
+	}
+	return parsed, nil
 }
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
@@ -712,7 +833,6 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 		return nil, nil
 	}
 
-	traffic := make(map[int][2]int64)
 	for _, u := range x.users {
 		email := userEmail(u.ID)
 
@@ -731,11 +851,8 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 			x.cumTraffic[u.ID] = cum
 		}
 
-		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
-			traffic[u.ID] = cum
-		}
 	}
-	return traffic, nil
+	return maps.Clone(x.cumTraffic), nil
 }
 
 // updateBandwidthLimits configures the patched xray-core bandwidth feature

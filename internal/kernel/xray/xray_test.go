@@ -1,14 +1,22 @@
 package xray
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	appstats "github.com/xtls/xray-core/app/stats"
+	xrayUUID "github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
 	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	xraystats "github.com/xtls/xray-core/features/stats"
@@ -274,5 +282,240 @@ func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
 	}
 	if x.IsRunning() {
 		t.Fatal("expected xray to stop when last user is removed")
+	}
+}
+
+func TestIsXrayUserNotFoundErr(t *testing.T) {
+	if !isXrayUserNotFoundErr(fmt.Errorf("User u1@xboard.local not found")) {
+		t.Fatal("expected 'not found' error to be treated as non-fatal")
+	}
+	if isXrayUserNotFoundErr(fmt.Errorf("context deadline exceeded")) {
+		t.Fatal("expected timeout error NOT to be treated as user not found")
+	}
+}
+
+func startLocalTCPEcho(t *testing.T) (int, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo server: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	return port, func() {
+		_ = ln.Close()
+		wg.Wait()
+	}
+}
+
+func reserveFreeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve tcp port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+func buildVLESSv0Handshake(t *testing.T, idStr string, targetPort int, payload []byte) []byte {
+	t.Helper()
+	u, err := xrayUUID.ParseString(idStr)
+	if err != nil {
+		t.Fatalf("parse uuid %q: %v", idStr, err)
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(0x00) // VLESS version 0
+	buf.Write(u.Bytes())
+	buf.WriteByte(0x00) // addons len
+	buf.WriteByte(0x01) // command TCP
+	var portBE [2]byte
+	binary.BigEndian.PutUint16(portBE[:], uint16(targetPort))
+	buf.Write(portBE[:])
+	buf.WriteByte(0x01) // IPv4
+	buf.Write(net.ParseIP("127.0.0.1").To4())
+	buf.Write(payload)
+	return buf.Bytes()
+}
+
+func readVLESSResponseHeader(t *testing.T, conn net.Conn) error {
+	t.Helper()
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return err
+	}
+	if hdr[0] != 0x00 {
+		return fmt.Errorf("unexpected VLESS response version: %d", hdr[0])
+	}
+	if hdr[1] > 0 {
+		addons := make([]byte, int(hdr[1]))
+		if _, err := io.ReadFull(conn, addons); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestXrayVLESSUUIDChangeKeepsOtherUserConnectionAlive(t *testing.T) {
+	echoPort, stopEcho := startLocalTCPEcho(t)
+	defer stopEcho()
+
+	listenPort := reserveFreeTCPPort(t)
+	uuid1 := "11111111-1111-1111-1111-111111111111"
+	uuid2Old := "22222222-2222-2222-2222-222222222222"
+	uuid2New := "33333333-3333-3333-3333-333333333333"
+
+	nc := &model.NodeSpec{
+		Protocol:   "vless",
+		ListenIP:   "127.0.0.1",
+		ServerPort: listenPort,
+		Network:    "tcp",
+		TLS:        0,
+		CustomRoutes: []map[string]any{
+			{
+				"type":        "field",
+				"ip":          []string{"127.0.0.1/32"},
+				"outboundTag": "direct",
+			},
+		},
+	}
+
+	x := New(config.KernelConfig{
+		Type:     "xray",
+		LogLevel: "error",
+		CustomOutbound: []map[string]any{
+			{
+				"tag":      "direct",
+				"protocol": "freedom",
+				"settings": map[string]any{
+					"finalRules": []any{
+						map[string]any{
+							"action": "allow",
+							"ip":     []string{"127.0.0.1/32"},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err := x.Start(nc, []model.UserSpec{
+		{ID: 1, UUID: uuid1},
+		{ID: 2, UUID: uuid2Old},
+	}, kernel.TLSCert{}); err != nil {
+		t.Fatalf("x.Start() error = %v", err)
+	}
+	defer x.Stop()
+
+	x.mu.Lock()
+	instBefore := x.instance
+	x.mu.Unlock()
+
+	// Open User 1's connection BEFORE User 2's UUID changes, and keep it open.
+	conn1, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial user1 connection: %v", err)
+	}
+	defer conn1.Close()
+	_ = conn1.SetDeadline(time.Now().Add(5 * time.Second))
+
+	msgBefore := []byte("before-change\n")
+	if _, err := conn1.Write(buildVLESSv0Handshake(t, uuid1, echoPort, msgBefore)); err != nil {
+		t.Fatalf("write user1 handshake: %v", err)
+	}
+	if err := readVLESSResponseHeader(t, conn1); err != nil {
+		t.Fatalf("read user1 VLESS response header: %v", err)
+	}
+	gotBefore := make([]byte, len(msgBefore))
+	if _, err := io.ReadFull(conn1, gotBefore); err != nil {
+		t.Fatalf("read user1 echo before UUID change: %v", err)
+	}
+	if !bytes.Equal(gotBefore, msgBefore) {
+		t.Fatalf("user1 before echo = %q, want %q", gotBefore, msgBefore)
+	}
+
+	// Change User 2's UUID via hot UpdateUsers.
+	added, removed, err := x.UpdateUsers([]model.UserSpec{
+		{ID: 1, UUID: uuid1},
+		{ID: 2, UUID: uuid2New},
+	})
+	if err != nil {
+		t.Fatalf("UpdateUsers(UUID change) error = %v", err)
+	}
+	if added != 1 || removed != 1 {
+		t.Fatalf("UpdateUsers counts = (+%d, -%d), want (+1, -1)", added, removed)
+	}
+
+	x.mu.Lock()
+	instAfter := x.instance
+	x.mu.Unlock()
+	if instAfter != instBefore {
+		t.Fatal("expected xray instance NOT to restart on same-ID UUID change")
+	}
+
+	// Verify User 1's ALREADY-OPEN connection stays alive and still echoes.
+	msgAfter := []byte("after-change\n")
+	_ = conn1.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn1.Write(msgAfter); err != nil {
+		t.Fatalf("write to user1 existing connection after UUID change: %v", err)
+	}
+	gotAfter := make([]byte, len(msgAfter))
+	if _, err := io.ReadFull(conn1, gotAfter); err != nil {
+		t.Fatalf("user1 existing connection broken after user2 UUID change: %v", err)
+	}
+	if !bytes.Equal(gotAfter, msgAfter) {
+		t.Fatalf("user1 after echo = %q, want %q", gotAfter, msgAfter)
+	}
+
+	// Verify User 2's NEW UUID succeeds.
+	connNew, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial user2 new UUID connection: %v", err)
+	}
+	defer connNew.Close()
+	_ = connNew.SetDeadline(time.Now().Add(5 * time.Second))
+	msgNew := []byte("new-uuid-ok\n")
+	if _, err := connNew.Write(buildVLESSv0Handshake(t, uuid2New, echoPort, msgNew)); err != nil {
+		t.Fatalf("write user2 new handshake: %v", err)
+	}
+	if err := readVLESSResponseHeader(t, connNew); err != nil {
+		t.Fatalf("read user2 new response header: %v", err)
+	}
+	gotNew := make([]byte, len(msgNew))
+	if _, err := io.ReadFull(connNew, gotNew); err != nil {
+		t.Fatalf("read user2 new echo: %v", err)
+	}
+	if !bytes.Equal(gotNew, msgNew) {
+		t.Fatalf("user2 new echo = %q, want %q", gotNew, msgNew)
+	}
+
+	// Verify User 2's OLD UUID is rejected.
+	connOld, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial user2 old UUID connection: %v", err)
+	}
+	defer connOld.Close()
+	_ = connOld.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = connOld.Write(buildVLESSv0Handshake(t, uuid2Old, echoPort, []byte("old-uuid-rejected\n")))
+	var probe [32]byte
+	n, readErr := connOld.Read(probe[:])
+	if readErr == nil && n > 0 {
+		t.Fatalf("expected old UUID to be rejected, but got %d bytes: %q", n, probe[:n])
 	}
 }

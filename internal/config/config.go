@@ -19,14 +19,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -151,7 +151,9 @@ type CertConfig struct {
 	CertFile string `yaml:"cert_file"`
 	KeyFile  string `yaml:"key_file"`
 	CertDir  string `yaml:"cert_dir"`
-	HTTPPort int    `yaml:"http_port"` // port for HTTP-01 challenge (default: 80)
+	// Previous static-node layout. Read only, never supplied by a panel or YAML.
+	LegacyCertDir string `yaml:"-" json:"-"`
+	HTTPPort      int    `yaml:"http_port"` // port for HTTP-01 challenge (default: 80)
 
 	// CertMode selects the TLS certificate strategy:
 	//   ""       - auto-detect: if CertFile is set → file; if AutoTLS → http; else none
@@ -718,6 +720,19 @@ func (c *Config) validate() error {
 				return fmt.Errorf("nodes[%d].node_id must be positive", i)
 			}
 		}
+		if len(c.Nodes) > 1 {
+			seenCertDirs := make(map[string]int, len(c.Nodes))
+			for _, expanded := range c.ExpandNodes() {
+				if expanded.Cert.CertDir == "" {
+					continue
+				}
+				cleaned := filepath.Clean(expanded.Cert.CertDir)
+				if prevID, exists := seenCertDirs[cleaned]; exists {
+					return fmt.Errorf("nodes %d and %d share cert_dir %q; configure distinct cert_dir or node_id", prevID, expanded.Panel.NodeID, expanded.Cert.CertDir)
+				}
+				seenCertDirs[cleaned] = expanded.Panel.NodeID
+			}
+		}
 	}
 	switch c.Kernel.Type {
 	case "singbox", "xray":
@@ -761,6 +776,11 @@ func (c *Config) ExpandNodes() []*Config {
 					// the new ConfigDir unless the user set it explicitly.
 					nodeCfg.Kernel.GeoDataDir = entry.Kernel.ConfigDir
 				}
+			} else {
+				nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, entry.NodeID)
+				if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
+					nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
+				}
 			}
 			if entry.Kernel.GeoDataDir != "" {
 				nodeCfg.Kernel.GeoDataDir = entry.Kernel.GeoDataDir
@@ -781,13 +801,32 @@ func (c *Config) ExpandNodes() []*Config {
 		}
 
 		// Per-node cert overrides
+		defaultParentCertDir := filepath.Join(c.Kernel.ConfigDir, "certs")
 		if entry.Cert != nil {
 			nodeCfg.Cert = *entry.Cert
-		}
-		if nodeCfg.Cert.CertDir == "" {
+			if nodeCfg.Cert.CertDir == "" {
+				nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+			}
+		} else if nodeCfg.Cert.CertDir == "" || nodeCfg.Cert.CertDir == defaultParentCertDir {
 			nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+		} else {
+			nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Cert.CertDir, fmt.Sprintf("node-%d", entry.NodeID))
 		}
 
+		oldDir := c.Cert.CertDir
+		if entry.Cert != nil {
+			oldDir = entry.Cert.CertDir
+		}
+		if oldDir == "" {
+			oldKernelDir := nodeCfg.Kernel.ConfigDir
+			if entry.Kernel != nil && entry.Kernel.ConfigDir == "" {
+				oldKernelDir = c.Kernel.ConfigDir
+			}
+			oldDir = filepath.Join(oldKernelDir, "certs")
+		}
+		if oldDir != "" && filepath.Clean(oldDir) != filepath.Clean(nodeCfg.Cert.CertDir) {
+			nodeCfg.Cert.LegacyCertDir = oldDir
+		}
 		result = append(result, &nodeCfg)
 	}
 	return result
@@ -861,6 +900,8 @@ func InitLogger(cfg LogConfig) {
 func ValidateStartupLayout(instances []*Config) error {
 	healthPorts := make(map[int]string)
 	configDirs := make(map[string]string)
+	machineRoots := make(map[string]string)
+	certDirs := make(map[string]string)
 	nodeBindings := make(map[string]string)
 	for _, instance := range instances {
 		if instance == nil {
@@ -874,10 +915,17 @@ func ValidateStartupLayout(instances []*Config) error {
 			healthPorts[instance.HealthPort] = owner
 		}
 		if dir := strings.TrimSpace(instance.Kernel.ConfigDir); dir != "" {
+			dir, err := filepath.Abs(dir)
+			if err != nil {
+				return fmt.Errorf("resolve kernel config_dir: %w", err)
+			}
 			if other, ok := configDirs[dir]; ok && other != owner {
 				return fmt.Errorf("kernel config_dir %q is shared by %s and %s", dir, other, owner)
 			}
 			configDirs[dir] = owner
+			if instance.IsMachineMode() {
+				machineRoots[dir] = owner
+			}
 		}
 		// Machine mode discovers nodes dynamically — skip static binding check,
 		// but still validate custom_config if set at the instance level.
@@ -890,6 +938,16 @@ func ValidateStartupLayout(instances []*Config) error {
 			continue
 		}
 		for _, node := range instance.ExpandNodes() {
+			if node.Cert.CertDir != "" {
+				dir, err := filepath.Abs(node.Cert.CertDir)
+				if err != nil {
+					return fmt.Errorf("resolve cert_dir: %w", err)
+				}
+				if other, ok := certDirs[dir]; ok {
+					return fmt.Errorf("cert_dir %q is shared by %s and %s/node-%d", dir, other, owner, node.Panel.NodeID)
+				}
+				certDirs[dir] = fmt.Sprintf("%s/node-%d", owner, node.Panel.NodeID)
+			}
 			binding := fmt.Sprintf("%s/%d", strings.TrimSpace(node.Panel.URL), node.Panel.NodeID)
 			if other, ok := nodeBindings[binding]; ok {
 				return fmt.Errorf("node binding %s is declared by both %s and %s", binding, other, owner)
@@ -900,6 +958,18 @@ func ValidateStartupLayout(instances []*Config) error {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)
 				}
 			}
+		}
+	}
+	for dir, owner := range certDirs {
+		nodeDir := filepath.Dir(dir)
+		machine, ok := machineRoots[filepath.Dir(nodeDir)]
+		if !ok || filepath.Base(dir) != "certs" {
+			continue
+		}
+		name := filepath.Base(nodeDir)
+		id, err := strconv.Atoi(strings.TrimPrefix(name, "node-"))
+		if err == nil && id > 0 && name == fmt.Sprintf("node-%d", id) {
+			return fmt.Errorf("cert_dir %q for %s conflicts with machine instance %s", dir, owner, machine)
 		}
 	}
 	return nil

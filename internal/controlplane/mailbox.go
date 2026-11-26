@@ -52,10 +52,43 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if users != nil && !m.hasFullUserState {
-		m.users = cloneUsers(users)
+		cloned := cloneUsers(users)
+		if cloned == nil {
+			cloned = []model.UserSpec{}
+		}
+		m.users = cloned
 		m.hasFullUserState = true
 	}
 	if config != nil && m.config == nil {
+		m.config = cloneNodeSpec(config)
+	}
+}
+
+// ArbitrateUsers installs the next baseline before REST can change the kernel.
+// A coalesced WS snapshot has no ordering information relative to this response.
+// Retain only credentials both views authorize; a fresh poll can restore grants.
+func (m *NodeMailbox) ArbitrateUsers(users []model.UserSpec) ([]model.UserSpec, bool) {
+	if users == nil {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	conflict := m.dirtyUsers || m.needsReconcile
+	if conflict {
+		users = model.IntersectUsers(m.users, users)
+	}
+	m.users = make([]model.UserSpec, len(users))
+	copy(m.users, users)
+	m.hasFullUserState = true
+	m.dirtyUsers = false
+	m.needsReconcile = false
+	return users, conflict
+}
+
+func (m *NodeMailbox) SyncConfigBaseline(config *model.NodeSpec) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if config != nil && !m.dirtyConfig {
 		m.config = cloneNodeSpec(config)
 	}
 }
@@ -128,6 +161,9 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 	}
 	if m.dirtyUsers {
 		state.Users = cloneUsers(m.users)
+		if state.Users == nil {
+			state.Users = []model.UserSpec{}
+		}
 		state.HasUsers = true
 		m.dirtyUsers = false
 	}
@@ -255,7 +291,9 @@ func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSp
 			}
 			filtered = append(filtered, user)
 		}
-		current = append([]model.UserSpec(nil), filtered...)
+		next := make([]model.UserSpec, len(filtered))
+		copy(next, filtered)
+		current = next
 	default:
 		return false
 	}

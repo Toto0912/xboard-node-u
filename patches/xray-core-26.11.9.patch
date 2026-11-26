@@ -1,8 +1,8 @@
 diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
-index cae9735..ceafa6f 100644
+index cae9735..bd07b76 100644
 --- a/app/dispatcher/default.go
 +++ b/app/dispatcher/default.go
-@@ -14,6 +14,7 @@ import (
+@@ -14,6 +14,7 @@
  	"github.com/xtls/xray-core/common/protocol"
  	"github.com/xtls/xray-core/common/session"
  	"github.com/xtls/xray-core/core"
@@ -10,7 +10,7 @@ index cae9735..ceafa6f 100644
  	"github.com/xtls/xray-core/features/dns"
  	"github.com/xtls/xray-core/features/outbound"
  	"github.com/xtls/xray-core/features/policy"
-@@ -93,21 +94,22 @@ func (r *cachedReader) Interrupt() {
+@@ -93,21 +94,22 @@
  
  // DefaultDispatcher is a default implementation of Dispatcher.
  type DefaultDispatcher struct {
@@ -40,7 +40,7 @@ index cae9735..ceafa6f 100644
  		}); err != nil {
  			return nil, err
  		}
-@@ -116,11 +118,12 @@ func init() {
+@@ -116,11 +118,12 @@
  }
  
  // Init initializes DefaultDispatcher.
@@ -54,7 +54,7 @@ index cae9735..ceafa6f 100644
  	return nil
  }
  
-@@ -169,6 +172,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+@@ -169,6 +172,7 @@
  				}
  			}
  		}
@@ -62,7 +62,7 @@ index cae9735..ceafa6f 100644
  		if p.Stats.UserDownlink {
  			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
  			if c, _ := d.stats.GetOrRegisterCounter(name); c != nil {
-@@ -178,6 +182,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+@@ -178,6 +182,7 @@
  				}
  			}
  		}
@@ -70,18 +70,34 @@ index cae9735..ceafa6f 100644
  
  		if p.Stats.UserOnline {
  			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
-@@ -196,6 +201,10 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
+@@ -194,14 +199,23 @@
+ 		user = sessionInbound.User
+ 	}
  
- 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
- 
+-	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+-
++	uplink := &buf.TimeoutWrapperReader{Reader: link.Reader}
++	link.Reader = uplink
++
 +	var bandwidthManager bandwidth.Manager
 +	if feat := core.MustFromContext(ctx).GetFeature(bandwidth.ManagerType()); feat != nil {
 +		bandwidthManager, _ = feat.(bandwidth.Manager)
 +	}
  	if user != nil && len(user.Email) > 0 {
++		// Charge reads from the client once, below the timeout and sniffing caches.
++		if bandwidthManager != nil {
++			uplink.Reader = &rateLimitReader{reader: uplink.Reader, ctx: ctx, manager: bandwidthManager, user: user.Email}
++		}
  		p := policyManager.ForLevel(user.Level)
  		if p.Stats.UserUplink {
-@@ -213,6 +222,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
+ 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
+ 			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
+-				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
++				uplink.Counter = c
+ 			}
+ 		}
+ 		if p.Stats.UserDownlink {
+@@ -213,6 +227,7 @@
  				}
  			}
  		}
@@ -89,26 +105,26 @@ index cae9735..ceafa6f 100644
  		if p.Stats.UserOnline {
  			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
  		}
-@@ -263,6 +273,13 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
- 	return false
- }
+@@ -261,6 +276,13 @@
+ 	}
  
+ 	return false
++}
++
 +func applyBandwidthLimit(ctx context.Context, writer buf.Writer, limiter bandwidth.Manager, user *protocol.MemoryUser) buf.Writer {
 +	if limiter == nil || user == nil || user.Email == "" {
 +		return writer
 +	}
 +	return &RateLimitWriter{Writer: writer, Manager: limiter, User: user.Email, Context: ctx}
-+}
-+
+ }
+ 
  // Dispatch implements routing.Dispatcher.
- func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
- 	if !destination.IsValid() {
 diff --git a/app/dispatcher/ratelimit.go b/app/dispatcher/ratelimit.go
 new file mode 100644
-index 0000000..2d4a826
+index 0000000..c74a682
 --- /dev/null
 +++ b/app/dispatcher/ratelimit.go
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,72 @@
 +package dispatcher
 +
 +import (
@@ -128,46 +144,73 @@ index 0000000..2d4a826
 +	User    string
 +}
 +
++type rateLimitReader struct {
++	reader  buf.Reader
++	ctx     context.Context
++	manager bandwidth.Manager
++	user    string
++}
++
++func (r *rateLimitReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	mb, err := r.reader.ReadMultiBuffer()
++	if len(mb) != 0 {
++		if limitErr := limitBuffer(r.ctx, r.manager.GetUserLimiter(r.user), mb); limitErr != nil {
++			return nil, limitErr
++		}
++	}
++	return mb, err
++}
++
 +func (w *RateLimitWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 +	limiter := w.Limiter
 +	if w.Manager != nil {
 +		limiter = w.Manager.GetUserLimiter(w.User)
 +	}
-+	if limiter != nil {
-+		ctx := w.Context
-+		if ctx == nil {
-+			ctx = context.Background()
-+		}
-+		remaining := int(mb.Len())
-+		for remaining > 0 {
-+			n := min(remaining, limiter.Burst())
-+			if n <= 0 {
-+				buf.ReleaseMulti(mb)
-+				return context.Canceled
-+			}
-+			if err := limiter.WaitN(ctx, n); err != nil {
-+				buf.ReleaseMulti(mb)
-+				return err
-+			}
-+			remaining -= n
-+		}
++	if err := limitBuffer(w.Context, limiter, mb); err != nil {
++		return err
 +	}
 +	return w.Writer.WriteMultiBuffer(mb)
++}
++
++// limitBuffer releases mb on failure. On success ownership stays with the caller.
++func limitBuffer(ctx context.Context, limiter *rate.Limiter, mb buf.MultiBuffer) error {
++	if limiter == nil {
++		return nil
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	for remaining := int(mb.Len()); remaining > 0; {
++		n := min(remaining, limiter.Burst())
++		if n <= 0 {
++			buf.ReleaseMulti(mb)
++			return context.Canceled
++		}
++		if err := limiter.WaitN(ctx, n); err != nil {
++			buf.ReleaseMulti(mb)
++			return err
++		}
++		remaining -= n
++	}
++	return nil
 +}
 +
 +func (w *RateLimitWriter) Close() error { return common.Close(w.Writer) }
 +func (w *RateLimitWriter) Interrupt()   { common.Interrupt(w.Writer) }
 diff --git a/app/dispatcher/ratelimit_test.go b/app/dispatcher/ratelimit_test.go
 new file mode 100644
-index 0000000..781670e
+index 0000000..5a91601
 --- /dev/null
 +++ b/app/dispatcher/ratelimit_test.go
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,155 @@
 +package dispatcher
 +
 +import (
 +	"context"
++	"errors"
++	"io"
 +	"testing"
++	"time"
 +
 +	"github.com/xtls/xray-core/common/buf"
 +	"github.com/xtls/xray-core/common/net"
@@ -218,42 +261,86 @@ index 0000000..781670e
 +func (w *stubWriter) Close() error { return nil }
 +func (w *stubWriter) Interrupt()   {}
 +
-+type stubReader struct{}
++type testReadFunc func() (buf.MultiBuffer, error)
 +
-+func (stubReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, nil }
-+func (stubReader) Interrupt()                                {}
++func (f testReadFunc) ReadMultiBuffer() (buf.MultiBuffer, error) { return f() }
 +
-+func TestApplyBandwidthLimitWrapsWriterOnly(t *testing.T) {
-+	bm := bandwidthfeat.New()
-+	bm.SetUserLimit("user@example.com", 1024)
-+	writer := &stubWriter{}
-+	reader := stubReader{}
-+	user := &protocol.MemoryUser{Email: "user@example.com"}
-+	wrapped := applyBandwidthLimit(context.Background(), writer, bm, user)
-+	if _, ok := wrapped.(*RateLimitWriter); !ok {
-+		t.Fatal("expected writer to be wrapped by RateLimitWriter")
-+	}
-+	if _, ok := any(reader).(stubReader); !ok {
-+		t.Fatal("reader type unexpectedly changed")
-+	}
++func testPayload(n int32) buf.MultiBuffer {
++	b := buf.New()
++	b.Extend(n)
++	return buf.MultiBuffer{b}
 +}
 +
-+func TestWrapLinkUsesBandwidthFeature(t *testing.T) {
++func TestWrapLinkMetersSharedBucketOnceAfterTimeout(t *testing.T) {
 +	inst := new(core.Instance)
 +	bm := bandwidthfeat.New()
-+	bm.SetUserLimit("user@example.com", 1024)
 +	if err := inst.AddFeature(bm); err != nil {
 +		t.Fatalf("AddFeature(bandwidth) error = %v", err)
 +	}
 +	ctx := context.WithValue(context.Background(), core.XrayKey(1), inst)
 +	ctx = session.ContextWithInbound(ctx, &session.Inbound{User: &protocol.MemoryUser{Email: "user@example.com"}, Source: net.TCPDestination(net.IPAddress([]byte{127, 0, 0, 1}), 1234)})
-+	link := &transport.Link{Reader: &buf.TimeoutWrapperReader{Reader: stubReader{}}, Writer: &stubWriter{}}
-+	_ = WrapLink(ctx, featurepolicy.DefaultManager{}, featurestats.NoopManager{}, link)
-+	if _, ok := link.Writer.(*RateLimitWriter); !ok {
-+		t.Fatal("expected WrapLink to wrap writer with bandwidth limiter")
++	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
++	defer cancel()
++	ready := make(chan struct{})
++	var last buf.MultiBuffer
++	source := testReadFunc(func() (buf.MultiBuffer, error) {
++		<-ready
++		last = testPayload(7)
++		return last, io.EOF
++	})
++	link := WrapLink(ctx, featurepolicy.DefaultManager{}, featurestats.NoopManager{}, &transport.Link{Reader: source, Writer: &stubWriter{}})
++	timeoutReader := link.Reader.(*buf.TimeoutWrapperReader)
++	// A session opened without a limit must observe later changes.
++	bucket := rate.NewLimiter(0, 16)
++	bm.SetUserLimiter("user@example.com", bucket)
++	if mb, err := timeoutReader.ReadMultiBufferTimeout(time.Millisecond); mb != nil || err != buf.ErrReadTimeout {
++		t.Fatalf("expected read timeout, got %v, %v", mb, err)
 +	}
-+	if _, ok := link.Reader.(*buf.TimeoutWrapperReader); !ok {
-+		t.Fatal("expected reader wrapper to remain TimeoutWrapperReader")
++	close(ready)
++	mb, err := timeoutReader.ReadMultiBuffer()
++	if mb.Len() != 7 || err != io.EOF || bucket.Tokens() != 9 {
++		t.Fatalf("deferred read: bytes=%d err=%v tokens=%v", mb.Len(), err, bucket.Tokens())
++	}
++	buf.ReleaseMulti(mb)
++	if err := link.Writer.WriteMultiBuffer(testPayload(9)); err != nil || bucket.Tokens() != 0 {
++		t.Fatalf("shared downlink: err=%v tokens=%v", err, bucket.Tokens())
++	}
++	cancel()
++	if mb, err := timeoutReader.ReadMultiBuffer(); !errors.Is(err, context.Canceled) || mb != nil || last[0] != nil {
++		t.Fatal("canceled rate wait should release the entire unread batch")
++	}
++	bm.Reset()
++	mb, err = timeoutReader.ReadMultiBuffer()
++	if mb.Len() != 7 || err != io.EOF {
++		t.Fatalf("removed limit remained active on reader: bytes=%d err=%v", mb.Len(), err)
++	}
++	buf.ReleaseMulti(mb)
++}
++
++func TestGetLinkChargesOnlyTheTwoPipeWriters(t *testing.T) {
++	bm := bandwidthfeat.New()
++	bucket := rate.NewLimiter(0, 16)
++	bm.SetUserLimiter("limited", bucket)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	ctx = session.ContextWithInbound(ctx, &session.Inbound{User: &protocol.MemoryUser{Email: "limited"}})
++	d := &DefaultDispatcher{policy: featurepolicy.DefaultManager{}, stats: featurestats.NoopManager{}, bandwidth: bm}
++	in, out := d.getLink(ctx)
++	for _, direction := range []struct {
++		src, dst *transport.Link
++		n        int32
++	}{{in, out, 7}, {out, in, 9}} {
++		if err := direction.src.Writer.WriteMultiBuffer(testPayload(direction.n)); err != nil {
++			t.Fatal(err)
++		}
++		mb, err := direction.dst.Reader.ReadMultiBuffer()
++		if mb.Len() != direction.n || err != nil {
++			t.Fatalf("pipe read: bytes=%d err=%v", mb.Len(), err)
++		}
++		buf.ReleaseMulti(mb)
++	}
++	if bucket.Tokens() != 0 {
++		t.Fatalf("after transferring exactly one burst, tokens=%v", bucket.Tokens())
 +	}
 +}
 +
@@ -271,6 +358,118 @@ index 0000000..781670e
 +		t.Fatal("expected canceled context to abort wait")
 +	}
 +}
+diff --git a/app/proxyman/inbound/always.go b/app/proxyman/inbound/always.go
+index 70edbef..609c8d8 100644
+--- a/app/proxyman/inbound/always.go
++++ b/app/proxyman/inbound/always.go
+@@ -69,6 +69,8 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
+ 		return nil, errors.New("failed to parse stream config").Base(err)
+ 	}
+ 
++	mss.BindDialerFeatures(core.MustFromContext(ctx).DialerFeatures())
++
+ 	newCtx := session.ContextWithInbound(ctx, &session.Inbound{Tag: tag, Source: src})
+ 	newCtx = session.ContextWithContent(newCtx, &session.Content{SniffingRequest: sniffingRequest})
+ 	newCtx = session.ContextWithStreamSettings(newCtx, mss)
+diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
+index 4a3bb6d..b4d432f 100644
+--- a/app/proxyman/inbound/worker.go
++++ b/app/proxyman/inbound/worker.go
+@@ -27,6 +27,16 @@ import (
+ 	"github.com/xtls/xray-core/transport/pipe"
+ )
+ 
++// SessionTrackerKey optionally binds accepted sessions to the embedding node's shutdown.
++type SessionTrackerKey struct{}
++
++func trackSession(ctx context.Context, cancel context.CancelFunc, conn net.Conn) (func(), bool) {
++	if begin, ok := ctx.Value(SessionTrackerKey{}).(func(func()) (func(), bool)); ok {
++		return begin(func() { cancel(); conn.Close() })
++	}
++	return func() {}, true
++}
++
+ type worker interface {
+ 	Start() error
+ 	Close() error
+@@ -60,6 +70,13 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
+ 
+ func (w *tcpWorker) callback(conn stat.Connection) {
+ 	ctx, cancel := context.WithCancel(w.ctx)
++	finish, ok := trackSession(ctx, cancel, conn)
++	if !ok {
++		cancel()
++		conn.Close()
++		return
++	}
++	defer finish()
+ 	sid := session.NewID()
+ 	ctx = c.ContextWithID(ctx, sid)
+ 
+@@ -332,6 +349,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
+ 		go func() {
+ 			ctx, cancel := context.WithCancel(w.ctx)
+ 			conn.cancel = cancel
++			finish, ok := trackSession(ctx, cancel, conn)
++			if !ok {
++				conn.Close()
++				return
++			}
++			defer finish()
+ 			sid := session.NewID()
+ 			ctx = c.ContextWithID(ctx, sid)
+ 
+@@ -483,6 +506,13 @@ type dsWorker struct {
+ 
+ func (w *dsWorker) callback(conn stat.Connection) {
+ 	ctx, cancel := context.WithCancel(w.ctx)
++	finish, ok := trackSession(ctx, cancel, conn)
++	if !ok {
++		cancel()
++		conn.Close()
++		return
++	}
++	defer finish()
+ 	sid := session.NewID()
+ 	ctx = c.ContextWithID(ctx, sid)
+ 
+diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
+index 4c3b16a..de32586 100644
+--- a/app/proxyman/outbound/handler.go
++++ b/app/proxyman/outbound/handler.go
+@@ -55,6 +55,7 @@ func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter)
+ 
+ // Handler implements outbound.Handler.
+ type Handler struct {
++	dialerFeatures  *internet.DialerFeatures
+ 	tag             string
+ 	senderSettings  *proxyman.SenderConfig
+ 	streamSettings  *internet.MemoryStreamConfig
+@@ -72,6 +73,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
+ 	v := core.MustFromContext(ctx)
+ 	uplinkCounter, downlinkCounter := getStatCounter(v, config.Tag)
+ 	h := &Handler{
++		dialerFeatures:  v.DialerFeatures(),
+ 		tag:             config.Tag,
+ 		uplinkCounter:   uplinkCounter,
+ 		downlinkCounter: downlinkCounter,
+@@ -89,6 +91,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
+ 			if err != nil {
+ 				return nil, errors.New("failed to parse stream settings").Base(err)
+ 			}
++			mss.BindDialerFeatures(h.dialerFeatures)
+ 			h.streamSettings = mss
+ 		default:
+ 			return nil, errors.New("settings is not SenderConfig")
+@@ -184,7 +187,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+ 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
+ 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
+ 		}
+-		ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
++		ips, err := h.dialerFeatures.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
+ 		if err != nil {
+ 			errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
+ 			if h.senderSettings.TargetStrategy.ForceIP() {
 diff --git a/common/buf/io.go b/common/buf/io.go
 index 4f0e64f..24a1ed3 100644
 --- a/common/buf/io.go
@@ -423,18 +622,33 @@ index d3de166..eecb0f3 100644
  	configType := reflect.TypeOf(config)
  	creator, found := typeCreatorRegistry[configType]
 diff --git a/core/xray.go b/core/xray.go
-index 794ce8f..d82659b 100644
+index 794ce8f..bdf5177 100644
 --- a/core/xray.go
 +++ b/core/xray.go
-@@ -17,6 +17,7 @@ import (
- 	"github.com/xtls/xray-core/features/policy"
- 	"github.com/xtls/xray-core/features/routing"
- 	"github.com/xtls/xray-core/features/stats"
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/xtls/xray-core/common/platform"
+ 	"github.com/xtls/xray-core/common/serial"
+ 	"github.com/xtls/xray-core/features"
 +	"github.com/xtls/xray-core/features/bandwidth"
- 	"github.com/xtls/xray-core/transport/internet"
- )
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/dns/localdns"
+ 	"github.com/xtls/xray-core/features/inbound"
+@@ -87,9 +88,13 @@ type Instance struct {
+ 	running                    bool
+ 	resolveLock                sync.Mutex
  
-@@ -219,6 +220,7 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+-	ctx context.Context
++	ctx            context.Context
++	dialerFeatures *internet.DialerFeatures
+ }
+ 
++// DialerFeatures is fixed before inbound and outbound handlers are built.
++func (s *Instance) DialerFeatures() *internet.DialerFeatures { return s.dialerFeatures }
++
+ // Instance state
+ func (server *Instance) IsRunning() bool {
+ 	server.statusLock.Lock()
+@@ -219,6 +224,7 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
  		{policy.ManagerType(), policy.DefaultManager{}},
  		{routing.RouterType(), routing.DefaultRouter{}},
  		{stats.ManagerType(), stats.NoopManager{}},
@@ -442,6 +656,39 @@ index 794ce8f..d82659b 100644
  	}
  
  	for _, f := range essentialFeatures {
+@@ -229,13 +235,9 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+ 		}
+ 	}
+ 
+-	internet.InitSystemDialer(
+-		server.GetFeature(dns.ClientType()).(dns.Client),
+-		func() outbound.Manager {
+-			obm, _ := server.GetFeature(outbound.ManagerType()).(outbound.Manager)
+-			return obm
+-		}(),
+-	)
++	dc := server.GetFeature(dns.ClientType()).(dns.Client)
++	om, _ := server.GetFeature(outbound.ManagerType()).(outbound.Manager)
++	server.dialerFeatures = internet.NewDialerFeatures(dc, om)
+ 
+ 	server.resolveLock.Lock()
+ 	if server.pendingResolutions != nil {
+@@ -251,6 +253,7 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+ 	if err := addOutboundHandlers(server, config.Outbound); err != nil {
+ 		return true, err
+ 	}
++	server.dialerFeatures.SetDefault()
+ 	return false, nil
+ }
+ 
+@@ -265,6 +268,7 @@ func (s *Instance) Close() error {
+ 	defer s.statusLock.Unlock()
+ 
+ 	s.running = false
++	defer s.dialerFeatures.Close()
+ 
+ 	var errs []interface{}
+ 	for _, f := range s.features {
 diff --git a/features/bandwidth/bandwidth.go b/features/bandwidth/bandwidth.go
 new file mode 100644
 index 0000000..b4e737a
@@ -572,6 +819,241 @@ index aa5694c..4536d30 100644
  	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
  	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
  	golang.zx2c4.com/wireguard/windows v1.1.1
+diff --git a/proxy/freedom/freedom.go b/proxy/freedom/freedom.go
+index 6215647..e4c961c 100644
+--- a/proxy/freedom/freedom.go
++++ b/proxy/freedom/freedom.go
+@@ -53,7 +53,7 @@ func reloadEnvSettings() error {
+ 
+ func init() {
+ 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+-		h := new(Handler)
++		h := &Handler{dialerFeatures: core.MustFromContext(ctx).DialerFeatures()}
+ 		if streamSettings, ok := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig); ok && streamSettings.SocketSettings != nil {
+ 			h.resolveStrategy = streamSettings.SocketSettings.DomainStrategy
+ 			h.usesDialerProxy = len(streamSettings.SocketSettings.DialerProxy) > 0
+@@ -97,6 +97,7 @@ type FinalRule struct {
+ 
+ // Handler handles Freedom connections.
+ type Handler struct {
++	dialerFeatures  *internet.DialerFeatures
+ 	policyManager   policy.Manager
+ 	config          *Config
+ 	finalRules      []*FinalRule
+@@ -321,7 +322,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 		if destination.Address.Family().IsDomain() {
+ 			if defaultRule != nil || len(h.finalRules) > 0 {
+ 				if strategy := h.resolveStrategy; strategy.HasStrategy() {
+-					ips, err := internet.LookupForIP(destination.Address.Domain(), strategy, outGateway)
++					ips, err := h.dialerFeatures.LookupForIP(destination.Address.Domain(), strategy, outGateway)
+ 					if err != nil { // non-force may still dial with system DNS
+ 						errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", destination.Address.Domain())
+ 						if strategy.ForceIP() {
+@@ -626,7 +627,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+ 				} else {
+ 					shouldUseSystemResolver := true
+ 					if strategy := w.Handler.resolveStrategy; strategy.HasStrategy() {
+-						ips, err := internet.LookupForIP(b.UDP.Address.Domain(), strategy, w.OutGateway)
++						ips, err := w.Handler.dialerFeatures.LookupForIP(b.UDP.Address.Domain(), strategy, w.OutGateway)
+ 						if err != nil {
+ 							// drop packet if resolve failed when forceIP
+ 							if strategy.ForceIP() {
+diff --git a/transport/internet/config.pb.go b/transport/internet/config.pb.go
+index ec24ef9..67c3ef2 100644
+--- a/transport/internet/config.pb.go
++++ b/transport/internet/config.pb.go
+@@ -633,6 +633,8 @@ func (x *CustomSockopt) GetType() string {
+ // SocketConfig is options to be applied on network sockets.
+ type SocketConfig struct {
+ 	state protoimpl.MessageState `protogen:"open.v1"`
++	// Runtime only. Transport callbacks can outlive or replace the dialing context.
++	dialerFeatures *DialerFeatures
+ 	// Mark of the connection. If non-zero, the value will be set to SO_MARK.
+ 	Mark int32 `protobuf:"varint,1,opt,name=mark,proto3" json:"mark,omitempty"`
+ 	// TFO is the state of TFO settings.
+diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
+index 6d7b905..65c1f9b 100644
+--- a/transport/internet/dialer.go
++++ b/transport/internet/dialer.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"strings"
++	"sync/atomic"
+ 
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/dice"
+@@ -79,23 +80,60 @@ func DestIpAddress() net.IP {
+ 	return effectiveSystemDialer.DestIpAddress()
+ }
+ 
+-var (
+-	dnsClient dns.Client
+-	obm       outbound.Manager
+-)
++// DialerFeatures belongs to the core instance that created a handler.
++type DialerFeatures struct {
++	active atomic.Pointer[dialerServices]
++}
++
++type dialerServices struct {
++	dns       dns.Client
++	outbounds outbound.Manager
++}
++
++func NewDialerFeatures(dc dns.Client, om outbound.Manager) *DialerFeatures {
++	f := new(DialerFeatures)
++	f.active.Store(&dialerServices{dns: dc, outbounds: om})
++	return f
++}
++
++func (f *DialerFeatures) services() *dialerServices {
++	if f == nil {
++		return nil
++	}
++	return f.active.Load()
++}
++
++// Close releases the owner even if a transport pool retains its socket options.
++func (f *DialerFeatures) Close() {
++	if f != nil {
++		f.active.Store(nil)
++		defaultDialerFeatures.CompareAndSwap(f, nil)
++	}
++}
++
++func (f *DialerFeatures) SetDefault() { defaultDialerFeatures.Store(f) }
++
++// Standalone callers of InitSystemDialer and LookupForIP retain the legacy
++// default. Core-owned handlers and socket settings always select their owner.
++var defaultDialerFeatures atomic.Pointer[DialerFeatures]
+ 
+ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
+-	if dnsClient == nil {
++	return defaultDialerFeatures.Load().LookupForIP(domain, strategy, localAddr)
++}
++
++func (f *DialerFeatures) LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
++	services := f.services()
++	if services == nil || services.dns == nil {
+ 		return nil, errors.New("DNS client not initialized")
+ 	}
+ 
+-	ips, _, err := dnsClient.LookupIP(domain, dns.IPOption{
++	ips, _, err := services.dns.LookupIP(domain, dns.IPOption{
+ 		IPv4Enable: (localAddr == nil && strategy.PreferIP4()) || (localAddr != nil && localAddr.Family().IsIPv4() && (strategy.PreferIP4() || strategy.FallbackIP4())),
+ 		IPv6Enable: (localAddr == nil && strategy.PreferIP6()) || (localAddr != nil && localAddr.Family().IsIPv6() && (strategy.PreferIP6() || strategy.FallbackIP6())),
+ 	})
+ 	{ // Resolve fallback
+ 		if (len(ips) == 0 || err != nil) && strategy.HasFallback() && localAddr == nil {
+-			ips, _, err = dnsClient.LookupIP(domain, dns.IPOption{
++			ips, _, err = services.dns.LookupIP(domain, dns.IPOption{
+ 				IPv4Enable: strategy.FallbackIP4(),
+ 				IPv6Enable: strategy.FallbackIP6(),
+ 			})
+@@ -248,12 +286,16 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ 		dest = *newDest
+ 	}
+ 
++	features := sockopt.dialerFeatures
++	if features == nil {
++		features = defaultDialerFeatures.Load()
++	}
+ 	if sockopt.DomainStrategy.HasStrategy() && dest.Address.Family().IsDomain() {
+ 		finalStrategy := sockopt.DomainStrategy
+ 		if outboundName == "freedom" && dest.Network == net.Network_UDP && origTargetAddr != nil && src == nil {
+ 			finalStrategy = finalStrategy.GetDynamicStrategy(origTargetAddr.Family())
+ 		}
+-		ips, err := LookupForIP(dest.Address.Domain(), finalStrategy, src)
++		ips, err := features.LookupForIP(dest.Address.Domain(), finalStrategy, src)
+ 		if err != nil {
+ 			errors.LogErrorInner(ctx, err, "failed to resolve ip")
+ 			if sockopt.DomainStrategy.ForceIP() {
+@@ -268,10 +310,11 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ 	}
+ 
+ 	if len(sockopt.DialerProxy) > 0 {
+-		if obm == nil {
++		services := features.services()
++		if services == nil || services.outbounds == nil {
+ 			return nil, errors.New("there is no outbound manager for dialerProxy")
+ 		}
+-		h := obm.GetHandler(sockopt.DialerProxy)
++		h := services.outbounds.GetHandler(sockopt.DialerProxy)
+ 		if h == nil {
+ 			return nil, errors.New("there is no outbound handler for dialerProxy")
+ 		}
+@@ -282,6 +325,5 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ }
+ 
+ func InitSystemDialer(dc dns.Client, om outbound.Manager) {
+-	dnsClient = dc
+-	obm = om
++	NewDialerFeatures(dc, om).SetDefault()
+ }
+diff --git a/transport/internet/dialer_features_test.go b/transport/internet/dialer_features_test.go
+new file mode 100755
+index 0000000..50b195e
+--- /dev/null
++++ b/transport/internet/dialer_features_test.go
+@@ -0,0 +1,57 @@
++package internet_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/features/dns"
++	"github.com/xtls/xray-core/features/outbound"
++	"github.com/xtls/xray-core/transport/internet"
++)
++
++type handoffDNS struct {
++	dns.Client
++	ip net.IP
++}
++
++func (d handoffDNS) LookupIP(string, dns.IPOption) ([]net.IP, uint32, error) {
++	return []net.IP{d.ip}, 60, nil
++}
++
++type handoffOutbounds struct {
++	outbound.Manager
++	calls int
++}
++
++func (m *handoffOutbounds) GetHandler(string) outbound.Handler {
++	m.calls++
++	return nil
++}
++
++func TestClosedDialerFeaturesDoNotBorrowCurrentInstance(t *testing.T) {
++	ipA, ipB := net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.2")
++	old := internet.NewDialerFeatures(handoffDNS{ip: ipA}, nil)
++	old.SetDefault()
++	currentOutbounds := new(handoffOutbounds)
++	current := internet.NewDialerFeatures(handoffDNS{ip: ipB}, currentOutbounds)
++	defer current.Close()
++	current.SetDefault()
++	stale := &internet.MemoryStreamConfig{SocketSettings: &internet.SocketConfig{DialerProxy: "shared-tag"}}
++	stale.BindDialerFeatures(old)
++	old.Close()
++	if _, err := old.LookupForIP("fixture.invalid", internet.DomainStrategy_FORCE_IP4, nil); err == nil {
++		t.Fatal("closed DNS owner still usable")
++	}
++	if _, err := internet.DialSystem(context.Background(), net.TCPDestination(net.LocalHostIP, 80), stale.SocketSettings); err == nil || currentOutbounds.calls != 0 {
++		t.Fatal("stale socket selected the current instance's outbound")
++	}
++	ips, err := internet.LookupForIP("fixture.invalid", internet.DomainStrategy_FORCE_IP4, nil)
++	if err != nil || len(ips) != 1 || !ips[0].Equal(ipB) {
++		t.Fatalf("closing the old instance changed the current default: %v, %v", ips, err)
++	}
++	current.Close()
++	if _, err := internet.LookupForIP("fixture.invalid", internet.DomainStrategy_FORCE_IP4, nil); err == nil {
++		t.Fatal("closing the last instance retained its DNS client")
++	}
++}
 diff --git a/transport/internet/hysteria/conn.go b/transport/internet/hysteria/conn.go
 index 5e801ee..ec9d286 100644
 --- a/transport/internet/hysteria/conn.go
@@ -688,3 +1170,170 @@ index 441db87..ec725a4 100644
  			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
  			w.WriteHeader(StatusAuthOK)
  			return true
+diff --git a/transport/internet/memory_settings.go b/transport/internet/memory_settings.go
+index 6277151..6450f00 100644
+--- a/transport/internet/memory_settings.go
++++ b/transport/internet/memory_settings.go
+@@ -12,6 +12,7 @@ import (
+ 
+ // MemoryStreamConfig is a parsed form of StreamConfig. It is used to reduce the number of Protobuf parses.
+ type MemoryStreamConfig struct {
++	dialerFeatures   *DialerFeatures
+ 	Destination      *net.Destination
+ 	ProtocolName     string
+ 	ProtocolSettings interface{}
+@@ -23,6 +24,25 @@ type MemoryStreamConfig struct {
+ 	DownloadSettings *MemoryStreamConfig
+ }
+ 
++// BindDialerFeatures runs once before publishing these decoded stream options.
++// An ECH resolver may have its own socket options and asynchronous HTTP client.
++func (s *MemoryStreamConfig) BindDialerFeatures(f *DialerFeatures) {
++	s.dialerFeatures = f
++	if s.SocketSettings != nil {
++		s.SocketSettings.dialerFeatures = f
++	}
++	if ech, ok := s.SecuritySettings.(interface{ GetEchSocketSettings() *SocketConfig }); ok {
++		if opt := ech.GetEchSocketSettings(); opt != nil {
++			opt.dialerFeatures = f
++		}
++	}
++}
++
++// InheritDialerFeatures binds a split download transport to the same owner.
++func (s *MemoryStreamConfig) InheritDialerFeatures(parent *MemoryStreamConfig) {
++	s.BindDialerFeatures(parent.dialerFeatures)
++}
++
+ // ToMemoryStreamConfig converts a StreamConfig to MemoryStreamConfig. It returns a default non-nil MemoryStreamConfig for nil input.
+ func ToMemoryStreamConfig(s *StreamConfig) (*MemoryStreamConfig, error) {
+ 	ets, err := s.GetEffectiveTransportSettings()
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+index b52f5a7..e2f50d8 100644
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -354,6 +354,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
+ 		globalDialerAccess.Lock()
+ 		if streamSettings.DownloadSettings == nil {
+ 			streamSettings.DownloadSettings = common.Must2(internet.ToMemoryStreamConfig(transportConfiguration.DownloadSettings))
++			streamSettings.DownloadSettings.InheritDialerFeatures(streamSettings)
+ 			if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.Penetrate {
+ 				streamSettings.DownloadSettings.SocketSettings = streamSettings.SocketSettings
+ 			}
+diff --git a/app/proxyman/outbound/handler_test.go b/app/proxyman/outbound/handler_test.go
+index 7029442..db5b43c 100644
+--- a/app/proxyman/outbound/handler_test.go
++++ b/app/proxyman/outbound/handler_test.go
+@@ -107,11 +107,11 @@ func TestTagsCache(t *testing.T) {
+ 	v.AddFeature(ohm)
+ 	ctx := context.WithValue(context.Background(), xrayKey, v)
+ 
+-	stop_add_rm := false
++	var stopAddRemove atomic.Bool
+ 	wg_add_rm := sync.WaitGroup{}
+ 	addHandlers := func() {
+ 		defer wg_add_rm.Done()
+-		for !stop_add_rm {
++		for !stopAddRemove.Load() {
+ 			time.Sleep(delay)
+ 			idx := counter.Add(1)
+ 			tag := fmt.Sprintf("%s%d", tags_prefix, idx)
+@@ -134,7 +134,7 @@ func TestTagsCache(t *testing.T) {
+ 
+ 	rmHandlers := func() {
+ 		defer wg_add_rm.Done()
+-		for !stop_add_rm {
++		for !stopAddRemove.Load() {
+ 			time.Sleep(delay)
+ 			tags.Range(func(key interface{}, value interface{}) bool {
+ 				if _, ok := tags.LoadAndDelete(key); ok {
+@@ -149,10 +149,10 @@ func TestTagsCache(t *testing.T) {
+ 
+ 	selectors := []string{tags_prefix}
+ 	wg_get := sync.WaitGroup{}
+-	stop_get := false
++	var stopSelect atomic.Bool
+ 	getTags := func() {
+ 		defer wg_get.Done()
+-		for !stop_get {
++		for !stopSelect.Load() {
+ 			time.Sleep(delay)
+ 			_ = ohm.Select(selectors)
+ 			// t.Logf("get tags: %v", tag)
+@@ -168,8 +168,8 @@ func TestTagsCache(t *testing.T) {
+ 	}
+ 
+ 	time.Sleep(test_duration)
+-	stop_add_rm = true
++	stopAddRemove.Store(true)
+ 	wg_add_rm.Wait()
+-	stop_get = true
++	stopSelect.Store(true)
+ 	wg_get.Wait()
+ }
+diff --git a/app/proxyman/outbound/outbound.go b/app/proxyman/outbound/outbound.go
+index d865428..6d96f00 100644
+--- a/app/proxyman/outbound/outbound.go
++++ b/app/proxyman/outbound/outbound.go
+@@ -163,13 +163,13 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
+ // Select implements outbound.HandlerSelector.
+ func (m *Manager) Select(selectors []string) []string {
+ 	key := strings.Join(selectors, ",")
++	m.access.RLock()
++	defer m.access.RUnlock()
++
+ 	if cache, ok := m.tagsCache.Load(key); ok {
+ 		return cache.([]string)
+ 	}
+ 
+-	m.access.RLock()
+-	defer m.access.RUnlock()
+-
+ 	tags := make([]string, 0, len(selectors))
+ 
+ 	for tag := range m.taggedHandler {
+diff --git a/testing/servers/udp/udp.go b/testing/servers/udp/udp.go
+index c927d5e..4769e04 100644
+--- a/testing/servers/udp/udp.go
++++ b/testing/servers/udp/udp.go
+@@ -1,7 +1,9 @@
+ package udp
+ 
+ import (
++	"errors"
+ 	"fmt"
++	stdnet "net"
+ 
+ 	"github.com/xtls/xray-core/common/net"
+ )
+@@ -9,7 +11,6 @@ import (
+ type Server struct {
+ 	Port         net.Port
+ 	MsgProcessor func(msg []byte) []byte
+-	accepting    bool
+ 	conn         *net.UDPConn
+ }
+ 
+@@ -32,11 +33,13 @@ func (server *Server) Start() (net.Destination, error) {
+ }
+ 
+ func (server *Server) handleConnection(conn *net.UDPConn) {
+-	server.accepting = true
+-	for server.accepting {
++	for {
+ 		buffer := make([]byte, 2*1024)
+ 		nBytes, addr, err := conn.ReadFromUDP(buffer)
+ 		if err != nil {
++			if errors.Is(err, stdnet.ErrClosed) {
++				return
++			}
+ 			fmt.Printf("Failed to read from UDP: %v\n", err)
+ 			continue
+ 		}
+@@ -49,6 +52,5 @@ func (server *Server) handleConnection(conn *net.UDPConn) {
+ }
+ 
+ func (server *Server) Close() error {
+-	server.accepting = false
+ 	return server.conn.Close()
+ }

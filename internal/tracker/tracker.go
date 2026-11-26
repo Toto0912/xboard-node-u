@@ -4,6 +4,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
@@ -17,6 +18,8 @@ type snapshot struct {
 	inSpeed   int64
 	outSpeed  int64
 }
+
+var emptySnapshot snapshot
 
 // Tracker computes per-user traffic deltas from cumulative counters
 // provided by the kernel, and accumulates totals for panel reporting.
@@ -36,7 +39,8 @@ type Tracker struct {
 
 	// lastSeen stores the cumulative traffic from the previous Process() call.
 	// Protected by mu — only written by Process.
-	lastSeen map[int][2]int64 // userID → [upload, download] cumulative
+	lastSeen  map[int][2]int64 // userID → [upload, download] cumulative
+	sampledAt time.Time        // last successful sample in this run, protected by mu
 
 	// pending accumulates deltas between flushes.
 	// Protected by mu — written by Process, drained by FlushTraffic.
@@ -52,12 +56,18 @@ func New() *Tracker {
 		lastSeen:       make(map[int][2]int64),
 		pendingTraffic: make(map[int][2]int64),
 	}
-	// Publish initial empty snapshot.
-	t.live.Store(&snapshot{
-		aliveIPs: make(map[int]map[string]bool),
-		online:   make(map[int]int),
-	})
+	t.ClearActivity()
 	return t
+}
+
+// ClearActivity publishes zero connections, devices and speed. Both kernels
+// retain cumulative traffic across restarts, so lastSeen and unsent deltas
+// must survive stops, including a stop while a report is in flight.
+func (t *Tracker) ClearActivity() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sampledAt = time.Time{}
+	t.live.Store(&emptySnapshot)
 }
 
 // Process computes per-user traffic deltas from cumulative kernel counters.
@@ -72,6 +82,7 @@ func (t *Tracker) Process(
 ) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	now := time.Now()
 
 	var cycleIn, cycleOut int64
 
@@ -107,14 +118,17 @@ func (t *Tracker) Process(
 		online[uid] = len(ips)
 	}
 
-	// Publish new snapshot (readers will see this atomically).
-	t.live.Store(&snapshot{
+	s := &snapshot{
 		aliveIPs:  kernelAliveIPs, // kernel provides fresh copy each tick
 		online:    online,
 		connCount: connCount,
-		inSpeed:   cycleIn,
-		outSpeed:  cycleOut,
-	})
+	}
+	if elapsed := now.Sub(t.sampledAt).Seconds(); !t.sampledAt.IsZero() && elapsed > 0 {
+		s.inSpeed = int64(float64(cycleIn) / elapsed)
+		s.outSpeed = int64(float64(cycleOut) / elapsed)
+	}
+	t.sampledAt = now
+	t.live.Store(s)
 }
 
 // FlushTraffic returns accumulated per-user traffic and resets the pending buffer.
@@ -196,11 +210,11 @@ func (t *Tracker) TotalConnections() int64 {
 // InboundSpeed returns the last observed inbound (download) speed in bytes/second.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) InboundSpeed() int64 {
-	return t.live.Load().inSpeed / 10
+	return t.live.Load().inSpeed
 }
 
 // OutboundSpeed returns the last observed outbound (upload) speed in bytes/second.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) OutboundSpeed() int64 {
-	return t.live.Load().outSpeed / 10
+	return t.live.Load().outSpeed
 }

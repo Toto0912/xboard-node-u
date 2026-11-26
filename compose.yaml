@@ -3,10 +3,12 @@ services:
     build: .
     image: xboard-node:local
     restart: unless-stopped
+    stop_grace_period: 90s
     network_mode: host
     environment:
       XBOARD_NODE_TOKEN: ${XBOARD_NODE_TOKEN:-}
       XBOARD_NODE_MACHINE_TOKEN: ${XBOARD_NODE_MACHINE_TOKEN:-}
+      XBOARD_NODE_TRAFFIC_DIR: /etc/xboard-node/data/traffic-batches
     volumes:
       - ./config.yml:/etc/xboard-node/config.yml:ro
       - ./data:/etc/xboard-node/data

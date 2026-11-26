@@ -245,7 +245,7 @@ error_log="/var/log/xboard-node/error.log"
 respawn_delay=5
 respawn_max=5
 respawn_period=60
-retry="TERM/30/KILL/5"
+retry="TERM/90/KILL/5"
 depend() {
     need net
 }

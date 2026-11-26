@@ -2,7 +2,9 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,13 +31,15 @@ var (
 // When machineID > 0 the client uses machine-level authentication
 // (machine_id + token) instead of the legacy (token + node_type) scheme.
 type Client struct {
-	baseURL    string
-	token      string
-	nodeID     int
-	nodeType   string
-	machineID  int
-	httpClient *http.Client
+	baseURL         string
+	token           string
+	nodeID          int
+	nodeType        string
+	machineID       int
+	httpClient      *http.Client
+	batchCapability *atomic.Int32 // shared with all child clients of a machine
 
+	etagMu     sync.Mutex
 	configETag string
 	userETag   string
 
@@ -46,11 +50,12 @@ type Client struct {
 // NewClient creates a new panel API client.
 func NewClient(cfg config.PanelConfig) *Client {
 	return &Client{
-		baseURL:   strings.TrimRight(cfg.URL, "/"),
-		token:     cfg.Token,
-		nodeID:    cfg.NodeID,
-		nodeType:  cfg.NodeType,
-		machineID: cfg.MachineID,
+		baseURL:         strings.TrimRight(cfg.URL, "/"),
+		batchCapability: new(atomic.Int32),
+		token:           cfg.Token,
+		nodeID:          cfg.NodeID,
+		nodeType:        cfg.NodeType,
+		machineID:       cfg.MachineID,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -66,12 +71,13 @@ func NewClient(cfg config.PanelConfig) *Client {
 // same base URL, auth and HTTP transport. ETags and metric counters start fresh.
 func (c *Client) ForNode(nodeID int) *Client {
 	return &Client{
-		baseURL:    c.baseURL,
-		token:      c.token,
-		nodeID:     nodeID,
-		nodeType:   c.nodeType,
-		machineID:  c.machineID,
-		httpClient: c.httpClient,
+		baseURL:         c.baseURL,
+		batchCapability: c.batchCapability,
+		token:           c.token,
+		nodeID:          nodeID,
+		nodeType:        c.nodeType,
+		machineID:       c.machineID,
+		httpClient:      c.httpClient,
 	}
 }
 
@@ -79,7 +85,17 @@ func (c *Client) ForNode(nodeID int) *Client {
 // returns a full response instead of 304. Used by machine mode after a
 // pre-fetch to probe the transport type.
 func (c *Client) ResetConfigETag() {
+	c.etagMu.Lock()
 	c.configETag = ""
+	c.etagMu.Unlock()
+}
+
+// ResetUserETag clears the cached user ETag so the next GetUsers call returns
+// an authoritative full user snapshot instead of 304.
+func (c *Client) ResetUserETag() {
+	c.etagMu.Lock()
+	c.userETag = ""
+	c.etagMu.Unlock()
 }
 
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
@@ -99,6 +115,7 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&hs); err != nil {
 		return nil, fmt.Errorf("decode handshake: %w", err)
 	}
+	c.setBatchCapability(hs.Capabilities)
 	return &hs, nil
 }
 
@@ -228,69 +245,105 @@ func (c *Client) userPath() string {
 	return "/api/v1/server/UniProxy/user"
 }
 
-// GetConfig fetches node configuration. Returns nil if not modified (304).
+// GetConfig fetches node configuration and commits its ETag immediately. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
-	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
+	cfg, etag, err := c.GetConfigWithETag()
+	if err == nil {
+		c.CommitConfigETag(etag)
+	}
+	return cfg, err
+}
+
+// GetConfigWithETag fetches node configuration and returns any new ETag without saving it yet.
+func (c *Client) GetConfigWithETag() (*NodeConfig, string, error) {
+	c.etagMu.Lock()
+	etag := c.configETag
+	c.etagMu.Unlock()
+
+	resp, err := c.doRequest("GET", c.configPath(), nil, etag)
 	if err != nil {
-		return nil, fmt.Errorf("get config: %w", err)
+		return nil, "", fmt.Errorf("get config: %w", err)
 	}
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode == http.StatusNotModified {
-		return nil, nil
+		return nil, "", nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, "", fmt.Errorf("GET %s: HTTP %d %s", c.configPath(), resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	var raw map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("decode raw config: %w", err)
+		return nil, "", fmt.Errorf("decode raw config: %w", err)
 	}
 
 	var cfg NodeConfig
 	// Use mapstructure for weak type conversion (string -> int, bool -> string, etc.)
 	if err := decodeWeakRaw(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("weak decode config: %w", err)
+		return nil, "", fmt.Errorf("weak decode config: %w", err)
 	}
 
 	// Basic validation
 	if cfg.Protocol == "" {
-		return nil, fmt.Errorf("invalid config: missing protocol")
+		return nil, "", fmt.Errorf("invalid config: missing protocol")
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.configETag = etag
-	}
-	return &cfg, nil
+	return &cfg, resp.Header.Get("ETag"), nil
 }
 
-// GetUsers fetches available users. Returns nil if not modified (304).
+// CommitConfigETag saves a config ETag after callers have processed the snapshot.
+func (c *Client) CommitConfigETag(etag string) {
+	if etag != "" {
+		c.etagMu.Lock()
+		c.configETag = etag
+		c.etagMu.Unlock()
+	}
+}
+
+// GetUsers fetches available users and commits their ETag immediately. Returns nil if not modified (304).
 func (c *Client) GetUsers() ([]User, error) {
-	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
+	users, etag, err := c.GetUsersWithETag()
+	if err == nil {
+		c.CommitUserETag(etag)
+	}
+	return users, err
+}
+
+// GetUsersWithETag fetches available users and returns any new ETag without saving it yet.
+func (c *Client) GetUsersWithETag() ([]User, string, error) {
+	c.etagMu.Lock()
+	etag := c.userETag
+	c.etagMu.Unlock()
+
+	resp, err := c.doRequest("GET", c.userPath(), nil, etag)
 	if err != nil {
-		return nil, fmt.Errorf("get users: %w", err)
+		return nil, "", fmt.Errorf("get users: %w", err)
 	}
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode == http.StatusNotModified {
-		return nil, nil
+		return nil, "", nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, "", fmt.Errorf("GET %s: HTTP %d %s", c.userPath(), resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	var usersResp UsersResponse
 	if err := json.NewDecoder(resp.Body).Decode(&usersResp); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+		return nil, "", fmt.Errorf("decode: %w", err)
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
+	return usersResp.Users, resp.Header.Get("ETag"), nil
+}
+
+// CommitUserETag saves a users ETag after callers have processed the snapshot.
+func (c *Client) CommitUserETag(etag string) {
+	if etag != "" {
+		c.etagMu.Lock()
 		c.userETag = etag
+		c.etagMu.Unlock()
 	}
-	return usersResp.Users, nil
 }
 
 // PushTraffic submits per-user traffic data
@@ -330,9 +383,14 @@ func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 
 // ResetETags clears cached ETags, forcing full responses
 func (c *Client) ResetETags() {
+	c.etagMu.Lock()
 	c.configETag = ""
 	c.userETag = ""
+	c.etagMu.Unlock()
 }
+
+// ErrMachineUnauthorized means the discovery endpoint explicitly rejected the machine.
+var ErrMachineUnauthorized = errors.New("machine authorization rejected")
 
 // GetMachineNodes fetches the list of active nodes bound to this machine.
 func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
@@ -342,6 +400,9 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 	}
 	defer drainAndClose(resp.Body)
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: status %d", ErrMachineUnauthorized, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("machine nodes status %d: %s", resp.StatusCode, body)
@@ -351,6 +412,15 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode machine nodes: %w", err)
 	}
+	if out.Nodes == nil {
+		return nil, errors.New("machine discovery response missing nodes array")
+	}
+	for _, node := range out.Nodes {
+		if node.ID <= 0 || node.Type == "" {
+			return nil, errors.New("machine discovery response contains invalid node")
+		}
+	}
+	c.setBatchCapability(out.Capabilities)
 	return &out, nil
 }
 
@@ -422,28 +492,30 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
 	}
-	c.apiSuccess.Add(1)
 	return nil
 }
 
 func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
-	fullURL := c.baseURL + path
+	return c.doRequestContext(context.Background(), method, path, body, ifNoneMatch)
+}
 
+func (c *Client) doRequestContext(ctx context.Context, method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
 	var bodyReader io.Reader
-	if method == "GET" {
-		fullURL += "?" + c.authQuery().Encode()
-	} else if body != nil {
+	if body != nil {
 		bodyReader = bytes.NewReader(body)
-	} else {
+	} else if method != http.MethodGet {
 		authOnly := make(map[string]interface{})
 		c.injectAuth(authOnly)
 		merged, _ := json.Marshal(authOnly)
 		bodyReader = bytes.NewReader(merged)
 	}
 
-	req, err := http.NewRequest(method, fullURL, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, safeRequestError(method, path, err)
+	}
+	if method == http.MethodGet {
+		req.URL.RawQuery = c.authQuery().Encode()
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -457,7 +529,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.apiFailure.Add(1)
-		return nil, err
+		return nil, safeRequestError(method, path, err)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
@@ -470,6 +542,27 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	return resp, nil
 }
 
+// net/http includes the authenticated URL in transport errors. A malformed
+// redirect can also quote its query inside the underlying error message.
+func safeRequestError(method, path string, err error) error {
+	var urlErr *url.Error
+	for errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	if before, _, found := strings.Cut(err.Error(), "?"); found {
+		err = &queryRedactedError{cause: err, message: before + " [query omitted]"}
+	}
+	return &url.Error{Op: method, URL: path, Err: err}
+}
+
+type queryRedactedError struct {
+	cause   error
+	message string
+}
+
+func (e *queryRedactedError) Error() string { return e.message }
+func (e *queryRedactedError) Unwrap() error { return e.cause }
+
 // drainAndClose reads any remaining bytes (up to 512B) and closes the body.
 // This allows the HTTP transport to reuse the underlying TCP connection.
 func drainAndClose(body io.ReadCloser) {
@@ -477,7 +570,7 @@ func drainAndClose(body io.ReadCloser) {
 	body.Close()
 }
 
-// APIMetrics holds aggregated API call statistics.
+// APIMetrics counts HTTP outcomes before individual endpoints validate their payloads.
 type APIMetrics struct {
 	Success uint64
 	Failure uint64

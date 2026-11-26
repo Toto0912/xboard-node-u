@@ -13,6 +13,29 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestWSMachineRevokedRequiresExplicitDenial(t *testing.T) {
+	for _, tt := range []struct {
+		machineID int
+		data      string
+		want      bool
+	}{
+		{1, `{"code":403}`, true},
+		{1, `{"code":401}`, true},
+		{1, `{"code":503}`, false},
+		{1, `{}`, false},
+		{0, `{"code":403}`, false},
+	} {
+		got := false
+		ws := NewWSClient("", "", 0, WSClientConfig{MachineID: tt.machineID}, func(event WSEvent) {
+			got = event.Type == WSEventMachineRevoked
+		}, nil, nil)
+		ws.handleMessage(wsMessage{Event: "machine.revoked", Data: json.RawMessage(tt.data)})
+		if got != tt.want {
+			t.Fatalf("machine=%d data=%s delivered=%v; expected %v", tt.machineID, tt.data, got, tt.want)
+		}
+	}
+}
+
 // fakeWSServer simulates a minimal Workerman-style WS server for testing.
 // It authenticates via token/node_id query params, sends auth.success, then
 // delivers the provided events and handles pongs until the client disconnects.
@@ -287,5 +310,30 @@ func TestWSClient_UserDeltaEvent(t *testing.T) {
 	}
 	if len(received[0].DeltaUsers) != 1 || received[0].DeltaUsers[0].ID != 42 {
 		t.Errorf("unexpected DeltaUsers: %+v", received[0].DeltaUsers)
+	}
+}
+
+func TestWSClient_SyncUsersEmptyArrayPreservedAndMissingIgnored(t *testing.T) {
+	var received []WSEvent
+	ws := NewWSClient("ws://127.0.0.1:1", "tok", 1, WSClientConfig{}, func(event WSEvent) {
+		received = append(received, event)
+	}, nil, nil)
+
+	// Missing "users" key must be ignored (must not wipe kernel users on malformed frame).
+	ws.handleMessage(wsMessage{Event: WSEventSyncUsers, Data: json.RawMessage(`{"timestamp":100}`)})
+	if len(received) != 0 {
+		t.Fatalf("expected malformed sync.users without users key to be ignored, got %d events", len(received))
+	}
+
+	// Explicit empty "users": [] must be delivered with non-nil slice so 1->0 clears users.
+	ws.handleMessage(wsMessage{Event: WSEventSyncUsers, Data: json.RawMessage(`{"users":[],"node_id":7}`)})
+	if len(received) != 1 {
+		t.Fatalf("expected 1 event for explicit empty users list, got %d", len(received))
+	}
+	if received[0].Users == nil || len(received[0].Users) != 0 {
+		t.Fatalf("expected non-nil empty Users slice, got %#v", received[0].Users)
+	}
+	if received[0].NodeID != 7 {
+		t.Fatalf("expected NodeID=7, got %d", received[0].NodeID)
 	}
 }

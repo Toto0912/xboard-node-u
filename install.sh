@@ -697,6 +697,7 @@ WorkingDirectory=${INSTALL_ROOT}
 EnvironmentFile=-${CREDENTIALS_FILE}
 ExecStart=${BINARY_PATH} -c ${CONFIG_FILE}
 ExecStopPost=${BINARY_PATH} --cleanup-port-hopping
+TimeoutStopSec=90
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576

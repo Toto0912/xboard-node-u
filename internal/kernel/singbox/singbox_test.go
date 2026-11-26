@@ -36,8 +36,6 @@ func TestSingBoxCapabilities(t *testing.T) {
 	}
 }
 
-
-
 type testConn struct {
 	closed bool
 	reads  [][]byte
@@ -60,11 +58,11 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error { c.closed = true; return nil }
-func (c *testConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) SetDeadline(time.Time) error { return nil }
-func (c *testConn) SetReadDeadline(time.Time) error { return nil }
+func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
 
 func testInboundContext(uuid, ip string) adapter.InboundContext {
@@ -168,9 +166,9 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
 	base := &testConn{}
 	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
-	tracked, ok := wrapped.(*trackedConn)
+	tracked, ok := wrapped.(*countedConn)
 	if !ok {
-		t.Fatalf("wrapped type = %T, want *trackedConn", wrapped)
+		t.Fatalf("wrapped type = %T, want *countedConn", wrapped)
 	}
 	if !tracker.CloseByID(tracked.connID) {
 		t.Fatal("CloseByID() = false, want true")

@@ -183,3 +183,45 @@ func TestNodeMailboxDeltaFailedApplyNotifies(t *testing.T) {
 		t.Fatal("expected NeedsReconcile for invalid delta action")
 	}
 }
+
+func TestNodeMailboxRemoveLastUserPreservesEmptySliceAndSyncBaseline(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}}, nil)
+	mb.MarkReady()
+	_ = mb.DrainIfReady()
+
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "remove",
+		DeltaUsers:  []model.UserSpec{{ID: 1}},
+	})
+
+	state := mb.DrainIfReady()
+	if !state.HasUsers {
+		t.Fatal("expected HasUsers=true after removing last user")
+	}
+	if state.Users == nil || len(state.Users) != 0 {
+		t.Fatalf("expected non-nil empty Users slice, got %#v", state.Users)
+	}
+
+	// Simulate missed WS remove followed by authoritative REST sync correcting baseline to empty:
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "add",
+		DeltaUsers:  []model.UserSpec{{ID: 2, UUID: "u2"}},
+	})
+	_ = mb.DrainIfReady()
+
+	// REST says user 2 was actually already removed:
+	mb.ArbitrateUsers([]model.UserSpec{})
+	// Next unrelated delta must NOT resurrect user 2:
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "add",
+		DeltaUsers:  []model.UserSpec{{ID: 3, UUID: "u3"}},
+	})
+	state = mb.DrainIfReady()
+	if !state.HasUsers || len(state.Users) != 1 || state.Users[0].ID != 3 {
+		t.Fatalf("expected only user 3 after SyncBaseline, got %#v", state.Users)
+	}
+}

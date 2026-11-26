@@ -25,10 +25,16 @@ func (s *StringOrArray) UnmarshalJSON(data []byte) error {
 	return fmt.Errorf("StringOrArray: expected string or []string, got %s", string(data))
 }
 
-// HandshakeResponse is the response from POST /api/v2/server/handshake
+// Capabilities lists explicitly negotiated billing features.
+type Capabilities struct {
+	TrafficBatchV1 *bool `json:"traffic_batch_v1"`
+}
+
+// HandshakeResponse is the response from POST /api/v2/server/handshake.
 type HandshakeResponse struct {
-	WebSocket WSConfig `json:"websocket"`
-	Settings  Settings `json:"settings"`
+	Capabilities Capabilities `json:"capabilities"`
+	WebSocket    WSConfig     `json:"websocket"`
+	Settings     Settings     `json:"settings"`
 }
 
 func (h *HandshakeResponse) UnmarshalJSON(data []byte) error {
@@ -72,8 +78,9 @@ type MachineNode struct {
 
 // MachineNodesResponse is the response from GET /api/v2/server/machine/nodes.
 type MachineNodesResponse struct {
-	Nodes      []MachineNode     `json:"nodes"`
-	BaseConfig MachineBaseConfig `json:"base_config"`
+	Capabilities Capabilities      `json:"capabilities"`
+	Nodes        []MachineNode     `json:"nodes"`
+	BaseConfig   MachineBaseConfig `json:"base_config"`
 }
 
 // MachineBaseConfig holds polling intervals for machine mode.

@@ -4,9 +4,12 @@ package machine
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -23,6 +26,16 @@ type nodeHandle struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	mailbox *controlplane.NodeMailbox
+	svc     *service.Service
+	// Protected by Orchestrator.mu. An ordinary WS config invalidates a probe
+	// already in flight. Repeated XHTTP hints share the pending probe.
+	ready       bool
+	checkKernel bool
+	configEpoch uint64
+	lastHint    [sha256.Size]byte
+	nextCheck   time.Time
+	// Only a failed replacement gets a single immediate sing-box recovery.
+	rollback *model.NodeSpec
 }
 
 // Orchestrator manages all nodes bound to a panel machine. It:
@@ -45,12 +58,17 @@ type Orchestrator struct {
 	kernels   map[int]config.KernelConfig
 
 	// Shared WS client (nil when WS is disabled).
-	ws       *panel.WSClient
-	wsCancel context.CancelFunc
+	ws            atomic.Pointer[panel.WSClient]
+	nextWSAttempt time.Time
+	wsCancel      context.CancelFunc
 
-	// runCtx is stored from Run() so that onWSEvent can trigger rediscover
-	// for sync.nodes events without blocking the main loop.
-	runCtx context.Context
+	// Discovery runs only in Run. WS callbacks invalidate any older snapshot
+	// under mu before waking the loop, including while a node is starting.
+	discoveryWake chan struct{}
+	generation    uint64
+	stopPending   bool
+	wsConnected   bool
+	initialized   bool
 
 	pullInterval time.Duration
 	pushInterval time.Duration
@@ -64,49 +82,46 @@ func New(cfg *config.Config) *Orchestrator {
 		MachineID: cfg.Machine.MachineID,
 	}
 	return &Orchestrator{
-		cfg:       cfg,
-		client:    panel.NewClient(panelCfg),
-		nodes:     make(map[int]*nodeHandle),
-		mailboxes: make(map[int]*controlplane.NodeMailbox),
-		statuses:  make(map[int]chan<- controlplane.StatusChange),
-		kernels:   make(map[int]config.KernelConfig),
+		cfg:           cfg,
+		client:        panel.NewClient(panelCfg),
+		nodes:         make(map[int]*nodeHandle),
+		mailboxes:     make(map[int]*controlplane.NodeMailbox),
+		statuses:      make(map[int]chan<- controlplane.StatusChange),
+		kernels:       make(map[int]config.KernelConfig),
+		discoveryWake: make(chan struct{}, 1),
 	}
 }
 
 // Run is the main loop. It blocks until ctx is cancelled.
 func (o *Orchestrator) Run(ctx context.Context) error {
-	o.runCtx = ctx
-	nodesResp, err := o.client.GetMachineNodes()
-	if err != nil {
-		return fmt.Errorf("initial node discovery: %w", err)
-	}
-
-	o.applyIntervals(nodesResp.BaseConfig)
-	nlog.Core().Info(fmt.Sprintf("machine %d: discovered %d nodes",
-		o.cfg.Machine.MachineID, len(nodesResp.Nodes)))
-
-	// Start machine-level WS as early as possible so sync.nodes can reach an
-	// empty machine before the first node is attached.
-	o.tryStartWS(ctx)
-
-	// Start initial nodes.
-	for _, n := range nodesResp.Nodes {
-		o.startNode(ctx, n)
-	}
-
+	o.applyIntervals(panel.MachineBaseConfig{})
 	discoveryTicker := time.NewTicker(o.pullInterval)
 	statusTicker := time.NewTicker(o.pushInterval)
 	defer discoveryTicker.Stop()
 	defer statusTicker.Stop()
 
+	discover := func() {
+		initialized := o.initialized
+		o.rediscover(ctx)
+		if !initialized && o.initialized {
+			discoveryTicker.Reset(o.pullInterval)
+			statusTicker.Reset(o.pushInterval)
+		}
+	}
+	discover()
 	for {
 		select {
 		case <-ctx.Done():
-			o.stopAll()
+			if o.wsCancel != nil {
+				o.wsCancel()
+			}
+			o.stopChildren()
 			return nil
 
 		case <-discoveryTicker.C:
-			o.rediscover(ctx)
+			discover()
+		case <-o.discoveryWake:
+			discover()
 
 		case <-statusTicker.C:
 			o.reportMachineStatus()
@@ -116,15 +131,31 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 // ─── Node lifecycle ──────────────────────────────────────────────────────
 
-func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
+func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode, generation uint64) {
+	o.launchNode(ctx, mn, generation, nil)
+}
+
+type kernelReplacement struct {
+	previous  *model.NodeSpec
+	confirmed [sha256.Size]byte
+}
+
+func (o *Orchestrator) launchNode(ctx context.Context, mn panel.MachineNode, generation uint64, replacement *kernelReplacement) {
 	o.mu.Lock()
+	if o.generation != generation || ctx.Err() != nil {
+		o.mu.Unlock()
+		return
+	}
+	var rollback *model.NodeSpec
 	if previous, exists := o.nodes[mn.ID]; exists {
 		select {
 		case <-previous.done:
 			previous.cancel()
+			rollback = previous.rollback
 			delete(o.nodes, mn.ID)
 		default:
 			o.mu.Unlock()
+			o.checkKernelSwitch(ctx, mn, generation, previous)
 			return
 		}
 	}
@@ -132,7 +163,13 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	nodeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	mb := controlplane.NewNodeMailbox()
-	o.nodes[mn.ID] = &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	h := &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	if rollback != nil {
+		h.nextCheck = time.Now().Add(o.pullInterval)
+		h.checkKernel = true
+		h.rollback = rollback
+	}
+	o.nodes[mn.ID] = h
 	o.mu.Unlock()
 
 	o.eventsMu.Lock()
@@ -146,12 +183,17 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	// Pre-fetch node config to detect transport-based kernel requirements.
 	// If the transport (e.g. xhttp) is incompatible with the configured kernel
 	// (e.g. singbox), auto-switch to the required kernel for this node.
-	if cfgSnapshot, err := perNodeClient.GetConfig(); err == nil && cfgSnapshot != nil {
-		if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
-			nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, transport=%s)",
-				mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
-			nodeCfg.Kernel.Type = resolved
+	var confirmed *[sha256.Size]byte
+	if replacement != nil {
+		nodeCfg.Kernel.Type = "xray"
+		h.rollback = replacement.previous
+		confirmed = &replacement.confirmed
+	} else if rollback == nil {
+		if cfgSnapshot, err := perNodeClient.GetConfig(); err == nil && cfgSnapshot != nil {
+			nodeCfg.Kernel.Type = model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type)
 		}
+	} else {
+		nlog.Core().Warn("machine: recovering previous sing-box config", "node_id", mn.ID)
 	}
 	// Reset cached ETag so the subsequent GetConfig in Initial() gets a full response.
 	o.eventsMu.Lock()
@@ -159,13 +201,8 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	o.eventsMu.Unlock()
 	perNodeClient.ResetConfigETag()
 
-	var push controlplane.PushClient
-	if o.ws != nil {
-		push = &machineNodePush{
-			nodeID: mn.ID,
-			ws:     o.ws,
-		}
-	}
+	// Children keep a stable adapter and mailbox even during REST-only startup.
+	push := &machineNodePush{nodeID: mn.ID, mux: &o.ws}
 
 	// The registerFn is called by MachinePanelControlPlane.Initial() to expose
 	// the node mailbox + status channel to the Service.
@@ -176,19 +213,131 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	}
 
 	cp := controlplane.NewMachinePanelControlPlane(perNodeClient, nodeCfg.Kernel, push, registerFn)
+	replacing := replacement != nil
+	cp.SetKernelHandoff(controlplane.MachineKernelHandoff{
+		Mismatch: func() { o.requestKernelCheck(nodeID, mb) },
+		Rollback: rollback, Confirmed: confirmed,
+		Applied: func() {
+			o.mu.Lock()
+			h.ready = true
+			h.rollback = nil
+			wake := h.checkKernel && !time.Now().Before(h.nextCheck)
+			o.mu.Unlock()
+			if wake {
+				o.wakeDiscovery()
+			}
+		},
+	})
 	svc := service.NewWithControlPlane(nodeCfg, cp)
+	h.svc = svc
 
 	nlog.Core().Info(fmt.Sprintf("machine: starting node %d (%s/%s)",
 		mn.ID, mn.Type, mn.Name))
 
 	go func() {
+		// Cleanup and close done before asking the main loop to recover.
+		if replacing {
+			defer func() {
+				if nodeCtx.Err() == nil {
+					o.wakeDiscovery()
+				}
+			}()
+		}
 		defer close(done)
 		defer o.unregisterNode(mn.ID)
+		if nodeCtx.Err() != nil {
+			return
+		}
 		if err := svc.Run(nodeCtx); err != nil {
 			nlog.Core().Error("machine node exited with error",
 				"node_id", mn.ID, "error", err)
 		}
 	}()
+}
+
+// requestKernelCheck is safe from the WS mux and the child's async poller.
+// Binding to the mailbox makes late hints from a stopped child harmless.
+func (o *Orchestrator) requestKernelCheck(nodeID int, mb *controlplane.NodeMailbox) {
+	o.noteKernelHint(nodeID, mb, nil)
+}
+
+func (o *Orchestrator) noteKernelHint(nodeID int, mb *controlplane.NodeMailbox, hint *panel.NodeConfig) {
+	var hash [sha256.Size]byte
+	if hint != nil {
+		hash = controlplane.MachineConfigDigest(hint)
+	}
+	o.mu.Lock()
+	h := o.nodes[nodeID]
+	wake := false
+	if h != nil && h.mailbox == mb {
+		wake = h.ready && !h.checkKernel && !time.Now().Before(h.nextCheck)
+		if hint != nil && h.lastHint != hash {
+			h.configEpoch++
+			h.lastHint = hash
+		}
+		h.checkKernel = true
+	}
+	o.mu.Unlock()
+	if wake {
+		o.wakeDiscovery()
+	}
+}
+
+func (o *Orchestrator) checkKernelSwitch(ctx context.Context, mn panel.MachineNode, generation uint64, h *nodeHandle) {
+	o.mu.Lock()
+	if !h.ready || !h.checkKernel || time.Now().Before(h.nextCheck) || o.generation != generation {
+		o.mu.Unlock()
+		return
+	}
+	epoch := h.configEpoch
+	h.nextCheck = time.Now().Add(o.pullInterval)
+	o.mu.Unlock()
+
+	// Use fresh ETags so a hint or a rejected candidate never confirms itself.
+	client := o.client.ForNode(mn.ID)
+	raw, _, err := client.GetConfigWithETag()
+	if err != nil || raw == nil {
+		nlog.Core().Warn("machine: kernel check could not confirm config", "node_id", mn.ID, "error", err)
+		return
+	}
+	if model.ResolveKernelForTransport(raw.Network, "singbox") != "xray" {
+		o.mu.Lock()
+		if h.configEpoch == epoch {
+			h.checkKernel = false
+		}
+		o.mu.Unlock()
+		return
+	}
+	cfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
+	cfg.Kernel.Type = "xray"
+	confirmed := controlplane.MachineConfigDigest(raw)
+	spec, err := model.NodeSpecFromPanelValidated(raw, cfg.Kernel)
+	if err == nil {
+		var users []panel.User
+		users, _, err = client.GetUsersWithETag()
+		if err == nil && users == nil {
+			err = fmt.Errorf("expected a full user list for kernel handoff")
+		}
+		if err == nil {
+			err = h.svc.ValidateXrayHandoff(cfg, spec, model.UserSpecsFromPanel(users))
+		}
+	}
+	if err != nil {
+		nlog.Core().Warn("machine: keeping existing kernel after preflight", "node_id", mn.ID, "error", err)
+		return
+	}
+	o.mu.Lock()
+	valid := o.nodes[mn.ID] == h && h.checkKernel && h.configEpoch == epoch && o.generation == generation && ctx.Err() == nil
+	if valid {
+		h.cancel()
+	}
+	o.mu.Unlock()
+	if !valid {
+		return
+	}
+	nlog.Core().Info("machine: switching child to Xray", "node_id", mn.ID, "transport", raw.Network)
+	o.stopNode(mn.ID)
+	o.launchNode(ctx, mn, generation, &kernelReplacement{previous: h.svc.StoppedConfig(), confirmed: confirmed})
 }
 
 func (o *Orchestrator) stopNode(nodeID int) {
@@ -216,7 +365,7 @@ func (o *Orchestrator) stopNode(nodeID int) {
 	o.mu.Unlock()
 }
 
-func (o *Orchestrator) stopAll() {
+func (o *Orchestrator) stopChildren() {
 	o.mu.Lock()
 	handles := make(map[int]*nodeHandle, len(o.nodes))
 	for id, h := range o.nodes {
@@ -231,21 +380,52 @@ func (o *Orchestrator) stopAll() {
 	for _, h := range handles {
 		<-h.done
 	}
-
-	if o.wsCancel != nil {
-		o.wsCancel()
+	o.mu.Lock()
+	for id, h := range handles {
+		if o.nodes[id] == h {
+			delete(o.nodes, id)
+		}
 	}
+	o.mu.Unlock()
 }
 
 // ─── Node discovery ──────────────────────────────────────────────────────
 
 func (o *Orchestrator) rediscover(ctx context.Context) {
+	o.mu.Lock()
+	generation, stop := o.generation, o.stopPending
+	o.stopPending = false
+	o.mu.Unlock()
+	if stop {
+		o.stopChildren()
+	}
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
+		if errors.Is(err, panel.ErrMachineUnauthorized) {
+			o.stopChildren()
+		}
 		nlog.Core().Warn("machine node discovery failed", "error", err)
 		return
 	}
 
+	o.mu.Lock()
+	stale := o.generation != generation
+	o.mu.Unlock()
+	if stale || ctx.Err() != nil {
+		return
+	}
+	if !o.initialized {
+		o.applyIntervals(nodesResp.BaseConfig)
+		o.initialized = true
+	}
+	if o.ws.Load() == nil && !time.Now().Before(o.nextWSAttempt) {
+		o.nextWSAttempt = time.Now().Add(o.pullInterval)
+		o.tryStartWS(ctx)
+	}
+	if len(nodesResp.Nodes) == 0 {
+		o.stopChildren()
+		return
+	}
 	wanted := make(map[int]panel.MachineNode, len(nodesResp.Nodes))
 	for _, n := range nodesResp.Nodes {
 		wanted[n.ID] = n
@@ -265,7 +445,7 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	}
 
 	for _, n := range nodesResp.Nodes {
-		o.startNode(ctx, n) // no-op if already running
+		o.startNode(ctx, n, generation) // no-op if already running
 	}
 }
 
@@ -305,7 +485,7 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		MachineID:        o.cfg.Machine.MachineID,
 	}
 
-	o.ws = panel.NewWSClient(
+	ws := panel.NewWSClient(
 		hs.WebSocket.WSURL,
 		o.cfg.Machine.Token,
 		0, // no single node_id
@@ -317,7 +497,8 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 
 	wsCtx, wsCancel := context.WithCancel(ctx)
 	o.wsCancel = wsCancel
-	go o.ws.Run(wsCtx)
+	o.ws.Store(ws)
+	go ws.Run(wsCtx)
 
 	nlog.Core().Info("machine: ws mux started")
 }
@@ -325,10 +506,8 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 // onWSEvent routes a WS event to the correct node's channel.
 // sync.nodes is a machine-level event that triggers immediate rediscovery.
 func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
-	// sync.nodes is a machine-level event, not per-node
-	if event.Type == panel.WSEventSyncNodes {
-		nlog.Core().Info("machine received sync.nodes, triggering immediate rediscovery")
-		go o.rediscover(o.runCtx)
+	if event.Type == panel.WSEventSyncNodes || event.Type == panel.WSEventMachineRevoked {
+		o.requestDiscovery(event.Type == panel.WSEventMachineRevoked)
 		return
 	}
 
@@ -346,6 +525,18 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 		// The initial REST snapshot covers events before kernel selection finishes.
 		return
 	}
+	if event.Type == panel.WSEventSyncConfig && event.Config != nil && kcfg.Type == "singbox" {
+		if model.ResolveKernelForTransport(event.Config.Network, kcfg.Type) != kcfg.Type {
+			o.noteKernelHint(nodeID, mailbox, event.Config)
+			return
+		}
+		o.mu.Lock()
+		if h := o.nodes[nodeID]; h != nil && h.mailbox == mailbox {
+			h.configEpoch++
+			h.checkKernel = false
+		}
+		o.mu.Unlock()
+	}
 	translated, err := controlplane.TranslateWSEvent(event, kcfg)
 	if err != nil {
 		nlog.Core().Warn("machine ws event translation failed",
@@ -353,29 +544,58 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 		return
 	}
 
-	if !ok {
-		nlog.Core().Debug("machine ws event for unknown node", "node_id", nodeID, "type", event.Type)
-		return
-	}
 	mailbox.Apply(translated)
+}
+
+func (o *Orchestrator) requestDiscovery(revoked bool) {
+	o.mu.Lock()
+	o.generation++
+	if revoked {
+		o.stopPending = true
+		for _, h := range o.nodes {
+			h.cancel()
+		}
+	}
+	o.mu.Unlock()
+	o.wakeDiscovery()
+}
+
+func (o *Orchestrator) wakeDiscovery() {
+	select {
+	case o.discoveryWake <- struct{}{}:
+	default:
+	}
 }
 
 // onWSStatus broadcasts WS connectivity changes to all registered nodes.
 func (o *Orchestrator) onWSStatus(status panel.WSStatusChange) {
+	o.eventsMu.Lock()
+	lostConnection := o.wsConnected && !status.Connected
+	o.wsConnected = status.Connected
 	change := controlplane.StatusChange{Connected: status.Connected}
-	o.eventsMu.RLock()
-	defer o.eventsMu.RUnlock()
 	for _, ch := range o.statuses {
 		select {
 		case ch <- change:
 		default:
 		}
 	}
+	o.eventsMu.Unlock()
+	if lostConnection {
+		// Older panels may close the socket without an explicit revocation.
+		o.requestDiscovery(false)
+	}
 }
 
 func (o *Orchestrator) registerNode(nodeID int, st chan<- controlplane.StatusChange) {
 	o.eventsMu.Lock()
 	o.statuses[nodeID] = st
+	if o.wsConnected {
+		// A socket can connect while the child is fetching its initial snapshot.
+		select {
+		case st <- controlplane.StatusChange{Connected: true}:
+		default:
+		}
+	}
 	o.eventsMu.Unlock()
 }
 
@@ -406,7 +626,7 @@ func (o *Orchestrator) applyIntervals(bc panel.MachineBaseConfig) {
 // connectivity status and send capabilities.
 type machineNodePush struct {
 	nodeID int
-	ws     *panel.WSClient
+	mux    *atomic.Pointer[panel.WSClient]
 }
 
 func (p *machineNodePush) Run(ctx context.Context) {
@@ -415,11 +635,15 @@ func (p *machineNodePush) Run(ctx context.Context) {
 }
 
 func (p *machineNodePush) IsConnected() bool {
-	return p.ws != nil && p.ws.IsConnected()
+	ws := p.mux.Load()
+	return ws != nil && ws.IsConnected()
 }
 
+func (p *machineNodePush) IsEnabled() bool { return p.mux.Load() != nil }
+
 func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
-	if p.ws == nil {
+	ws := p.mux.Load()
+	if ws == nil {
 		return
 	}
 	payload := map[string]interface{}{
@@ -432,5 +656,5 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 	}
 	payload["devices"] = strDevices
 	data, _ := json.Marshal(payload)
-	p.ws.SendRaw(panel.WSEventReportDevices, data)
+	ws.SendRaw(panel.WSEventReportDevices, data)
 }

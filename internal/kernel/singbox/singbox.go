@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	N "github.com/sagernet/sing/common/network"
+	"io"
 	"sync"
 
 	box "github.com/sagernet/sing-box"
@@ -42,6 +44,7 @@ type SingBox struct {
 	// Created fresh on every Start (full restart).
 	// Survives Reload (hot-swap) since live connections persist.
 	connTracker *ConnTracker
+	sessions    *kernel.SessionDrain
 
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	// Set once by SetSpeedLimitFunc and forwarded to every new ConnTracker.
@@ -173,7 +176,11 @@ func (s *SingBox) reloadLocked(nodeConfig *model.NodeSpec, users []model.UserSpe
 	oldNode, oldUsers, oldTLS := s.nodeConfig, s.users, s.tls
 	s.stop()
 	if err := s.startLocked(nodeConfig, users, tls); err != nil {
-		if rollbackErr := s.startLocked(oldNode, oldUsers, oldTLS); rollbackErr != nil {
+		allowed := model.IntersectUsers(oldUsers, users)
+		if len(allowed) == 0 {
+			return err
+		}
+		if rollbackErr := s.startLocked(oldNode, allowed, oldTLS); rollbackErr != nil {
 			return fmt.Errorf("reload: %v; restore previous config: %w", err, rollbackErr)
 		}
 		return err
@@ -193,9 +200,28 @@ func (s *SingBox) registerTracker(ctx context.Context) {
 		return
 	}
 	if s.connTracker != nil {
-		router.AppendTracker(s.connTracker)
+		s.sessions = new(kernel.SessionDrain)
+		router.AppendTracker(&scopedTracker{s.connTracker, s.sessions})
 	}
 	s.trackerRegistered = true
+}
+
+type scopedTracker struct {
+	*ConnTracker
+	sessions *kernel.SessionDrain
+}
+
+func (t *scopedTracker) TrackSession(conn io.Closer, onClose N.CloseHandlerFunc) (N.CloseHandlerFunc, bool) {
+	finish, ok := t.sessions.Begin(func() { _ = conn.Close() })
+	if !ok {
+		return nil, false
+	}
+	return N.OnceClose(func(err error) {
+		defer finish()
+		if onClose != nil {
+			onClose(err)
+		}
+	}), true
 }
 
 func (s *SingBox) Stop() {
@@ -209,12 +235,15 @@ func (s *SingBox) stop() {
 		return
 	}
 
-	s.box.Close()
-	s.box = nil
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
 	}
+	if !s.sessions.CloseAndWait() {
+		nlog.Core().Warn("sing-box: session drain timed out; reporting available counters")
+	}
+	s.box.Close()
+	s.box = nil
 	s.ctx = nil
 }
 

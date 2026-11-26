@@ -144,8 +144,8 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 				case sig = <-sigCh:
 					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
 					os.Exit(1)
-				case <-time.After(15 * time.Second):
-					nlog.Core().Error("shutdown timed out after 15s, forcing exit")
+				case <-time.After(service.FinalReportTimeout + 15*time.Second):
+					nlog.Core().Error("shutdown grace period expired, forcing exit")
 					os.Exit(2)
 				}
 			case <-ctx.Done():
@@ -170,7 +170,14 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			startHealth(instances[0].HealthPort)
 		}
 
-		errCh := make(chan error, len(instances))
+		var firstErr error
+		var failOnce sync.Once
+		stopWithError := func(err error) {
+			failOnce.Do(func() {
+				firstErr = err
+				cancel()
+			})
+		}
 		doneCh := make(chan struct{})
 		var wg sync.WaitGroup
 		for _, instanceCfg := range instances {
@@ -183,8 +190,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 					orch := machine.New(instanceCfg)
 					if err := orch.Run(ctx); err != nil {
 						nlog.Core().Error("machine instance exited with error", "instance", instanceCfg.InstanceID, "error", err)
-						errCh <- err
-						cancel()
+						stopWithError(err)
 					}
 					return
 				}
@@ -210,8 +216,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 						svc := service.New(nodeCfg)
 						if err := svc.Run(ctx); err != nil {
 							nlog.Core().Error("node service exited with error", "instance", nodeCfg.InstanceID, "node_id", nodeCfg.Panel.NodeID, "error", err)
-							errCh <- err
-							cancel()
+							stopWithError(err)
 						}
 					}(idx)
 				}
@@ -235,8 +240,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}
 
 		if newRoot == nil {
-			close(errCh)
-			if err := <-errCh; err != nil {
+			if firstErr != nil {
 				os.Exit(1)
 			}
 			nlog.Core().Info("stopped")

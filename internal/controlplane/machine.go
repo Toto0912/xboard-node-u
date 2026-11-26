@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -20,6 +22,7 @@ type MachinePanelControlPlane struct {
 	push   PushClient // virtual push client from WS mux (may be nil)
 
 	registerFn func(statuses chan<- StatusChange) *NodeMailbox
+	handoff    MachineKernelHandoff
 }
 
 // NewMachinePanelControlPlane creates a per-node control plane for machine mode.
@@ -40,10 +43,29 @@ func NewMachinePanelControlPlane(
 	}
 }
 
+// MachineKernelHandoff carries one child generation's transition hooks.
+type MachineKernelHandoff struct {
+	Mismatch  func()
+	Rollback  *model.NodeSpec
+	Confirmed *[sha256.Size]byte
+	Applied   func()
+}
+
+// MachineConfigDigest identifies the decoded panel descriptor independent of map order and ETags.
+func MachineConfigDigest(cfg *panel.NodeConfig) [sha256.Size]byte {
+	data, _ := json.Marshal(cfg) // The descriptor came from a JSON payload.
+	return sha256.Sum256(data)
+}
+
+// SetKernelHandoff configures the machine lifecycle callbacks before the service starts.
+func (p *MachinePanelControlPlane) SetKernelHandoff(h MachineKernelHandoff) { p.handoff = h }
+
 func (p *MachinePanelControlPlane) SupportsPolling() bool       { return true }
 func (p *MachinePanelControlPlane) SupportsDiscovery() bool     { return false }
 func (p *MachinePanelControlPlane) SupportsReporting() bool     { return true }
 func (p *MachinePanelControlPlane) SupportsDeviceReports() bool { return p.push != nil }
+func (p *MachinePanelControlPlane) ResetConfigETag()            { p.client.ResetConfigETag() }
+func (p *MachinePanelControlPlane) ResetUserETag()              { p.client.ResetUserETag() }
 
 func (p *MachinePanelControlPlane) Initial(
 	ctx context.Context,
@@ -65,21 +87,49 @@ func (p *MachinePanelControlPlane) Initial(
 		bootstrap.PullInterval = hs.Settings.PullInterval
 	}
 
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config: %w", err)
 	}
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config is nil")
 	}
-	users, err := p.client.GetUsers()
+	if expected := p.handoff.Confirmed; expected != nil && *expected != MachineConfigDigest(configSnapshot) {
+		return Bootstrap{}, fmt.Errorf("machine kernel handoff config changed since preflight")
+	}
+	users, userETag, err := p.client.GetUsersWithETag()
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial users: %w", err)
 	}
-	bootstrap.Config, err = model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
+	if users == nil && (p.handoff.Confirmed != nil || p.handoff.Rollback != nil) {
+		return Bootstrap{}, fmt.Errorf("machine handoff requires a full user list")
+	}
+	if p.handoff.Rollback != nil && model.ResolveKernelForTransport(configSnapshot.Network, p.kcfg.Type) != p.kcfg.Type {
+		// Use the old descriptor with the newly authorized users. Leave the panel
+		// config unacknowledged so the next poll can retry the handoff.
+		bootstrap.Config = p.handoff.Rollback
+		cfgETag = ""
+	} else {
+		bootstrap.Config, err = model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
+	}
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config normalize: %w", err)
 	}
+	if bootstrap.PushInterval == 0 && configSnapshot.BaseConfig.PushInterval > 0 {
+		bootstrap.PushInterval = configSnapshot.BaseConfig.PushInterval
+	}
+	if bootstrap.PullInterval == 0 && configSnapshot.BaseConfig.PullInterval > 0 {
+		bootstrap.PullInterval = configSnapshot.BaseConfig.PullInterval
+	}
+	bootstrap.CommitConfig = func() {
+		p.client.CommitConfigETag(cfgETag)
+		p.handoff.Rollback = nil
+		p.handoff.Confirmed = nil
+		if p.handoff.Applied != nil {
+			p.handoff.Applied()
+		}
+	}
+	bootstrap.CommitUsers = func() { p.client.CommitUserETag(userETag) }
 	bootstrap.Users = model.UserSpecsFromPanel(users)
 
 	// Register mailbox access after the initial snapshot is prepared, so the
@@ -96,11 +146,17 @@ func (p *MachinePanelControlPlane) Initial(
 }
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, cfgETag, err := p.client.GetConfigWithETag()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
 	}
-	users, err := p.client.GetUsers()
+	// Process user revocations even while the new transport is incompatible.
+	if ctx.Err() == nil && configSnapshot != nil && p.handoff.Mismatch != nil &&
+		model.ResolveKernelForTransport(configSnapshot.Network, p.kcfg.Type) != p.kcfg.Type {
+		p.handoff.Mismatch()
+		configSnapshot, cfgETag = nil, ""
+	}
+	users, userETag, err := p.client.GetUsersWithETag()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
 	}
@@ -113,7 +169,12 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return Snapshot{
+		Config:       nodeSpec,
+		Users:        model.UserSpecsFromPanel(users),
+		CommitConfig: func() { p.client.CommitConfigETag(cfgETag) },
+		CommitUsers:  func() { p.client.CommitUserETag(userETag) },
+	}, nil
 }
 
 func (p *MachinePanelControlPlane) Discover(
@@ -124,6 +185,8 @@ func (p *MachinePanelControlPlane) Discover(
 ) (PushClient, error) {
 	return nil, nil
 }
+
+func (p *MachinePanelControlPlane) BatchClient() *panel.Client { return p.client }
 
 func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
 	return p.client.Report(

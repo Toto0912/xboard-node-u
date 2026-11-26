@@ -41,8 +41,8 @@ func TestDiscoveryRetriesExitedNodesWithoutReplacingHealthyNodes(t *testing.T) {
 	old := &nodeHandle{done: done, cancel: func() { canceled = true }}
 	o.nodes[7] = old
 	ctx, cancel := context.WithCancel(context.Background())
+	o.startNode(ctx, panel.MachineNode{ID: 7, Type: "vless"}, 0)
 	cancel()
-	o.startNode(ctx, panel.MachineNode{ID: 7, Type: "vless"})
 	o.mu.Lock()
 	fresh := o.nodes[7]
 	o.mu.Unlock()
@@ -57,7 +57,7 @@ func TestDiscoveryRetriesExitedNodesWithoutReplacingHealthyNodes(t *testing.T) {
 	live := &nodeHandle{done: make(chan struct{}), cancel: func() {}}
 	o.nodes[8] = live
 	before := calls.Load()
-	o.startNode(ctx, panel.MachineNode{ID: 8, Type: "vless"})
+	o.startNode(context.Background(), panel.MachineNode{ID: 8, Type: "vless"}, 0)
 	if o.nodes[8] != live || calls.Load() != before {
 		t.Fatal("healthy node was restarted")
 	}
@@ -73,7 +73,7 @@ func TestStopKeepsGenerationReservedUntilCleanupFinishes(t *testing.T) {
 	stopped := make(chan struct{})
 	go func() { o.stopNode(9); close(stopped) }()
 	<-entered
-	o.startNode(context.Background(), panel.MachineNode{ID: 9, Type: "vless"})
+	o.startNode(context.Background(), panel.MachineNode{ID: 9, Type: "vless"}, 0)
 	o.mu.Lock()
 	kept := o.nodes[9] == h
 	o.mu.Unlock()

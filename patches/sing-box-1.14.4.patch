@@ -1565,3 +1565,56 @@ diff --git a/protocol/hysteria2/inbound.go b/protocol/hysteria2/inbound.go
  				}
  				w.Write([]byte(options.Masquerade.StringOptions.Content))
  			})
+diff --git a/route/route.go b/route/route.go
+--- a/route/route.go
++++ b/route/route.go
+@@ -162,6 +162,15 @@
+ 	metadata.RouteOutbound = selectedOutbound.Tag()
+ 	metadata.OutboundChain = chain
+ 	for _, tracker := range r.trackers {
++		if lifetime, ok := tracker.(interface {
++			TrackSession(io.Closer, N.CloseHandlerFunc) (N.CloseHandlerFunc, bool)
++		}); ok {
++			var accepted bool
++			onClose, accepted = lifetime.TrackSession(conn, onClose)
++			if !accepted {
++				return net.ErrClosed
++			}
++		}
+ 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
+ 	}
+ 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
+@@ -328,6 +337,15 @@
+ 	metadata.RouteOutbound = selectedOutbound.Tag()
+ 	metadata.OutboundChain = chain
+ 	for _, tracker := range r.trackers {
++		if lifetime, ok := tracker.(interface {
++			TrackSession(io.Closer, N.CloseHandlerFunc) (N.CloseHandlerFunc, bool)
++		}); ok {
++			var accepted bool
++			onClose, accepted = lifetime.TrackSession(conn, onClose)
++			if !accepted {
++				return net.ErrClosed
++			}
++		}
+ 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
+ 	}
+ 	if metadata.FakeIP {
+diff --git a/route/conn.go b/route/conn.go
+--- a/route/conn.go
++++ b/route/conn.go
+@@ -408,10 +408,10 @@
+ 			m.logger.DebugContext(ctx, "packet download closed: ", err)
+ 		}
+ 	}
+-	if !done.Swap(true) {
+-		if onClose != nil {
+-			onClose(err)
+-		}
++	// The first copy closes both endpoints to unblock its peer. Notify the
++	// session owner only after both copies have finished counting their bytes.
++	if done.Swap(true) && onClose != nil {
++		onClose(err)
+ 	}
+ 	common.Close(source, destination)
+ }
