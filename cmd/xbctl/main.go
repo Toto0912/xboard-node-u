@@ -748,6 +748,9 @@ func normalizeRootInstances(root *config.RootConfig) []config.Config {
 }
 
 func instanceMode(inst config.Config) string {
+	if inst.IsStandalone() {
+		return "standalone"
+	}
 	if inst.IsMachineMode() {
 		return "machine"
 	}
@@ -774,8 +777,8 @@ func collectRowsFromMeta() ([]instanceRow, error) {
 		rows = append(rows, instanceRow{
 			ID:      inst.ID,
 			Mode:    inst.Mode,
-			Panel:   inst.PanelURL,
-			Target:  formatTarget(inst.NodeID, inst.MachineID),
+			Panel:   formatPanel(inst.Mode, inst.PanelURL),
+			Target:  formatTargetForMode(inst.Mode, inst.NodeID, inst.MachineID),
 			Service: serviceStatus,
 			Health:  healthStatus,
 		})
@@ -797,15 +800,12 @@ func collectRowsFromConfig() ([]instanceRow, error) {
 	healthStatus := healthStatus()
 	rows := make([]instanceRow, 0, len(instances))
 	for _, inst := range instances {
-		mode := "node"
-		if inst.IsMachineMode() {
-			mode = "machine"
-		}
+		mode := instanceMode(*inst)
 		rows = append(rows, instanceRow{
 			ID:      inst.InstanceID,
 			Mode:    mode,
-			Panel:   inst.Panel.URL,
-			Target:  formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(inst)),
+			Panel:   formatPanel(mode, inst.Panel.URL),
+			Target:  formatTargetForMode(mode, intPtr(inst.Panel.NodeID), machineIDPtr(inst)),
 			Service: serviceStatus,
 			Health:  healthStatus,
 		})
@@ -854,6 +854,20 @@ func instanceAwareHealth() string {
 		return "ok"
 	}
 	return "down"
+}
+
+func formatPanel(mode, panelURL string) string {
+	if mode == "standalone" && panelURL == "" {
+		return "-"
+	}
+	return panelURL
+}
+
+func formatTargetForMode(mode string, nodeID *int, machineID *int) string {
+	if mode == "standalone" {
+		return "local"
+	}
+	return formatTarget(nodeID, machineID)
 }
 
 func formatTarget(nodeID *int, machineID *int) string {
@@ -1230,8 +1244,12 @@ func installMetaBytes(root *config.RootConfig, ver, latestID string) ([]byte, er
 			MachineID:  machineIDPtr(&inst),
 			HealthPort: inst.HealthPort,
 		}
-		if item.Mode == "machine" {
+		if item.Mode == "machine" || item.Mode == "standalone" {
 			item.NodeID = nil
+		}
+		if item.Mode == "standalone" {
+			item.PanelURL = ""
+			item.MachineID = nil
 		}
 		items = append(items, item)
 	}

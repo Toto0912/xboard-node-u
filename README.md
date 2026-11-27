@@ -77,7 +77,7 @@ OpenRC 的升级备份保存在 `/etc/xboard-node/backups/alpine-*/`，直接运
 
 ## 无面板独立运行（裸核运行）
 
-从本地配置读取节点和用户，无需连接面板。配置替换、客户端参数及与机器模式共存的写法见 [独立运行指南](docs/STANDALONE.md)。
+从本地配置读取节点和用户，无需连接面板。执行 `install.sh --interactive` 或 `install-alpine.sh --interactive` 时可直接选择 **3) 无面板裸核运行**（或传入 `--mode standalone`）；安装器会直接安装程序并将 [SS 独立节点示例](examples/standalone.yml.example) 写入 `/etc/xboard-node/config.yml`（暂不启动服务）。手动编辑配置并替换密码/协议后，执行 `xbctl enable && xbctl start` 即可运行。配置示例、客户端参数及与机器模式共存的写法见 [独立运行指南](docs/STANDALONE.md)。
 
 ## 自定义路由与出站
 

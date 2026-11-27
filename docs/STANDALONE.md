@@ -6,9 +6,9 @@
 
 ## 单独运行一个节点
 
-以下步骤适用于已经安装 xboard-node-u 和后台服务的服务器；安装向导本身只提供机器模式和面板单节点模式。
+首次安装时，可在 `install.sh --interactive` 或 `install-alpine.sh --interactive` 安装向导中选择 **3) 无面板裸核运行**（或直接传入 `--mode standalone`）。安装器会直接安装程序与系统服务，并将 [SS 独立节点示例](../examples/standalone.yml.example) 写入 `/etc/xboard-node/config.yml`，此时服务**暂不启动，也未开启开机自启**。
 
-选择一个完整示例，将内容复制到 `/etc/xboard-node/config.yml`，替换占位参数后保存：
+请手动编辑 `/etc/xboard-node/config.yml`（务必修改默认密码和端口，或将文件内容替换为下方所需协议的完整示例）后保存：
 
 | 协议 | 配置示例 | 需要修改 | 放行端口 |
 | --- | --- | --- | --- |
@@ -20,10 +20,10 @@
 
 SS、Reality 和 HY2 示例使用 sing-box，TLS 回落和 Reality 原生回落示例使用 Xray。配置只保留所选示例，不要把多个完整示例直接拼接在文件最外层。示例监听所有 IPv4 接口，客户端填写服务器公网 IP 或域名。
 
-以 root 执行：
+以 root 执行（首次启用并启动服务；已有运行中服务修改配置后改为 `xbctl restart`）：
 
 ```sh
-xbctl restart
+xbctl enable && xbctl start
 xbctl log
 ```
 

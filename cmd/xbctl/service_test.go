@@ -148,3 +148,54 @@ func TestMetadataPreservesConfigAndInlineTokens(t *testing.T) {
 		}
 	}
 }
+
+func TestStandaloneMetadataDeploymentAndBindingCoexistence(t *testing.T) {
+	example, err := os.ReadFile(filepath.Join("..", "..", "examples", "standalone.yml.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yml")
+	credPath := filepath.Join(dir, "credentials.env")
+	metaPath := filepath.Join(dir, "install-meta.json")
+	if err := os.WriteFile(cfgPath, example, 0600); err != nil {
+		t.Fatal(err)
+	}
+	port, err := deploymentPort(cfgPath, credPath, dir, cfgPath)
+	if err != nil || port != 0 {
+		t.Fatalf("deploymentPort = (%d, %v), want (0, nil)", port, err)
+	}
+	if err := runConfigMetadata([]string{"--config", cfgPath, "--meta", metaPath, "--version", "v2.4.3"}); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := loadInstallMeta(metaPath)
+	if err != nil || meta.InstanceCount != 1 || len(meta.Instances) != 1 {
+		t.Fatalf("meta = %+v, err = %v", meta, err)
+	}
+	inst := meta.Instances[0]
+	if inst.Mode != "standalone" || inst.PanelURL != "" || inst.NodeID != nil || inst.MachineID != nil {
+		t.Fatalf("unexpected standalone summary: %+v", inst)
+	}
+	if got := formatPanel(inst.Mode, inst.PanelURL); got != "-" {
+		t.Fatalf("formatPanel = %q, want -", got)
+	}
+	if got := formatTargetForMode(inst.Mode, inst.NodeID, inst.MachineID); got != "local" {
+		t.Fatalf("formatTargetForMode = %q, want local", got)
+	}
+	// Adding a panel binding later must preserve the standalone instance.
+	if err := runConfigInit([]string{
+		"--config", cfgPath, "--output", cfgPath,
+		"--credentials-in", credPath, "--credentials-out", credPath,
+		"--meta", metaPath, "--mode", "node",
+		"--panel-url", "https://panel.invalid", "--node-id", "5", "--token", "secret-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = loadInstallMeta(metaPath)
+	if err != nil || meta.InstanceCount != 2 {
+		t.Fatalf("after bind: meta = %+v, err = %v", meta, err)
+	}
+	if meta.Instances[0].Mode != "standalone" || meta.Instances[1].Mode != "node" {
+		t.Fatalf("unexpected modes after coexistence bind: %+v", meta.Instances)
+	}
+}

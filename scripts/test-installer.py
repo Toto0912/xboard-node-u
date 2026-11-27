@@ -81,7 +81,8 @@ def wizard_case(answers, expected, secret):
         assert next_answer == len(answers), transcript.decode(errors="replace")
         text = transcript.decode()
         assert expected in text, text
-        assert secret not in text, "The terminal echoed the hidden token"
+        if secret:
+            assert secret not in text, "The terminal echoed the hidden token"
     finally:
         if status is None:
             os.kill(child, signal.SIGKILL)
@@ -106,6 +107,103 @@ wizard_case(
      ("机器 ID", "0"), ("机器 ID", "9"), ("机器令牌", "retry-test-secret")],
     "RESULT|machine|xray|https://panel.example.com|9||17", "retry-test-secret",
 )
+wizard_case(
+    [("部署模式", "3")],
+    "RESULT|standalone|singbox||||0", "",
+)
+wizard_case(
+    [("部署模式", "wrong"), ("部署模式", "standalone")],
+    "RESULT|standalone|singbox||||0", "",
+)
+
+def standalone_install_checks():
+    example = (INSTALLER.parent / "examples" / "standalone.yml.example").read_text()
+    harness = r'''
+source "$INSTALLER"
+INSTALL_ROOT="$FIXTURE/etc"
+BACKUP_DIR="$INSTALL_ROOT/backups"
+INSTALL_META="$INSTALL_ROOT/install-meta.json"
+CONFIG_FILE="$INSTALL_ROOT/config.yml"
+CREDENTIALS_FILE="$INSTALL_ROOT/credentials.env"
+BINARY_PATH="$FIXTURE/bin/xboard-node"
+CLI_PATH="$FIXTURE/bin/xbctl"
+SERVICE_PATH="$FIXTURE/systemd/xboard-node.service"
+INSTALLER_COPY_PATH="$INSTALL_ROOT/install.sh"
+mkdir -p "$FIXTURE/bin" "$FIXTURE/systemd"
+lock_installation() { :; }
+ensure_cli_link() { :; }
+stage_release() {
+    printf '#!/bin/sh\necho "xboard-node v2.4.3"\n' > "$TMP_DIR/xboard-node"
+    cat > "$TMP_DIR/xbctl" <<'EOF'
+#!/bin/sh
+if [ "$1" = config ] && [ "$2" = metadata ]; then
+    out=""
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --meta ]; then out=$2; shift; fi
+        shift
+    done
+    printf '{"config_mode":"instances","version":"v2.4.3","instance_count":1,"instances":[{"mode":"standalone"}]}\n' > "$out"
+    exit 0
+fi
+if [ "$1" = config ] && [ "$2" = deployment-port ]; then
+    echo 0
+    exit 0
+fi
+echo "xbctl v2.4.3"
+EOF
+    chmod 755 "$TMP_DIR/xboard-node" "$TMP_DIR/xbctl"
+    RELEASE_VERSION=v2.4.3
+}
+systemctl() {
+    echo "$*" >> "$FIXTURE/systemctl.log"
+    case "$1" in
+        show) echo inactive ;;
+        is-enabled|is-active) return 1 ;;
+        daemon-reload|disable|stop) return 0 ;;
+        *) echo "unexpected systemctl $*" >&2; return 1 ;;
+    esac
+}
+MODE=standalone
+MODE_GIVEN=1
+if [ "$CASE" = conflict ]; then
+    PANEL_URL="https://panel.example.com"
+elif [ "$CASE" = force ]; then
+    FORCE_RECONFIGURE=1
+fi
+perform_install
+'''
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        env = {**os.environ, "INSTALLER": str(INSTALLER), "FIXTURE": tmp, "CASE": "fresh"}
+        p = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True)
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        assert (root / "etc" / "config.yml").read_text() == example
+        assert not (root / "etc" / "credentials.env").exists()
+        assert (root / "bin" / "xboard-node").is_file() and (root / "bin" / "xbctl").is_file()
+        assert (root / "systemd" / "xboard-node.service").is_file()
+        calls = (root / "systemctl.log").read_text().splitlines()
+        assert any(c.startswith("disable ") for c in calls), calls
+        assert not any(c.startswith(("enable ", "start ", "restart ")) for c in calls), calls
+        assert "https://github.com/Toto0912/xboard-node-u/blob/main/docs/STANDALONE.md" in p.stdout, p.stdout
+        assert "xbctl enable && xbctl start" in p.stdout, p.stdout
+
+        # Existing config is preserved unless --force-reconfigure is set.
+        (root / "etc" / "config.yml").write_text("# custom\n")
+        p_keep = subprocess.run(["bash", "-c", harness], env={**env, "CASE": "existing"}, capture_output=True, text=True)
+        assert p_keep.returncode != 0, (p_keep.stdout, p_keep.stderr)
+        assert (root / "etc" / "config.yml").read_text() == "# custom\n"
+
+        # --force-reconfigure overwrites with backup.
+        p_force = subprocess.run(["bash", "-c", harness], env={**env, "CASE": "force"}, capture_output=True, text=True)
+        assert p_force.returncode == 0, (p_force.stdout, p_force.stderr)
+        assert (root / "etc" / "config.yml").read_text() == example
+
+        # Conflicting panel arguments are rejected.
+        p_bad = subprocess.run(["bash", "-c", harness], env={**env, "CASE": "conflict"}, capture_output=True, text=True)
+        assert p_bad.returncode != 0, (p_bad.stdout, p_bad.stderr)
+
+
+standalone_install_checks()
 
 def staged_release(scenario, repository=None):
     with tempfile.TemporaryDirectory() as temp:
@@ -286,4 +384,4 @@ perform_upgrade
 for change in ("config", "metadata", "state"):
     legacy_rebind_during_stage(change)
 
-print("Installer tests passed: piped interactive machine/node setup, hidden tokens, input retries and repository selection.")
+print("Installer tests passed: piped interactive machine/node/standalone setup, hidden tokens, input retries and repository selection.")

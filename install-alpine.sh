@@ -14,6 +14,7 @@ CLI=/usr/local/bin/xbctl
 OLD_MANAGER=/usr/local/sbin/xb-alpine
 VERSION_FILE=$ROOT/alpine-release
 LOCK=/run/xboard-node-alpine-install.lock
+STANDALONE_DOC_URL='https://github.com/Toto0912/xboard-node-u/blob/main/docs/STANDALONE.md'
 ACTION=install
 VERSION=latest
 MODE=
@@ -47,14 +48,15 @@ usage() {
     cat <<'HELP'
 Alpine / OpenRC 一键安装 xboard-node-u（以 root 执行）
 
-  sh install-alpine.sh                 交互安装，默认机器模式 + sing-box
+  sh install-alpine.sh                 交互安装，默认机器模式 + sing-box（支持单节点与无面板裸核运行）
   sh install-alpine.sh upgrade         保留现有配置并更新程序
   xbctl status / service restart / service logs
   xbctl upgrade [--version v1.0.1]
   xbctl uninstall --yes                卸载程序和服务，保留配置/备份/日志
 
 无人值守安装：
-  --mode machine|node --panel URL --id ID --kernel singbox|xray
+  --mode machine|node|standalone       部署模式（standalone 无需 --panel/--id/--token-file）
+  --panel URL --id ID --kernel singbox|xray
   --token-file FILE                    从文件读取令牌（首行，不进入命令参数）
   --version latest|vX.Y.Z              默认最新正式版
   --reconfigure                       明确允许重新生成已有配置
@@ -107,12 +109,19 @@ prompt() {
 
 wizard() {
     # Read /dev/tty, so downloading through a pipe cannot consume answers.
-    { exec 3<>/dev/tty; } 2>/dev/null || die "没有交互终端，请传入 --mode --panel --id --token-file"
+    { exec 3<>/dev/tty; } 2>/dev/null || die "没有交互终端，请传入 --mode standalone 或 --mode --panel --id --token-file"
     info "开始配置；回车使用括号内的默认选项。"
-    while :; do
-        prompt '部署模式：1 机器模式 / 2 单节点模式 [1]：'
-        case "$ANSWER" in ''|1) MODE=machine; break ;; 2) MODE=node; break ;; esac
-    done
+    if [ -z "$MODE" ]; then
+        while :; do
+            prompt '部署模式：1 机器模式 / 2 单节点模式 / 3 无面板裸核运行 [1]：'
+            case "$ANSWER" in ''|1|machine) MODE=machine; break ;; 2|node) MODE=node; break ;; 3|standalone) MODE=standalone; break ;; esac
+        done
+    fi
+    if [ "$MODE" = standalone ]; then
+        exec 3>&-
+        info '已选择无面板裸核运行，将直接安装程序并写入 SS 独立节点示例配置（暂不启动服务）。'
+        return
+    fi
     while :; do
         prompt '选择内核：1 sing-box / 2 Xray [1]：'
         case "$ANSWER" in ''|1) KERNEL=singbox; break ;; 2) KERNEL=xray; break ;; esac
@@ -140,7 +149,11 @@ wizard() {
 }
 
 validate_config_input() {
-    case "$MODE" in machine|node) ;; *) die '模式必须是 machine 或 node' ;; esac
+    case "$MODE" in machine|node|standalone) ;; *) die '模式必须是 machine、node 或 standalone' ;; esac
+    if [ "$MODE" = standalone ]; then
+        [ -z "$PANEL$TARGET$TOKEN" ] || die '无面板裸核模式不需要 --panel、--id 或 --token-file'
+        return 0
+    fi
     case "$KERNEL" in singbox|xray) ;; *) die '内核必须是 singbox 或 xray' ;; esac
     case "$PANEL" in https://?*|http://?*) ;; *) die '面板地址必须以 https:// 或 http:// 开头' ;; esac
     case "$PANEL" in *\?*|*\#*|*\ *|*\@*) die '请填写不含登录信息、查询参数的网站根地址' ;; esac
@@ -220,16 +233,41 @@ stage_binary() {
 
 render_files() {
     if [ "$WRITE_CONFIG" = 1 ]; then
-        {
-            printf 'panel:\n  url: "%s"\n' "$(yaml_quote "${PANEL%/}")"
-            if [ "$MODE" = machine ]; then
-                printf 'machine:\n  machine_id: %s\n  token: "%s"\n' "$((TARGET + 0))" "$(yaml_quote "$TOKEN")"
-            else
-                printf '  node_id: %s\n  token: "%s"\n' "$((TARGET + 0))" "$(yaml_quote "$TOKEN")"
-            fi
-            printf 'kernel:\n  type: %s\n  config_dir: /var/lib/xboard-node\n  log_level: warn\n' "$KERNEL"
-            printf 'log:\n  level: info\n  output: stdout\nhealth_port: 0\n'
-        } > "$TMP/config.yml"
+        if [ "$MODE" = standalone ]; then
+            cat > "$TMP/config.yml" <<'STANDALONE'
+# SS 独立节点（sing-box）。将密码替换为自己的强密码。
+kernel:
+  type: singbox
+  config_dir: /var/lib/xboard-node/standalone-ss
+  log_level: warn
+standalone:
+  enabled: true
+  node:
+    protocol: shadowsocks
+    listen_ip: "0.0.0.0"
+    server_port: 8388
+    cipher: chacha20-ietf-poly1305
+  users:
+    - id: 1
+      # SS 的 uuid 字段用作密码，不要求 UUID 格式。
+      uuid: "REPLACE_WITH_YOUR_SS_PASSWORD"
+log:
+  level: info
+  output: stdout
+health_port: 0
+STANDALONE
+        else
+            {
+                printf 'panel:\n  url: "%s"\n' "$(yaml_quote "${PANEL%/}")"
+                if [ "$MODE" = machine ]; then
+                    printf 'machine:\n  machine_id: %s\n  token: "%s"\n' "$((TARGET + 0))" "$(yaml_quote "$TOKEN")"
+                else
+                    printf '  node_id: %s\n  token: "%s"\n' "$((TARGET + 0))" "$(yaml_quote "$TOKEN")"
+                fi
+                printf 'kernel:\n  type: %s\n  config_dir: /var/lib/xboard-node\n  log_level: warn\n' "$KERNEL"
+                printf 'log:\n  level: info\n  output: stdout\nhealth_port: 0\n'
+            } > "$TMP/config.yml"
+        fi
     fi
     cat > "$TMP/launcher" <<'LAUNCH'
 #!/bin/sh
@@ -466,7 +504,7 @@ install_or_upgrade() {
         info '检测到已有配置，将保留并更新程序。'
     else
         WRITE_CONFIG=1
-        if [ "$INTERACTIVE" = 1 ] || [ -z "$MODE$PANEL$TARGET$TOKEN" ]; then wizard; fi
+        if [ "$MODE" != standalone ] && { [ "$INTERACTIVE" = 1 ] || [ -z "$MODE$PANEL$TARGET$TOKEN" ]; }; then wizard; fi
         validate_config_input
     fi
     check_legacy_processes
@@ -520,6 +558,19 @@ install_or_upgrade() {
     if [ "$deployment" = empty ]; then
         MUTATING=0
         info '当前没有节点绑定；程序已更新，服务保持停止，原开机配置已保留。'
+        info "回退备份：$BACKUP"
+        return
+    fi
+    if [ "$WRITE_CONFIG" = 1 ] && [ "$MODE" = standalone ]; then
+        rc-update del xboard-node default >/dev/null 2>&1 || :
+        MUTATING=0
+        info '无面板裸核模式安装完成（服务暂未启动，也未开启开机自启）。'
+        cat "$TMP/version.txt"
+        info '已将 SS 独立节点示例配置写入：/etc/xboard-node/config.yml'
+        info '请先手动编辑 /etc/xboard-node/config.yml 进行节点配置（务必修改默认密码/端口或替换为所需协议配置）。'
+        info "配置示例可查看项目官网：$STANDALONE_DOC_URL"
+        info '配置完成后请执行：xbctl enable && xbctl start'
+        info '管理与日志：xbctl status / xbctl service restart / xbctl service logs'
         info "回退备份：$BACKUP"
         return
     fi

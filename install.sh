@@ -28,6 +28,7 @@ DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
 RELEASE_REPOSITORY="${XBOARD_NODE_REPOSITORY:-Toto0912/xboard-node-u}"
+STANDALONE_DOC_URL="https://github.com/Toto0912/xboard-node-u/blob/main/docs/STANDALONE.md"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -237,8 +238,9 @@ usage() {
     help         Show this help
 
   MODES (auto-detected from --node-id or --machine-id if omitted):
-    --mode node      Panel single-node mode (default)
-    --mode machine   Panel machine mode
+    --mode node        Panel single-node mode (default)
+    --mode machine     Panel machine mode
+    --mode standalone  Standalone bare-core mode without panel (writes SS example config)
 
   REQUIRED FOR NODE MODE:
     --panel, -a      Panel URL
@@ -270,6 +272,7 @@ usage() {
 
   EXAMPLES:
     sudo bash install.sh --interactive
+    sudo bash install.sh --mode standalone
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --node-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh upgrade
@@ -393,7 +396,7 @@ parse_args() {
     fi
 
     case "$MODE" in
-        node|machine) ;;
+        node|machine|standalone) ;;
         *)
             log_error "Unsupported mode: $MODE"
             usage
@@ -415,7 +418,7 @@ read_terminal() {
 
 configure_interactively() {
     if ! { true </dev/tty; } 2>/dev/null; then
-        log_error "Interactive installation requires a terminal; use --panel, --token and --node-id/--machine-id for unattended installation"
+        log_error "Interactive installation requires a terminal; use --mode standalone or --panel, --token and --node-id/--machine-id for unattended installation"
         return 1
     fi
 
@@ -423,13 +426,19 @@ configure_interactively() {
     local mode_choice kernel_choice target_id
     if [ "$MODE_GIVEN" -eq 0 ] && [ -z "$MACHINE_ID" ] && [ -z "$NODE_ID" ]; then
         while true; do
-            read_terminal mode_choice '部署模式：1) 机器模式  2) 单节点模式 [1]: ' '1'
+            read_terminal mode_choice '部署模式：1) 机器模式  2) 单节点模式  3) 无面板裸核运行 [1]: ' '1'
             case "$mode_choice" in
                 1|machine) MODE=machine; break ;;
                 2|node) MODE=node; break ;;
-                *) printf '请输入 1 或 2。\n' >/dev/tty ;;
+                3|standalone) MODE=standalone; break ;;
+                *) printf '请输入 1、2 或 3。\n' >/dev/tty ;;
             esac
         done
+    fi
+
+    if [ "$MODE" = standalone ]; then
+        printf '\n已选择无面板裸核运行，将直接安装程序并写入 SS 独立节点示例配置（暂不启动服务）。\n\n' >/dev/tty
+        return
     fi
 
     local kernel_default=1
@@ -584,6 +593,13 @@ validate_positive_int() {
 }
 
 validate_install_request() {
+    if [ "$MODE" = standalone ]; then
+        if [ -n "$PANEL_URL" ] || [ -n "$TOKEN" ] || [ -n "$NODE_ID" ] || [ -n "$NODE_TYPE" ] || [ -n "$MACHINE_ID" ]; then
+            log_error "Standalone mode does not accept --panel, --token, --node-id, --node-type, or --machine-id"
+            exit 1
+        fi
+        return
+    fi
     if [ -z "$PANEL_URL" ]; then
         log_error "Panel URL is required"
         exit 1
@@ -629,7 +645,20 @@ detect_current_state() {
 }
 
 require_reconfigure_confirmation() {
-    return
+    if [ "$MODE" != standalone ] || [ ! -f "$CONFIG_FILE" ] || [ "$FORCE_RECONFIGURE" -eq 1 ]; then
+        return
+    fi
+    if [ "$INTERACTIVE" -eq 1 ] && { true </dev/tty; } 2>/dev/null; then
+        local answer
+        read_terminal answer "检测到已有配置文件 ${CONFIG_FILE}，是否备份并覆盖为 SS 独立节点示例配置？[y/N]: " 'n'
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            return
+        fi
+        log_warn "Installation cancelled; existing config preserved at ${CONFIG_FILE}"
+        exit 0
+    fi
+    log_error "Existing config found at ${CONFIG_FILE}; pass --force-reconfigure to overwrite it with the standalone example"
+    exit 1
 }
 
 # Only explicitly supplied paths are trusted as local builds. All other files
@@ -705,7 +734,42 @@ fetch_asset() {
     curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 20 --max-time 180 -o "$2" "$1"
 }
 
+write_standalone_example_config() {
+    cat >"$1" <<'EOF_STANDALONE'
+# SS 独立节点（sing-box）。将密码替换为自己的强密码。
+kernel:
+  type: singbox
+  config_dir: /var/lib/xboard-node/standalone-ss
+  log_level: warn
+standalone:
+  enabled: true
+  node:
+    protocol: shadowsocks
+    listen_ip: "0.0.0.0"
+    server_port: 8388
+    cipher: chacha20-ietf-poly1305
+  users:
+    - id: 1
+      # SS 的 uuid 字段用作密码，不要求 UUID 格式。
+      uuid: "REPLACE_WITH_YOUR_SS_PASSWORD"
+log:
+  level: info
+  output: stdout
+health_port: 0
+EOF_STANDALONE
+}
+
 render_config() {
+    if [ "$MODE" = standalone ]; then
+        write_standalone_example_config "$TMP_DIR/config.yml"
+        chmod 600 "$TMP_DIR/config.yml"
+        "$TMP_DIR/xbctl" config metadata --config "$TMP_DIR/config.yml" --meta "$TMP_DIR/install-meta.json" --version "$RELEASE_VERSION" || {
+            log_error "xbctl config metadata failed"
+            exit 1
+        }
+        return
+    fi
+
     local init_args=(
         config init
         --mode "$MODE"
@@ -824,7 +888,9 @@ install_staged_files() {
     stop_existing_service
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 600 "$TMP_DIR/config.yml" "$CONFIG_FILE"
-    install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
+    if [ -f "$TMP_DIR/credentials.env" ]; then
+        install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
+    fi
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
     if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
         replace_saved_installer "$0"
@@ -832,7 +898,11 @@ install_staged_files() {
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    if [ "$MODE" = standalone ]; then
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+        systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    fi
 }
 
 wait_for_health() {
@@ -890,7 +960,20 @@ perform_install() {
     backup_existing_state
     MUTATING=1
     install_staged_files
+    if [ "$MODE" = standalone ]; then
+        MUTATING=0
+        ensure_cli_link
+        log_info "无面板裸核模式安装完成（服务暂未启动，也未开启开机自启）"
+        log_info "Service: ${SERVICE_NAME}"
+        log_info "Config: ${CONFIG_FILE}"
+        log_warn "请先手动编辑 ${CONFIG_FILE} 进行节点配置（务必修改默认密码/端口或替换为所需的协议配置）"
+        log_info "配置示例可查看项目官网：${STANDALONE_DOC_URL}"
+        log_info "配置完成后请执行：xbctl enable && xbctl start"
+        log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} status' or '${CLI_PATH} log')"
+        return
+    fi
     start_service
+    MUTATING=0
 
     ensure_cli_link
     log_info "Installation succeeded"

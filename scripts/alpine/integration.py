@@ -458,6 +458,17 @@ try:
     assert not ROOT.exists() and not BIN.exists() and not Path('/usr/local/bin/xbctl').exists()
     record('xbctl uninstall --purge removes configuration only when explicitly requested')
 
+    # Standalone bare-core installation via --mode standalone: writes SS example, stays stopped/disabled.
+    standalone_out = run('sh', SCRIPT, '--mode', 'standalone', *OFFLINE)
+    assert CONFIG.read_text() == Path('/src/examples/standalone.yml.example').read_text()
+    assert not node_pids() and not Path('/etc/runlevels/default/xboard-node').exists()
+    assert 'https://github.com/Toto0912/xboard-node-u/blob/main/docs/STANDALONE.md' in standalone_out.stdout
+    assert 'xbctl enable && xbctl start' in standalone_out.stdout
+    listed = json.loads(run('xbctl', 'list', '--output', 'json').stdout)
+    assert len(listed) == 1 and listed[0]['mode'] == 'standalone' and listed[0]['panel'] == '-' and listed[0]['target'] == 'local'
+    run('xbctl', 'uninstall', '--purge', '--yes')
+    record('standalone bare-core install writes SS example, stays stopped/disabled, and reports standalone in xbctl')
+
     reports = sum(1 for p, _ in EVENTS if p.endswith(("/report", "/push", "/status")))
     assert reports > 0
     summary = {"passed": RESULTS, "alpine": Path("/etc/alpine-release").read_text().strip(),
