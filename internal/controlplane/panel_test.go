@@ -2,14 +2,111 @@ package controlplane
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	panelapi "github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/gorilla/websocket"
 )
+
+func TestFullWSEventChannelPreservesConfigRejection(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		c.WriteMessage(websocket.TextMessage, []byte(`{"event":"auth.success"}`))
+		c.WriteMessage(websocket.TextMessage, []byte(`{"event":"sync.config","data":{"config":{}}}`))
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	events := make(chan Event, 1)
+	events <- Event{Type: EventSyncUsers}
+	statuses := NewStatusMailbox()
+	p := NewPanelControlPlane(config.PanelConfig{NodeID: 1, Token: "fixture"}, config.WSConfig{}, config.KernelConfig{})
+	client := p.newPushClient(nil, events, statuses, "ws"+strings.TrimPrefix(srv.URL, "http"))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); client.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case <-statuses.NotifyCh():
+			if change, ok := statuses.Drain(); ok && change.ConfigPending && change.NeedsResync {
+				return
+			}
+		case <-timeout:
+			t.Fatal("config rejection lost while event queue was full")
+		}
+	}
+}
+
+func TestPollDistinguishesIncompleteTransferFromInvalidConfiguration(t *testing.T) {
+	for _, machine := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, body                          string
+			status                              int
+			brokenTransport, usersFail, pending bool
+		}{
+			{"unavailable", "", 503, false, false, false},
+			{"truncated transfer", `{"protocol":`, 200, true, false, false},
+			{"invalid complete JSON", `{"protocol":`, 200, false, false, true},
+			{"missing protocol", `{}`, 200, false, false, true},
+			{"bad config and failed roster", `{"protocol":"vless","cert_config":{"http_port":{}}}`, 200, false, true, true},
+		} {
+			t.Run(fmt.Sprintf("%s/machine=%t", tc.name, machine), func(t *testing.T) {
+				var requests atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.HasSuffix(r.URL.Path, "/config") {
+						if tc.brokenTransport {
+							w.Header().Set("Content-Length", "500")
+						}
+						w.WriteHeader(tc.status)
+						io.WriteString(w, tc.body)
+						return
+					}
+					requests.Add(1)
+					if tc.usersFail {
+						w.WriteHeader(503)
+						return
+					}
+					io.WriteString(w, `{"users":[]}`)
+				}))
+				defer srv.Close()
+				cfg := config.PanelConfig{URL: srv.URL, NodeID: 1, Token: "fixture"}
+				var cp ControlPlane
+				if machine {
+					cfg.MachineID = 3
+					cp = NewMachinePanelControlPlane(panelapi.NewClient(cfg), config.KernelConfig{}, nil, nil)
+				} else {
+					cp = NewPanelControlPlane(cfg, config.WSConfig{}, config.KernelConfig{})
+				}
+				snap, err := cp.Poll(context.Background())
+				if err == nil || snap.ConfigPending != tc.pending || (requests.Load() > 0) != tc.pending || (snap.Users != nil) != (tc.pending && !tc.usersFail) || snap.CommitConfig != nil || snap.CommitUsers != nil {
+					t.Fatalf("snapshot %+v, err %v, %d roster requests", snap, err, requests.Load())
+				}
+				if !tc.usersFail && errors.Is(err, panelapi.ErrIncompatibleConfig) != tc.pending {
+					t.Fatalf("classification: %v", err)
+				}
+			})
+		}
+	}
+}
 
 func TestStandaloneRevocationRequiresExplicitPanelResponse(t *testing.T) {
 	for _, endpoint := range []string{"/api/v1/server/UniProxy/config", "/api/v1/server/UniProxy/user"} {

@@ -105,3 +105,49 @@ index df5f66a..8fa85e1 100644
  		headerReader = NewStreamReader(reader, userKey[:], timeHash.Sum(nil))
  		headerBuffer = make([]byte, 38)
  		_, err = io.ReadFull(headerReader, headerBuffer)
+diff --git a/vless/service.go b/vless/service.go
+--- a/vless/service.go
++++ b/vless/service.go
+@@ -5,6 +5,7 @@
+ 	"encoding/binary"
+ 	"io"
+ 	"net"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-vmess"
+ 	"github.com/sagernet/sing/common/auth"
+@@ -19,6 +20,7 @@
+ )
+ 
+ type Service[T comparable] struct {
++	userMu   sync.RWMutex
+ 	userMap  map[[16]byte]T
+ 	userFlow map[T]string
+ 	logger   logger.Logger
+@@ -48,8 +50,10 @@
+ 		userMap[userID] = userName
+ 		userFlowMap[userName] = userFlowList[i]
+ 	}
++	s.userMu.Lock()
+ 	s.userMap = userMap
+ 	s.userFlow = userFlowMap
++	s.userMu.Unlock()
+ }
+ 
+ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+@@ -57,12 +61,14 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	s.userMu.RLock()
+ 	user, loaded := s.userMap[request.UUID]
++	userFlow := s.userFlow[user]
++	s.userMu.RUnlock()
+ 	if !loaded {
+ 		return E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:]))
+ 	}
+ 	ctx = auth.ContextWithUser(ctx, user)
+-	userFlow := s.userFlow[user]
+ 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
+ 		return E.New(FlowVision, " flow does not support UDP")
+ 	} else if request.Flow != userFlow {

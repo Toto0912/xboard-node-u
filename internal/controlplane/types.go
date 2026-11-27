@@ -10,6 +10,7 @@ type EventType string
 
 const (
 	EventSyncConfig    EventType = "sync.config"
+	EventConfigPending EventType = "config.pending"
 	EventSyncUsers     EventType = "sync.users"
 	EventSyncUserDelta EventType = "sync.user.delta"
 	EventSyncDevices   EventType = "sync.devices"
@@ -25,6 +26,7 @@ type Event struct {
 }
 
 type StatusChange struct {
+	ConfigPending bool
 	Connected     bool
 	NeedsResync   bool
 	SawDisconnect bool
@@ -36,21 +38,23 @@ type APIMetrics struct {
 }
 
 type Bootstrap struct {
-	CommitConfig func()
-	CommitUsers  func()
-	PushInterval int
-	PullInterval int
-	Push         PushClient
-	Config       *model.NodeSpec
-	Users        []model.UserSpec
-	Mailbox      *NodeMailbox
+	ConfigPending bool
+	CommitConfig  func()
+	CommitUsers   func()
+	PushInterval  int
+	PullInterval  int
+	Push          PushClient
+	Config        *model.NodeSpec
+	Users         []model.UserSpec
+	Mailbox       *NodeMailbox
 }
 
 type Snapshot struct {
-	Config       *model.NodeSpec
-	Users        []model.UserSpec
-	CommitConfig func()
-	CommitUsers  func()
+	ConfigPending bool
+	Config        *model.NodeSpec
+	Users         []model.UserSpec
+	CommitConfig  func()
+	CommitUsers   func()
 }
 
 type ReportPayload struct {

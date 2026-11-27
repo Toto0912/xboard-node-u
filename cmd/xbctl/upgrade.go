@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cedar2025/xboard-node/internal/download"
 )
 
 var releaseTag = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)
@@ -227,7 +229,7 @@ func observeInstalledStart(port int) error {
 	}
 }
 
-func upgradeRelease(repoBase, requested, arch, binDir, installerPath string, prepare func() error, record func(string, []byte) error, restart func(rollback bool) error) error {
+func upgradeRelease(transport http.RoundTripper, repoBase, requested, arch, binDir, installerPath string, prepare func() error, record func(string, []byte) error, restart func(rollback bool) error) error {
 	if arch != "amd64" && arch != "arm64" {
 		return fmt.Errorf("unsupported architecture: %s", arch)
 	}
@@ -236,7 +238,7 @@ func upgradeRelease(repoBase, requested, arch, binDir, installerPath string, pre
 		return err
 	}
 	defer lock.Close()
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := download.Client(120*time.Second, transport)
 	tag, err := pinnedRelease(client, repoBase, requested)
 	if err != nil {
 		return err

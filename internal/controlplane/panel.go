@@ -82,7 +82,9 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	configSnapshot, cfgETag, err := p.client.GetConfigContext(ctx)
-	if err != nil {
+	configErr := err
+	pending := errors.Is(configErr, panel.ErrIncompatibleConfig)
+	if err != nil && !pending {
 		if errors.Is(err, panel.ErrNodeRevoked) {
 			p.client.ResetETags()
 			return Snapshot{Users: []model.UserSpec{}}, nil
@@ -93,18 +95,21 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		if errors.Is(err, panel.ErrNodeRevoked) {
 			p.client.ResetETags()
-			return Snapshot{Users: []model.UserSpec{}}, nil
+			return Snapshot{ConfigPending: pending, Users: []model.UserSpec{}}, nil
 		}
-		return Snapshot{}, fmt.Errorf("poll users: %w", err)
+		return Snapshot{ConfigPending: pending}, fmt.Errorf("poll users: %w", err)
 	}
 	select {
 	case <-ctx.Done():
 		return Snapshot{}, ctx.Err()
 	default:
 	}
+	if pending {
+		return Snapshot{ConfigPending: true, Users: model.UserSpecsFromPanel(users)}, configErr
+	}
 	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
 	if err != nil {
-		return Snapshot{Users: model.UserSpecsFromPanel(users)}, fmt.Errorf("poll config normalize: %w", err)
+		return Snapshot{ConfigPending: true, Users: model.UserSpecsFromPanel(users)}, fmt.Errorf("poll config normalize: %w", err)
 	}
 	return Snapshot{
 		Config:       nodeSpec,
@@ -164,7 +169,16 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 		func(event panel.WSEvent) {
 			translated, err := TranslateWSEvent(event, p.kcfg)
 			if err != nil {
-				nlog.Core().Warn("invalid ws event config, dropping event", "type", event.Type, "error", err)
+				nlog.Core().Warn("invalid ws event config", "type", event.Type, "error", err)
+				if event.Type != panel.WSEventSyncConfig {
+					return
+				}
+				translated = Event{Type: EventConfigPending}
+			}
+			if translated.Type == EventConfigPending {
+				// The service drains this mailbox before applying a REST result or
+				// another WS event, even if the ordinary event queue is full.
+				statuses.Publish(StatusChange{Connected: true, NeedsResync: true, ConfigPending: true})
 				return
 			}
 			select {

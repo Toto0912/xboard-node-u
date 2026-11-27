@@ -59,7 +59,7 @@ func prepare(dep dependency) error {
 	}
 	args := []string{"apply"}
 	statusArgs := []string{"status", "--porcelain"}
-	// A v2.4.1 checkout may already carry the TUIC part of the patch.
+	// Older checkouts may already carry the first part of the patch.
 	if file := dep.previouslyPatchedFile; file != "" {
 		if _, err := git(dir, "apply", "--reverse", "--check", "--include="+file, patch); err == nil {
 			args = append(args, "--exclude="+file)
@@ -79,7 +79,7 @@ func prepare(dep dependency) error {
 
 func main() {
 	for _, dep := range []dependency{
-		{"sing-vmess", "a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017", "sing-vmess-user-snapshot.patch", ""},
+		{"sing-vmess", "a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017", "sing-vmess-user-snapshot.patch", "service.go"},
 		{"sing-quic", "7e0a5869a5f49ed0a685143345dfda0448bbc708", "sing-quic-tuic-users.patch", "tuic/service.go"},
 	} {
 		if err := prepare(dep); err != nil {

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/download"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"golang.org/x/sync/singleflight"
 )
@@ -22,7 +23,9 @@ const (
 
 var downloads singleflight.Group
 
-var httpClient = &http.Client{Timeout: 10 * time.Minute}
+var httpClient = download.Client(10*time.Minute, nil)
+
+const maxGeoBytes = 256 << 20
 
 func EnsureContext(ctx context.Context, dir string, needGeoIP, needGeoSite bool, kernelType string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -99,6 +102,10 @@ func ensureFile(ctx context.Context, dir, name, url string) error {
 }
 
 func atomicDownload(dst, url string) error {
+	return downloadFile(dst, url, maxGeoBytes)
+}
+
+func downloadFile(dst, url string, limit int64) error {
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("http get %s: %w", url, err)
@@ -108,6 +115,9 @@ func atomicDownload(dst, url string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected HTTP status from %s: %s", url, resp.Status)
 	}
+	if resp.ContentLength > limit {
+		return fmt.Errorf("geo database exceeds %d bytes", limit)
+	}
 
 	f, err := os.CreateTemp(filepath.Dir(dst), ".geodata-*")
 	if err != nil {
@@ -116,7 +126,10 @@ func atomicDownload(dst, url string) error {
 	tmp := f.Name()
 	defer os.Remove(tmp)
 
-	n, err := io.Copy(f, resp.Body)
+	n, err := io.Copy(f, io.LimitReader(resp.Body, limit+1))
+	if err == nil && n > limit {
+		err = fmt.Errorf("geo database exceeds %d bytes", limit)
+	}
 	if err == nil && n == 0 {
 		err = io.ErrUnexpectedEOF
 	}

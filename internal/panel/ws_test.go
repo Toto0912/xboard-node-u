@@ -46,7 +46,7 @@ func fakeWSServer(t *testing.T, events []wsMessage) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Validate query params
 		q := r.URL.Query()
-		if q.Get("token") == "" || q.Get("node_id") == "" {
+		if q.Get("token") == "" || (q.Get("node_id") == "" && q.Get("machine_id") == "") {
 			http.Error(w, "missing auth params", http.StatusUnauthorized)
 			return
 		}
@@ -82,6 +82,45 @@ func fakeWSServer(t *testing.T, events []wsMessage) *httptest.Server {
 			}
 		}
 	}))
+}
+
+func TestWSIncompatibleConfigurationIdentity(t *testing.T) {
+	for _, machineID := range []int{0, 12} {
+		samples := []struct {
+			data string
+			id   int
+		}{
+			{`{"node_id":"7","config":{"cert_config":{"http_port":{}},"protocol":"vless"}}`, 7},
+			{`{"config":{"node_id":8}}`, 8},
+			{`{"node_id":7,"config":[]}`, 7},
+			{`{"node_id":7,"config":{"node_id":8}}`, 0},
+			{`{"node_id":7.5,"config":{}}`, 0},
+			{`{}`, 0},
+		}
+		var messages []wsMessage
+		for _, sample := range samples {
+			messages = append(messages, wsMessage{Event: WSEventSyncConfig, Data: json.RawMessage(sample.data)})
+		}
+		server := fakeWSServer(t, messages)
+		events := make(chan WSEvent, len(samples))
+		ctx, cancel := context.WithCancel(context.Background())
+		client := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "fixture", 7, WSClientConfig{MachineID: machineID}, func(e WSEvent) { events <- e }, nil, nil)
+		done := make(chan struct{})
+		go func() { defer close(done); client.Run(ctx) }()
+		func() {
+			defer func() { cancel(); <-done; server.Close() }()
+			for _, sample := range samples {
+				select {
+				case event := <-events:
+					if event.Type != WSEventConfigPending || event.Config != nil || event.NodeID != sample.id {
+						t.Fatalf("machine %d / %s: %+v", machineID, sample.data, event)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("undelivered config event")
+				}
+			}
+		}()
+	}
 }
 
 func TestWSClient_ConnectAndReceiveDataEvents(t *testing.T) {

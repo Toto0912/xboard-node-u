@@ -484,7 +484,7 @@ install_or_upgrade() {
         if [ "$EXPECT_EMPTY" = 1 ]; then rc-service xboard-node status >/dev/null 2>&1 || status=$?; fi
         # OpenRC returns 3 for a stopped service. Other failures do not prove it is stopped.
         if [ "$status" != 3 ] || ! sha256sum "$target_config" "$ROOT/install-meta.json" > "$TMP/legacy-input.sha256" ||
-            ! "$TMP/$CLI_ASSET" config migrate-empty-v241 --config "$target_config" --meta "$ROOT/install-meta.json" --output "$TMP/config.yml"; then
+            ! "$TMP/$CLI_ASSET" config migrate-empty-v241 --config "$target_config" --meta "$ROOT/install-meta.json" --output "$TMP/config.yml" --installed-binary "$BIN"; then
             cat "$TMP/config-error" >&2
             die '节点配置无效，未更换文件'
         fi

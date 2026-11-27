@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"reflect"
@@ -16,7 +18,7 @@ import (
 
 // v2.4.1 writes all six metadata fields, including a literal empty array after
 // the final unbind. Do not infer zero from missing, null or duplicate fields.
-func confirmedEmptyV241(data []byte) bool {
+func confirmedEmptyV241(data []byte, installed string) bool {
 	if !json.Valid(data) {
 		return false
 	}
@@ -41,7 +43,26 @@ func confirmedEmptyV241(data []byte) bool {
 	rows, ok := fields["instances"].([]any)
 	updated, _ := fields["updated_at"].(string)
 	_, err := time.Parse(time.RFC3339, updated)
-	return len(fields) == 6 && fields["config_mode"] == "instances" && fields["version"] == "v2.4.1" &&
+	version, _ := fields["version"].(string)
+	validVersion := version == "v2.4.1"
+	if (version == "latest" || version == "local") && installed != "" {
+		// Only the published v2.4.1 node binaries can corroborate an ambiguous marker.
+		f, err := os.Open(installed)
+		if err != nil {
+			return false
+		}
+		defer f.Close()
+		hash := sha256.New()
+		if _, err = io.Copy(hash, f); err != nil {
+			return false
+		}
+		switch fmt.Sprintf("%x", hash.Sum(nil)) {
+		case "d06d3fbd9432d7b2de0fc9bda4b41f59b1c7273e4bd8634787ec643008e0f301",
+			"362b117c57396151347b44ed17a00cc6e42b2fb4732f7848bbdbd3569266bf43":
+			validVersion = true
+		}
+	}
+	return len(fields) == 6 && fields["config_mode"] == "instances" && validVersion &&
 		fields["instance_count"] == json.Number("0") && fields["latest_instance_id"] == "" && ok && len(rows) == 0 && err == nil
 }
 
@@ -100,6 +121,7 @@ func runMigrateEmptyV241(args []string) error {
 	fs.SetOutput(io.Discard)
 	cfg := fs.String("config", "", "old configuration")
 	meta := fs.String("meta", "", "old installation metadata")
+	installed := fs.String("installed-binary", "", "previously installed node binary")
 	out := fs.String("output", "", "new staged file")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -111,7 +133,7 @@ func runMigrateEmptyV241(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !confirmedEmptyV241(m) {
+	if !confirmedEmptyV241(m, *installed) {
 		return errors.New("installation metadata does not confirm an empty v2.4.1 deployment")
 	}
 	data, err := os.ReadFile(*cfg)

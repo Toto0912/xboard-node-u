@@ -35,7 +35,8 @@ type nodeHandle struct {
 	lastHint    [sha256.Size]byte
 	nextCheck   time.Time
 	// Only a failed replacement gets a single immediate sing-box recovery.
-	rollback *model.NodeSpec
+	rollback      *model.NodeSpec
+	rollbackUsers []model.UserSpec
 }
 
 // Orchestrator manages all nodes bound to a panel machine. It:
@@ -137,6 +138,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode, gene
 }
 
 type kernelReplacement struct {
+	users     []model.UserSpec
 	previous  *model.NodeSpec
 	confirmed [sha256.Size]byte
 }
@@ -148,11 +150,13 @@ func (o *Orchestrator) launchNode(ctx context.Context, mn panel.MachineNode, gen
 		return
 	}
 	var rollback *model.NodeSpec
+	var rollbackUsers []model.UserSpec
 	if previous, exists := o.nodes[mn.ID]; exists {
 		select {
 		case <-previous.done:
 			previous.cancel()
 			rollback = previous.rollback
+			rollbackUsers = previous.rollbackUsers
 			delete(o.nodes, mn.ID)
 		default:
 			o.mu.Unlock()
@@ -169,6 +173,7 @@ func (o *Orchestrator) launchNode(ctx context.Context, mn panel.MachineNode, gen
 		h.nextCheck = time.Now().Add(o.pullInterval)
 		h.checkKernel = true
 		h.rollback = rollback
+		h.rollbackUsers = rollbackUsers
 	}
 	o.nodes[mn.ID] = h
 	o.mu.Unlock()
@@ -188,6 +193,7 @@ func (o *Orchestrator) launchNode(ctx context.Context, mn panel.MachineNode, gen
 	if replacement != nil {
 		nodeCfg.Kernel.Type = "xray"
 		h.rollback = replacement.previous
+		h.rollbackUsers = replacement.users
 		confirmed = &replacement.confirmed
 	} else if rollback == nil {
 		if cfgSnapshot, err := perNodeClient.GetConfig(); err == nil && cfgSnapshot != nil {
@@ -217,7 +223,7 @@ func (o *Orchestrator) launchNode(ctx context.Context, mn panel.MachineNode, gen
 	replacing := replacement != nil
 	cp.SetKernelHandoff(controlplane.MachineKernelHandoff{
 		Mismatch: func() { o.requestKernelCheck(nodeID, mb) },
-		Rollback: rollback, Confirmed: confirmed,
+		Rollback: rollback, RollbackUsers: rollbackUsers, Confirmed: confirmed,
 		Applied: func() {
 			o.mu.Lock()
 			h.ready = true
@@ -338,7 +344,7 @@ func (o *Orchestrator) checkKernelSwitch(ctx context.Context, mn panel.MachineNo
 	}
 	nlog.Core().Info("machine: switching child to Xray", "node_id", mn.ID, "transport", raw.Network)
 	o.stopNode(mn.ID)
-	o.launchNode(ctx, mn, generation, &kernelReplacement{previous: h.svc.StoppedConfig(), confirmed: confirmed})
+	o.launchNode(ctx, mn, generation, &kernelReplacement{previous: h.svc.StoppedConfig(), users: h.svc.StoppedUsers(), confirmed: confirmed})
 }
 
 func (o *Orchestrator) stopNode(nodeID int) {
@@ -568,6 +574,13 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 
 	nodeID := event.NodeID
 	if nodeID == 0 {
+		if event.Type == panel.WSEventConfigPending {
+			// Each child fetches its own authoritative snapshot. An ambiguous
+			// message cannot establish that any specific configuration was rejected.
+			o.broadcastStatus(true)
+			o.requestDiscovery(false)
+			return
+		}
 		nlog.Core().Debug("machine ws event missing node_id, dropping", "type", event.Type)
 		return
 	}
@@ -578,10 +591,14 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	o.eventsMu.RUnlock()
 	if !initialized || !ok {
 		// The initial REST snapshot covers events before kernel selection finishes.
+		if event.Type == panel.WSEventConfigPending {
+			o.requestDiscovery(false)
+		}
 		return
 	}
 	if event.Type == panel.WSEventSyncConfig && event.Config != nil && kcfg.Type == "singbox" {
 		if model.ResolveKernelForTransport(event.Config.Network, kcfg.Type) != kcfg.Type {
+			mailbox.Apply(controlplane.Event{Type: controlplane.EventConfigPending})
 			o.noteKernelHint(nodeID, mailbox, event.Config)
 			return
 		}
@@ -594,6 +611,9 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	}
 	translated, err := controlplane.TranslateWSEvent(event, kcfg)
 	if err != nil {
+		if event.Type == panel.WSEventSyncConfig {
+			mailbox.Apply(controlplane.Event{Type: controlplane.EventConfigPending})
+		}
 		nlog.Core().Warn("machine ws event translation failed",
 			"type", event.Type, "node_id", nodeID, "error", err)
 		return

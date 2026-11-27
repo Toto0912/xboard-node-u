@@ -8,6 +8,7 @@ import (
 
 // MailboxState is the coalesced snapshot drained from a NodeMailbox.
 type MailboxState struct {
+	ConfigPending  bool
 	Config         *model.NodeSpec
 	Users          []model.UserSpec
 	DeviceUsers    map[int][]string
@@ -21,6 +22,7 @@ type MailboxState struct {
 // yet ready to process them. Events are coalesced (latest-wins) and drained
 // as a single snapshot once the service marks the mailbox as ready.
 type NodeMailbox struct {
+	configPending    bool
 	mu               sync.Mutex
 	ready            bool
 	config           *model.NodeSpec
@@ -93,11 +95,21 @@ func (m *NodeMailbox) SyncConfigBaseline(config *model.NodeSpec) {
 	}
 }
 
+func (m *NodeMailbox) HasPendingConfig() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ready && (m.configPending || m.dirtyConfig)
+}
+
 func (m *NodeMailbox) Apply(event Event) {
 	m.mu.Lock()
 	changed := false
 
 	switch event.Type {
+	case EventConfigPending:
+		m.configPending = true
+		m.dirtyConfig = false
+		changed = true
 	case EventSyncConfig:
 		if event.Config != nil {
 			m.config = cloneNodeSpec(event.Config)
@@ -153,7 +165,8 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 	if !m.ready {
 		return MailboxState{}
 	}
-	state := MailboxState{NeedsReconcile: m.needsReconcile}
+	state := MailboxState{NeedsReconcile: m.needsReconcile, ConfigPending: m.configPending}
+	m.configPending = false
 	if m.dirtyConfig && m.config != nil {
 		state.Config = cloneNodeSpec(m.config)
 		state.HasConfig = true
@@ -324,6 +337,7 @@ func (m *StatusMailbox) Publish(change StatusChange) {
 	}
 	m.mu.Lock()
 	m.change.Connected = change.Connected
+	m.change.ConfigPending = m.change.ConfigPending || change.ConfigPending
 	m.change.NeedsResync = m.change.NeedsResync || change.NeedsResync || change.Connected
 	m.change.SawDisconnect = m.change.SawDisconnect || !change.Connected
 	m.pending = true

@@ -21,7 +21,7 @@ func TestUpgradeAlreadyInProgress(t *testing.T) {
 	}
 	defer lock.Close()
 	restarted := false
-	err = upgradeRelease("http://127.0.0.1:1", "v2", "amd64", dir, filepath.Join(dir, "install.sh"), nil, nil, func(bool) error { restarted = true; return nil })
+	err = upgradeRelease(nil, "https://127.0.0.1:1", "v2", "amd64", dir, filepath.Join(dir, "install.sh"), nil, nil, func(bool) error { restarted = true; return nil })
 	if err == nil || !strings.Contains(err.Error(), "lock installation") || restarted {
 		t.Fatal("concurrent upgrade did not stop before downloading", err)
 	}
@@ -56,7 +56,7 @@ func TestUpgradeVerifiedRelease(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/releases/latest":
 					to := "/releases/tag/v2"
@@ -118,7 +118,7 @@ func TestUpgradeVerifiedRelease(t *testing.T) {
 				}
 				return commitBindingFiles(files)
 			}
-			err := upgradeRelease(server.URL+"/releases", "latest", "amd64", dir, installerPath, nil, record, func(bool) error {
+			err := upgradeRelease(server.Client().Transport, server.URL+"/releases", "latest", "amd64", dir, installerPath, nil, record, func(bool) error {
 				versions := []string{}
 				for _, name := range []string{"xboard-node", "xbctl"} {
 					out, e := exec.Command(filepath.Join(dir, name), "version").Output()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -45,10 +46,11 @@ func NewMachinePanelControlPlane(
 
 // MachineKernelHandoff carries one child generation's transition hooks.
 type MachineKernelHandoff struct {
-	Mismatch  func()
-	Rollback  *model.NodeSpec
-	Confirmed *[sha256.Size]byte
-	Applied   func()
+	Mismatch      func()
+	Rollback      *model.NodeSpec
+	RollbackUsers []model.UserSpec
+	Confirmed     *[sha256.Size]byte
+	Applied       func()
 }
 
 // MachineConfigDigest identifies the decoded panel descriptor independent of map order and ETags.
@@ -108,6 +110,7 @@ func (p *MachinePanelControlPlane) Initial(
 		// Use the old descriptor with the newly authorized users. Leave the panel
 		// config unacknowledged so the next poll can retry the handoff.
 		bootstrap.Config = p.handoff.Rollback
+		bootstrap.ConfigPending = true
 		cfgETag = ""
 	} else {
 		bootstrap.Config, err = model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
@@ -122,7 +125,9 @@ func (p *MachinePanelControlPlane) Initial(
 		bootstrap.PullInterval = configSnapshot.BaseConfig.PullInterval
 	}
 	bootstrap.CommitConfig = func() {
-		p.client.CommitConfigETag(cfgETag)
+		if !bootstrap.ConfigPending {
+			p.client.CommitConfigETag(cfgETag)
+		}
 		p.handoff.Rollback = nil
 		p.handoff.Confirmed = nil
 		if p.handoff.Applied != nil {
@@ -131,6 +136,10 @@ func (p *MachinePanelControlPlane) Initial(
 	}
 	bootstrap.CommitUsers = func() { p.client.CommitUserETag(userETag) }
 	bootstrap.Users = model.UserSpecsFromPanel(users)
+	if bootstrap.ConfigPending {
+		bootstrap.Users = model.IntersectUsers(p.handoff.RollbackUsers, bootstrap.Users)
+		bootstrap.CommitUsers = nil
+	}
 
 	// Register mailbox access after the initial snapshot is prepared, so the
 	// Service can start the kernel immediately and only then drain coalesced WS
@@ -147,33 +156,40 @@ func (p *MachinePanelControlPlane) Initial(
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	configSnapshot, cfgETag, err := p.client.GetConfigContext(ctx)
-	if err != nil {
+	configErr := err
+	pending := errors.Is(configErr, panel.ErrIncompatibleConfig)
+	if err != nil && !pending {
 		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
 	}
 	// Process user revocations even while the new transport is incompatible.
 	if ctx.Err() == nil && configSnapshot != nil && p.handoff.Mismatch != nil &&
 		model.ResolveKernelForTransport(configSnapshot.Network, p.kcfg.Type) != p.kcfg.Type {
 		p.handoff.Mismatch()
+		pending = true
 		configSnapshot, cfgETag = nil, ""
 	}
 	users, userETag, err := p.client.GetUsersContext(ctx)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
+		return Snapshot{ConfigPending: pending}, fmt.Errorf("machine poll users: %w", err)
 	}
 	select {
 	case <-ctx.Done():
 		return Snapshot{}, ctx.Err()
 	default:
 	}
+	if configErr != nil {
+		return Snapshot{ConfigPending: true, Users: model.UserSpecsFromPanel(users)}, configErr
+	}
 	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
 	if err != nil {
-		return Snapshot{Users: model.UserSpecsFromPanel(users)}, fmt.Errorf("machine poll normalize: %w", err)
+		return Snapshot{ConfigPending: true, Users: model.UserSpecsFromPanel(users)}, fmt.Errorf("machine poll normalize: %w", err)
 	}
 	return Snapshot{
-		Config:       nodeSpec,
-		Users:        model.UserSpecsFromPanel(users),
-		CommitConfig: func() { p.client.CommitConfigETag(cfgETag) },
-		CommitUsers:  func() { p.client.CommitUserETag(userETag) },
+		ConfigPending: pending,
+		Config:        nodeSpec,
+		Users:         model.UserSpecsFromPanel(users),
+		CommitConfig:  func() { p.client.CommitConfigETag(cfgETag) },
+		CommitUsers:   func() { p.client.CommitUserETag(userETag) },
 	}, nil
 }
 

@@ -18,6 +18,7 @@ import (
 // WSEvent types
 const (
 	WSEventSyncConfig     = "sync.config"
+	WSEventConfigPending  = "config.pending"
 	WSEventSyncUsers      = "sync.users"
 	WSEventSyncUserDelta  = "sync.user.delta"
 	WSEventSyncDevices    = "sync.devices" // panel → node: global device state
@@ -382,20 +383,27 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	switch msg.Event {
 	case WSEventSyncConfig:
 		nlog.Core().Debug("ws sync config event received")
-		var p syncConfigPayload
-		if err := decodeData(msg.Data, &p); err != nil {
-			nlog.Core().Warn("ws: cannot decode config payload", "error", err)
-			return
+		var envelope struct {
+			NodeID json.RawMessage `json:"node_id"`
+			Config json.RawMessage `json:"config"`
 		}
-		if p.Config.Protocol == "" {
-			nlog.Core().Warn("ws: config payload missing protocol")
-			return
+		err := json.Unmarshal(msg.Data, &envelope)
+		var nested struct {
+			NodeID json.RawMessage `json:"node_id"`
 		}
-		event.Config = &p.Config
-		if p.NodeID > 0 {
-			event.NodeID = p.NodeID
-		} else if p.Config.NodeID > 0 {
-			event.NodeID = p.Config.NodeID
+		_ = json.Unmarshal(envelope.Config, &nested)
+		outerID, outerOK := configNodeID(envelope.NodeID)
+		innerID, innerOK := configNodeID(nested.NodeID)
+		addressed := outerOK && innerOK && (outerID == 0 || innerID == 0 || outerID == innerID)
+		if addressed {
+			event.NodeID = max(outerID, innerID)
+		}
+		if err == nil {
+			event.Config, err = decodeNodeConfig(envelope.Config)
+		}
+		if err != nil || !addressed || (w.cfg.MachineID > 0 && event.NodeID == 0) {
+			event.Type, event.Config = WSEventConfigPending, nil
+			nlog.Core().Warn("ws: incompatible or unaddressed configuration", "node_id", event.NodeID)
 		}
 
 	case WSEventSyncUsers:
@@ -469,6 +477,20 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	}
 
 	w.onEvent(event)
+}
+
+// A missing ID allows the other envelope field to identify the child. Reject
+// fractional, negative and ambiguous IDs rather than routing to a guessed node.
+func configNodeID(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 {
+		return 0, true
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return 0, false
+	}
+	id, err := strconv.Atoi(number.String())
+	return id, err == nil && id >= 0
 }
 
 // SendDeviceReport sends local device snapshot to panel via WS.

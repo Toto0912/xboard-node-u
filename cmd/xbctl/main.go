@@ -393,7 +393,7 @@ func runUpgrade(args []string) error {
 		}
 		return nil
 	}
-	if err := upgradeRelease(base, requested, runtime.GOARCH, filepath.Dir(defaultBinaryPath), installerPath, prepare, record, func(rollback bool) error {
+	if err := upgradeRelease(nil, base, requested, runtime.GOARCH, filepath.Dir(defaultBinaryPath), installerPath, prepare, record, func(rollback bool) error {
 		if rollback && previousState != "active" {
 			return restoreStoppedService(previousState)
 		}

@@ -22,10 +22,11 @@ import (
 )
 
 var (
-	ErrNodeRevoked = errors.New("panel revoked node binding")
-	trafficMapPool = sync.Pool{New: func() interface{} { return make(map[string][2]int64) }}
-	aliveMapPool   = sync.Pool{New: func() interface{} { return make(map[string][]string) }}
-	onlineMapPool  = sync.Pool{New: func() interface{} { return make(map[string]int) }}
+	ErrIncompatibleConfig = errors.New("incompatible node configuration")
+	ErrNodeRevoked        = errors.New("panel revoked node binding")
+	trafficMapPool        = sync.Pool{New: func() interface{} { return make(map[string][2]int64) }}
+	aliveMapPool          = sync.Pool{New: func() interface{} { return make(map[string][]string) }}
+	onlineMapPool         = sync.Pool{New: func() interface{} { return make(map[string]int) }}
 )
 
 // Client communicates with the Xboard panel API.
@@ -287,23 +288,34 @@ func (c *Client) GetConfigContext(ctx context.Context) (*NodeConfig, string, err
 		return nil, "", fmt.Errorf("GET %s: HTTP %d %s", c.configPath(), resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
-	var raw map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, "", fmt.Errorf("decode raw config: %w", err)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read config response: %w", err)
 	}
+	cfg, err := decodeNodeConfig(body)
+	if err != nil {
+		return nil, "", err
+	}
+	return cfg, resp.Header.Get("ETag"), nil
+}
 
+func decodeNodeConfig(body []byte) (*NodeConfig, error) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("%w: invalid JSON object", ErrIncompatibleConfig)
+	}
 	var cfg NodeConfig
 	// Use mapstructure for weak type conversion (string -> int, bool -> string, etc.)
 	if err := decodeWeakRaw(raw, &cfg); err != nil {
-		return nil, "", fmt.Errorf("weak decode config: %w", err)
+		return nil, fmt.Errorf("%w: invalid field types", ErrIncompatibleConfig)
 	}
 
 	// Basic validation
 	if cfg.Protocol == "" {
-		return nil, "", fmt.Errorf("invalid config: missing protocol")
+		return nil, fmt.Errorf("%w: missing protocol", ErrIncompatibleConfig)
 	}
 
-	return &cfg, resp.Header.Get("ETag"), nil
+	return &cfg, nil
 }
 
 // CommitConfigETag saves a config ETag after callers have processed the snapshot.

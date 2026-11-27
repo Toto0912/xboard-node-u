@@ -72,6 +72,7 @@ type Service struct {
 	wsReconcileInterval time.Duration // optional override for tests; default >= 10m
 
 	usersNeedsReapply bool       // lastUsers may be an unconfirmed target; only a fresh snapshot can clear this
+	configPending     bool       // A rejected or incompatible config cannot authorize new grants.
 	lastUserHash      string     // hash of user list for change detection
 	lastConfigHash    string     // hash of full config for change detection
 	pullBackoff       apiBackoff // backoff for panel pull failures
@@ -107,18 +108,19 @@ type kernelApplyResult struct {
 }
 
 type pullResult struct {
-	configRejected bool
-	config         *model.NodeSpec
-	users          []model.UserSpec
-	configHash     string
-	userHash       string
-	certChanged    bool
-	forced         bool
-	resyncGen      uint64
-	userMutSeq     uint64
-	configMutSeq   uint64
-	commitConfig   func()
-	commitUsers    func()
+	configRejected  bool
+	configConfirmed bool
+	config          *model.NodeSpec
+	users           []model.UserSpec
+	configHash      string
+	userHash        string
+	certChanged     bool
+	forced          bool
+	resyncGen       uint64
+	userMutSeq      uint64
+	configMutSeq    uint64
+	commitConfig    func()
+	commitUsers     func()
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -211,6 +213,9 @@ func (s *Service) ValidateXrayHandoff(cfg *config.Config, spec *model.NodeSpec, 
 // StoppedConfig returns the last descriptor after Run and its shutdown cleanup have finished.
 // Rollback must obtain its own fresh list of authorized users.
 func (s *Service) StoppedConfig() *model.NodeSpec { return s.lastConfig }
+
+// StoppedUsers is read by the orchestrator after the child has joined.
+func (s *Service) StoppedUsers() []model.UserSpec { return cloneUsersNonNil(s.appliedState.Users) }
 
 // NewWithControlPlane creates a Service with an externally-provided
 // ControlPlane. Used by the machine orchestrator to inject a
@@ -369,6 +374,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.drainMachineMailbox(ctx)
 
 		case event := <-s.wsEvents:
+			s.drainWSStatus(ctx)
 			s.handleWSEvent(ctx, event)
 		}
 	}
@@ -407,6 +413,9 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		s.wsClient = bootstrap.Push
 	}
 	s.machineMailbox = bootstrap.Mailbox
+	if bootstrap.ConfigPending {
+		s.holdConfigGrants()
+	}
 	if s.machineMailbox != nil {
 		s.machineMailboxCh = s.machineMailbox.NotifyCh()
 	}
@@ -585,6 +594,10 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 		return
 	}
 	state := s.machineMailbox.DrainIfReady()
+	if state.ConfigPending || (state.HasConfig && state.HasUsers && computeConfigHash(state.Config) != s.lastConfigHash) {
+		s.configMutSeq++
+		s.holdConfigGrants()
+	}
 	if state.HasUsers {
 		users := state.Users
 		if users == nil {
@@ -637,6 +650,9 @@ func (s *Service) drainWSStatus(ctx context.Context) {
 // - On disconnect: record timestamp, immediately REST poll.
 // - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
+	if status.ConfigPending {
+		s.holdConfigGrants()
+	}
 	if status.SawDisconnect || !status.Connected {
 		s.kernel.ClearGlobalDevices()
 	}
@@ -719,18 +735,22 @@ func (s *Service) applyPushDiscovery(ctx context.Context, result pushDiscoveryRe
 // handleWSEvent processes data events received via WebSocket
 func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	switch event.Type {
+	case controlplane.EventConfigPending:
+		s.configMutSeq++
+		s.holdConfigGrants()
 	case controlplane.EventSyncConfig:
 		if event.Config == nil {
 			return
 		}
 		newConfigHash := computeConfigHash(event.Config)
+		s.configMutSeq++
 		if err := validateCandidateFields(s.cfg, s.kernel.Protocols(), event.Config); err != nil {
+			s.holdConfigGrants()
 			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
 			return
 		}
 		// Advance generation even on hash equality so ABA WS coalescing (C0 -> C1 -> C0)
 		// still invalidates any in-flight REST snapshot carrying intermediate C1.
-		s.configMutSeq++
 		if newConfigHash == s.lastConfigHash {
 			return
 		}
@@ -748,11 +768,13 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		prevPanelCertOverride := s.panelCertOverride
 
 		if _, err := s.applyRemoteOverrides(ctx, event.Config); err != nil {
+			s.holdConfigGrants()
 			nlog.Core().Warn("ws remote overrides failed, keeping existing config", "error", err)
 			s.restoreCertOverrideRollback(prevCertCfg, prevLogLevel, prevPanelCertOverride)
 			return
 		}
 		if err := validateTLSRequirements(event.Config, s.cert.TLSCert(), cfgKernelType(s.cfg)); err != nil {
+			s.holdConfigGrants()
 			nlog.Core().Warn("ws post-override TLS validation failed, keeping existing config", "error", err)
 			s.restoreCertOverrideRollback(prevCertCfg, prevLogLevel, prevPanelCertOverride)
 			return
@@ -763,6 +785,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		s.metricsMu.Unlock()
 		s.lastConfigHash = newConfigHash
 		if !s.applyConfigWithUsers(s.safeUsersForRestart()).applied {
+			s.holdConfigGrants()
 			s.metricsMu.Lock()
 			s.lastConfig = prevConfig
 			s.metricsMu.Unlock()
@@ -785,7 +808,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		// still rejects an in-flight REST snapshot carrying [A,B].
 		s.userMutSeq++
 		newHash := computeUserHash(event.Users)
-		if s.usersNeedsReapply {
+		if s.usersNeedsReapply || s.configPending {
 			s.restrictPendingUsers(event.Users)
 			return
 		}
@@ -900,7 +923,7 @@ func (s *Service) pullViaAPIWithOptions(ctx context.Context, forceFull bool) {
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
 			s.pullBackoff.onFailure()
-			if snapshot.Users == nil {
+			if snapshot.Users == nil && !snapshot.ConfigPending {
 				s.pullActive.Store(false)
 				return
 			}
@@ -909,13 +932,14 @@ func (s *Service) pullViaAPIWithOptions(ctx context.Context, forceFull bool) {
 		}
 
 		result := pullResult{
-			configRejected: err != nil,
-			commitConfig:   snapshot.CommitConfig,
-			commitUsers:    snapshot.CommitUsers,
-			forced:         force,
-			resyncGen:      resyncGen,
-			userMutSeq:     startUserSeq,
-			configMutSeq:   startConfigSeq,
+			configRejected:  err != nil || snapshot.ConfigPending,
+			configConfirmed: snapshot.Config != nil,
+			commitConfig:    snapshot.CommitConfig,
+			commitUsers:     snapshot.CommitUsers,
+			forced:          force,
+			resyncGen:       resyncGen,
+			userMutSeq:      startUserSeq,
+			configMutSeq:    startConfigSeq,
 		}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
@@ -943,6 +967,9 @@ func (s *Service) pullViaAPIWithOptions(ctx context.Context, forceFull bool) {
 
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
+	if s.machineMailbox != nil && s.machineMailbox.HasPendingConfig() {
+		s.drainMachineMailbox(ctx)
+	}
 	// The event loop can select a completed poll ahead of a queued WS wakeup.
 	// Observe the newest status while the previous poll still owns pullActive.
 	s.drainWSStatus(ctx)
@@ -961,7 +988,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 
 	configChanged := false
-	configOK := !result.configRejected
+	configOK := !result.configRejected && (!s.configPending || (!configStale && (result.configConfirmed || result.config != nil)))
 	usersOK := !s.usersNeedsReapply
 
 	s.metricsMu.RLock()
@@ -1013,8 +1040,11 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 
 	// A rejected candidate cannot authorize new credentials or relax limits.
 	// Publish the restricted list to the mailbox as well as the running kernel.
-	if !configOK && result.users != nil {
-		result.users = intersectAppliedUsers(s.appliedState.Users, result.users)
+	if !configOK && !configStale {
+		s.holdConfigGrants()
+	}
+	if (!configOK || (s.configPending && configStale)) && result.users != nil {
+		result.users = model.IntersectUsers(s.appliedState.Users, result.users)
 		result.userHash = computeUserHash(result.users)
 		result.commitUsers = nil
 	}
@@ -1029,7 +1059,8 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	// A no-body 304 says nothing about an uncommitted target. Keep potential
 	// new grants out of config reloads until a non-stale full response arrives.
 	target := s.safeUsersForRestart()
-	usersChanged := result.users != nil && (result.userHash != s.lastUserHash || s.usersNeedsReapply)
+	usersChanged := result.users != nil && (result.userHash != s.lastUserHash || s.usersNeedsReapply ||
+		(s.configPending && computeUserHash(s.appliedState.Users) != result.userHash))
 	if result.users != nil {
 		if s.usersNeedsReapply && mailboxConflict {
 			s.restrictPendingUsers(result.users)
@@ -1059,6 +1090,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	if configChanged {
 		change := s.applyConfigWithUsers(target)
 		if !change.applied {
+			s.holdConfigGrants()
 			configOK = false
 			appliedConfig = nil
 			s.metricsMu.Lock()
@@ -1067,6 +1099,13 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			s.lastConfigHash = prevConfigHash
 			s.restoreCertOverrideRollback(prevCertCfg, prevLogLevel, prevPanelCertOverride)
 			if usersChanged {
+				target = model.IntersectUsers(s.appliedState.Users, target)
+				result.userHash = computeUserHash(target)
+				result.commitUsers = nil
+				if s.machineMailbox != nil {
+					target, mailboxConflict = s.machineMailbox.ArbitrateUsers(target)
+					result.userHash = computeUserHash(target)
+				}
 				if change.rolledBackUsers != nil {
 					s.restoreUserState(change.rolledBackUsers, computeUserHash(change.rolledBackUsers))
 					usersOK = result.userHash == s.lastUserHash || s.applyUserUpdate(ctx, target, result.userHash)
@@ -1095,11 +1134,14 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 	if result.users != nil && usersOK && !mailboxConflict {
 		s.usersNeedsReapply = false
+		if !configStale && configOK {
+			s.configPending = false
+		}
 	}
 	if !configStale && configOK && result.commitConfig != nil {
 		result.commitConfig()
 	}
-	if result.users != nil && usersOK && !mailboxConflict && result.commitUsers != nil {
+	if result.users != nil && usersOK && !s.configPending && !mailboxConflict && result.commitUsers != nil {
 		result.commitUsers()
 	}
 	if s.machineMailbox != nil && appliedConfig != nil {
@@ -1445,6 +1487,9 @@ func (s *Service) recordUserApplyFailure(target, rolledBack []model.UserSpec) {
 
 // A WS delta cannot prove that a previously failed REST grant is still valid.
 func (s *Service) restrictPendingUsers(target []model.UserSpec) {
+	if s.configPending {
+		target = model.IntersectUsers(s.appliedState.Users, target)
+	}
 	safe := s.stageUserState(target, "")
 	if s.kernel.IsRunning() && computeUserHash(safe) != computeUserHash(s.appliedState.Users) {
 		if len(safe) == 0 {
@@ -1456,10 +1501,17 @@ func (s *Service) restrictPendingUsers(target []model.UserSpec) {
 	s.appliedState.Users = safe
 }
 
+func (s *Service) holdConfigGrants() {
+	s.configPending = true
+	if !s.hasPendingForceResync() {
+		s.wsResyncWanted.Add(1)
+	}
+}
+
 // applyUserDelta applies an incremental user change (add or remove) directly
 // via the kernel's atomic user API. Kernel updates run before updateUserState.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) {
-	if s.usersNeedsReapply {
+	if s.usersNeedsReapply || s.configPending {
 		switch action {
 		case "remove":
 			s.restrictPendingUsers(subtractUsers(s.lastUsers, deltaUsers))
@@ -1628,7 +1680,7 @@ func subtractUsers(base, delta []model.UserSpec) []model.UserSpec {
 // config-only update or renewal can restart only previously confirmed users
 // that survived all the intervening revocations.
 func (s *Service) safeUsersForRestart() []model.UserSpec {
-	if s.usersNeedsReapply {
+	if s.usersNeedsReapply || s.configPending {
 		return s.appliedState.Users
 	}
 	return s.lastUsers

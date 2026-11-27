@@ -534,20 +534,33 @@ run_with_retry() {
 }
 
 install_dependencies() {
-    local -a firewall_packages=()
+    [[ "$ACTION" != uninstall ]] || return 0
+    local -a packages=()
+    # curl also checks the local health endpoint after starting the service.
+    command -v curl >/dev/null 2>&1 || packages+=(curl)
+    if [[ -z "$BINARY_SOURCE" || -z "$CLI_BINARY_SOURCE" ]]; then
+        if [[ ! -s /etc/ssl/certs/ca-certificates.crt && ! -s /etc/pki/tls/certs/ca-bundle.crt ]]; then
+            packages+=(ca-certificates)
+        fi
+    fi
     if ! command -v nft >/dev/null 2>&1 && { ! command -v iptables >/dev/null 2>&1 || ! command -v ip6tables >/dev/null 2>&1; }; then
-        firewall_packages=(nftables)
+        packages+=(nftables)
+    fi
+    (( ${#packages[@]} )) || return 0
+    if [[ -n "$BINARY_SOURCE" && -n "$CLI_BINARY_SOURCE" ]]; then
+        log_error "Offline installation requires these local dependencies: ${packages[*]}"
+        return 1
     fi
     case "$OS" in
         ubuntu|debian)
             DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates "${firewall_packages[@]}" >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq "${packages[@]}" >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf >/dev/null 2>&1; then
-                run_with_retry 5 3 dnf install -y -q curl wget ca-certificates "${firewall_packages[@]}" >/dev/null 2>&1
+                run_with_retry 5 3 dnf install -y -q "${packages[@]}" >/dev/null 2>&1
             else
-                run_with_retry 5 3 yum install -y -q curl wget ca-certificates "${firewall_packages[@]}" >/dev/null 2>&1
+                run_with_retry 5 3 yum install -y -q "${packages[@]}" >/dev/null 2>&1
             fi
             ;;
         *)
@@ -914,7 +927,7 @@ perform_upgrade() {
         if [[ "$EXPECT_EMPTY" != 1 ]]; then cat "$TMP_DIR/layout.err" >&2; return 1; fi
         legacy_sums=$(sha256sum -- "$CONFIG_FILE" "$INSTALL_META") || return 1
         checked_config="$TMP_DIR/empty.yml"
-        if ! "$TMP_DIR/xbctl" config migrate-empty-v241 --config "$CONFIG_FILE" --meta "$INSTALL_META" --output "$checked_config"; then
+        if ! "$TMP_DIR/xbctl" config migrate-empty-v241 --config "$CONFIG_FILE" --meta "$INSTALL_META" --output "$checked_config" --installed-binary "$BINARY_PATH"; then
             cat "$TMP_DIR/layout.err" >&2
             return 1
         fi

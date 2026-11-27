@@ -113,11 +113,43 @@ func TestManagedPoliciesWaitForKernelAcknowledgement(t *testing.T) {
 					raw.SetDeadline(time.Time{})
 					return conn
 				}
+				if !failure {
+					verifyWireConfigProtection(t, s, nc, a, b, open)
+				}
 				existing := open(a.UUID, "127.0.0.1")
 				if existing == nil {
 					t.Fatal("original account unreachable")
 				}
 				defer existing.Close()
+				if !failure {
+					// The old listener must not grant b on a user-only poll or WS delta
+					// after a transport mismatch. Only a paired recovery permits b.
+					ctx := context.Background()
+					s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventConfigPending})
+					users := []model.UserSpec{a, b}
+					users[0].DeviceLimit = 4
+					committed := false
+					s.applyPullResult(ctx, pullResult{users: users, userHash: computeUserHash(users),
+						configMutSeq: s.configMutSeq, commitUsers: func() { committed = true }})
+					s.applyUserDelta(ctx, "add", []model.UserSpec{b})
+					if conn := open(b.UUID, "127.0.0.1"); conn != nil {
+						conn.Close()
+						t.Fatal("old listener granted a pending account")
+					}
+					if limit, ok := s.userPolicy.DeviceLimit(a.ID, a.UUID); !ok || limit != 1 || committed {
+						t.Fatal("old listener relaxed the quota or confirmed a partial list")
+					}
+					s.applyPullResult(ctx, pullResult{configConfirmed: true, users: users, userHash: computeUserHash(users),
+						configMutSeq: s.configMutSeq, userMutSeq: s.userMutSeq, commitUsers: func() { committed = true }})
+					conn := open(b.UUID, "127.0.0.1")
+					if conn == nil || !committed || s.configPending {
+						t.Fatal("full recovery failed to grant b")
+					}
+					conn.Close()
+					if !s.applyUserUpdate(ctx, []model.UserSpec{a}, computeUserHash([]model.UserSpec{a})) {
+						t.Fatal("reset fixture")
+					}
+				}
 				k := &delayedUserUpdate{Kernel: s.kernel, entered: make(chan struct{}), release: make(chan struct{})}
 				s.kernel = k
 				target := []model.UserSpec{a, b}

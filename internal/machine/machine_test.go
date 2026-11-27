@@ -12,6 +12,27 @@ import (
 	"time"
 )
 
+func TestWSUnaddressedConfigResyncsWithoutRestrictingSibling(t *testing.T) {
+	o := New(&config.Config{Machine: &config.MachineConfig{MachineID: 12}})
+	for _, id := range []int{7, 8} {
+		o.mailboxes[id] = controlplane.NewNodeMailbox()
+		o.mailboxes[id].MarkReady()
+		o.kernels[id] = config.KernelConfig{Type: "xray"}
+		o.statuses[id] = controlplane.NewStatusMailbox()
+	}
+	o.onWSEvent(panel.WSEvent{Type: panel.WSEventConfigPending})
+	for _, id := range []int{7, 8} {
+		state, ok := o.statuses[id].Drain()
+		if !ok || !state.NeedsResync || o.mailboxes[id].HasPendingConfig() {
+			t.Fatal("unaddressed event must only request authoritative data")
+		}
+	}
+	o.onWSEvent(panel.WSEvent{Type: panel.WSEventConfigPending, NodeID: 7})
+	if !o.mailboxes[7].HasPendingConfig() || o.mailboxes[8].HasPendingConfig() {
+		t.Fatal("rejection was routed to the wrong child")
+	}
+}
+
 func TestWSConfigUsesResolvedNodeKernel(t *testing.T) {
 	o := New(&config.Config{Kernel: config.KernelConfig{Type: "singbox"}, Machine: &config.MachineConfig{MachineID: 1}})
 	mb := controlplane.NewNodeMailbox()

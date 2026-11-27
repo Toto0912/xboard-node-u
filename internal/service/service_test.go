@@ -500,8 +500,8 @@ func TestApplyPullResultRollbackRestoresConfigHashAndSkipsCommit(t *testing.T) {
 	if s.lastConfigHash != oldHash || s.lastConfig.ServerPort != 443 {
 		t.Fatalf("expected config and hash rollback to 443/%s, got %d/%s", oldHash, s.lastConfig.ServerPort, s.lastConfigHash)
 	}
-	if len(s.lastUsers) != 1 || s.lastUsers[0].ID != 2 || !s.usersNeedsReapply || k.IsRunning() || len(s.safeUsersForRestart()) != 0 {
-		t.Fatalf("failed combined update must retain unconfirmed ID=2 with no authorized rollback users: %#v", s.lastUsers)
+	if !s.configPending || k.IsRunning() || len(s.safeUsersForRestart()) != 0 {
+		t.Fatalf("failed combined update must wait for a fresh full snapshot: %#v", s.lastUsers)
 	}
 }
 
@@ -915,12 +915,12 @@ func TestCertFileRecoveryRetriesSameConfigWithout304(t *testing.T) {
 	mu.Lock()
 	headers := append([]string(nil), seenConfigIfNoneMatch...)
 	mu.Unlock()
-	// Call 0: Initial(""), Call 1: Poll #1("etag-c0"), Call 2: Poll #2("etag-c0"), Call 3: Poll #3("etag-c1")
+	// A rejected config forces one unconditional config and user reconciliation.
 	if len(headers) != 4 {
 		t.Fatalf("expected 4 config requests, got %v", headers)
 	}
-	if headers[1] != `"etag-c0"` || headers[2] != `"etag-c0"` || headers[3] != `"etag-c1"` {
-		t.Fatalf("unexpected If-None-Match progression: %v (wanted [\"\" \"etag-c0\" \"etag-c0\" \"etag-c1\"])", headers)
+	if headers[1] != `"etag-c0"` || headers[2] != "" || headers[3] != `"etag-c1"` {
+		t.Fatalf("unexpected If-None-Match progression: %v", headers)
 	}
 }
 
@@ -1677,7 +1677,7 @@ func TestACMEFailureRollbackAndRetryPresentsNewCertInTLSHandshake(t *testing.T) 
 	mu.Lock()
 	headers := append([]string(nil), seenInm...)
 	mu.Unlock()
-	if len(headers) != 3 || headers[1] != `"etag-A"` || headers[2] != `"etag-A"` {
+	if len(headers) != 3 || headers[1] != `"etag-A"` || headers[2] != "" {
 		t.Fatalf("expected retry NOT to commit etag-B on failure, If-None-Match headers = %v", headers)
 	}
 }
@@ -2242,8 +2242,8 @@ func TestRunningKernelConfigRollbackStillAppliesUserRevocation(t *testing.T) {
 	if cfgCommitted {
 		t.Fatal("expected failed cfg8443 NOT to commit ConfigETag")
 	}
-	if !usersCommitted {
-		t.Fatal("expected successful user revocation on restored cfg443 to commit UserETag")
+	if usersCommitted || !s.configPending {
+		t.Fatal("a restricted rollback must wait for config and users before confirming either ETag")
 	}
 	if len(startHistory) != 2 || len(startHistory[1]) != 1 || startHistory[1][0] != uB.ID {
 		t.Fatalf("expected rollback Start to launch [2] only without A, got %v", startHistory)
