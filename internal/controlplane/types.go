@@ -11,9 +11,11 @@ type EventType string
 const (
 	EventSyncConfig    EventType = "sync.config"
 	EventConfigPending EventType = "config.pending"
-	EventSyncUsers     EventType = "sync.users"
-	EventSyncUserDelta EventType = "sync.user.delta"
-	EventSyncDevices   EventType = "sync.devices"
+	// The machine coordinator is already probing the transport for this child.
+	EventKernelCheckPending EventType = "kernel.check.pending"
+	EventSyncUsers          EventType = "sync.users"
+	EventSyncUserDelta      EventType = "sync.user.delta"
+	EventSyncDevices        EventType = "sync.devices"
 )
 
 type Event struct {

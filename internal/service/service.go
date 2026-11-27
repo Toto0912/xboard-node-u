@@ -612,7 +612,9 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	if state.HasDevices {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers})
 	}
-	if state.NeedsReconcile {
+	// A pending notification or a config processed while grants are held needs a
+	// fresh config/roster pair, even when the recovered config hash is unchanged.
+	if state.NeedsReconcile || (state.HasConfig && s.configPending) {
 		s.requestWSResync(ctx, "machine_mailbox_reconcile")
 	}
 }

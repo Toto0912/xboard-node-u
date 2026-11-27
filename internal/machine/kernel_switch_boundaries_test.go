@@ -142,8 +142,17 @@ func TestKernelSwitchHintDuringBootstrapWakesOnce(t *testing.T) {
 		t.Fatal("pending hints did not wake discovery on bootstrap completion")
 	}
 	f.rediscover(f.ctx)
-	if reads.Load() != 3 || len(f.discoveryWake) != 0 {
-		t.Fatalf("expected one confirmation after bootstrap, got %d total config reads", reads.Load())
+	f.waitForConfigReads(t, &reads, 4) // bootstrap (2), transport probe, then grant reconciliation
+	if len(f.discoveryWake) != 0 {
+		t.Fatal("redundant discovery wake after bootstrap")
+	}
+}
+
+func (f *switchBoundaryNode) waitForConfigReads(t *testing.T, reads *atomic.Int32, want int32) {
+	t.Helper()
+	switchTestWait(t, "expected config reads", func() bool { return reads.Load() >= want })
+	if got := reads.Load(); got != want {
+		t.Fatalf("config reads=%d, want %d", got, want)
 	}
 }
 
@@ -221,9 +230,11 @@ func TestKernelSwitchRejectsUnconfirmedOrInvalidCandidate(t *testing.T) {
 			}
 			<-f.discoveryWake
 			f.rediscover(f.ctx)
-			if n := reads.Load(); n != 1 {
-				t.Fatalf("10 duplicate hints caused %d config reads", n)
-			}
+			want := int32(1)
+			if tc.name == "already-back-to-tcp" {
+				want++
+			} // child confirms its roster
+			f.waitForConfigReads(t, &reads, want)
 			f.requireOriginalListener(t)
 			// More hints arriving after failure, or unrelated rediscoveries in
 			// the same interval, must not repeatedly query the panel.
@@ -234,7 +245,7 @@ func TestKernelSwitchRejectsUnconfirmedOrInvalidCandidate(t *testing.T) {
 				t.Fatal("repeated hint bypassed retry interval")
 			}
 			f.rediscover(f.ctx)
-			if n := reads.Load(); n != 1 {
+			if n := reads.Load(); n != want {
 				t.Fatalf("retry interval allowed %d reads", n)
 			}
 		})

@@ -106,8 +106,11 @@ func (m *NodeMailbox) Apply(event Event) {
 	changed := false
 
 	switch event.Type {
-	case EventConfigPending:
+	case EventConfigPending, EventKernelCheckPending:
 		m.configPending = true
+		if event.Type == EventConfigPending {
+			m.needsReconcile = true
+		}
 		m.dirtyConfig = false
 		changed = true
 	case EventSyncConfig:

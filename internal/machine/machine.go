@@ -311,6 +311,9 @@ func (o *Orchestrator) checkKernelSwitch(ctx context.Context, mn panel.MachineNo
 		o.mu.Lock()
 		if h.configEpoch == epoch {
 			h.checkKernel = false
+			// No replacement will bootstrap a roster. Let the current child
+			// confirm a complete config/user pair before restoring grants.
+			h.mailbox.Apply(controlplane.Event{Type: controlplane.EventConfigPending})
 		}
 		o.mu.Unlock()
 		return
@@ -598,7 +601,7 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	}
 	if event.Type == panel.WSEventSyncConfig && event.Config != nil && kcfg.Type == "singbox" {
 		if model.ResolveKernelForTransport(event.Config.Network, kcfg.Type) != kcfg.Type {
-			mailbox.Apply(controlplane.Event{Type: controlplane.EventConfigPending})
+			mailbox.Apply(controlplane.Event{Type: controlplane.EventKernelCheckPending})
 			o.noteKernelHint(nodeID, mailbox, event.Config)
 			return
 		}

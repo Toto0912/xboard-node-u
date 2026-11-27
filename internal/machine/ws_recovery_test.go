@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,10 @@ func TestMachineWSRecoveryAttachesExistingRESTChild(t *testing.T) {
 			listener.Close()
 			var enabled, removed atomic.Bool
 			var handshakes, dials, fullPulls atomic.Int32
+			var recoverGrants atomic.Bool
+			configRequest := make(chan string, 2)
+			rosterRequest := make(chan string, 2)
+			releaseRoster := make(chan struct{})
 			connected := make(chan *websocket.Conn, 1)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -67,14 +72,28 @@ func TestMachineWSRecoveryAttachesExistingRESTChild(t *testing.T) {
 						}
 					}
 				case "/api/v2/server/config":
-					fmt.Fprintf(w, `{"protocol":"vless","listen_ip":"127.0.0.1","server_port":%d,"network":"tcp"}`, port)
+					w.Header().Set("ETag", "old-config")
+					if recoverGrants.Load() {
+						configRequest <- r.Header.Get("If-None-Match")
+					}
+					fmt.Fprintf(w, `{"protocol":"vless","listen_ip":"127.0.0.1","server_port":%d,"network":"tcp","custom_route_rules":[{"match":{"ip_cidrs":["127.0.0.1/32"]},"action":{"type":"direct"}}],"custom_outbounds":[{"protocol":"freedom","tag":"direct","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]}`, port)
 				case "/api/v2/server/user":
 					fullPulls.Add(1)
-					if removed.Load() {
+					w.Header().Set("ETag", "old-users")
+					if recoverGrants.Load() {
+						rosterRequest <- r.Header.Get("If-None-Match")
+						select {
+						case <-releaseRoster:
+						case <-r.Context().Done():
+							return
+						}
+						fmt.Fprintf(w, `{"users":[{"id":2,"uuid":%q}]}`, switchTestUUID)
+						return
+					} else if removed.Load() {
 						fmt.Fprint(w, `{"users":[]}`)
 						return
 					}
-					fmt.Fprint(w, `{"users":[{"id":1,"uuid":"11111111-1111-1111-1111-111111111111"}]}`)
+					fmt.Fprint(w, `{"users":[{"id":1,"uuid":"22222222-2222-4222-8222-222222222222"}]}`)
 				default:
 					fmt.Fprint(w, "{}")
 				}
@@ -85,7 +104,7 @@ func TestMachineWSRecoveryAttachesExistingRESTChild(t *testing.T) {
 				WS: config.WSConfig{DiscoveryInterval: 3600}}
 			o := New(cfg)
 			ctx, cancel := context.WithCancel(context.Background())
-			defer func() { cancel(); o.stopChildren() }()
+			defer func() { cancel(); o.retireWS(); o.stopChildren() }()
 			wait := func(condition func() bool) {
 				t.Helper()
 				until := time.Now().Add(5 * time.Second)
@@ -132,6 +151,38 @@ func TestMachineWSRecoveryAttachesExistingRESTChild(t *testing.T) {
 				t.Fatal(err)
 			}
 			wait(func() bool { return !open() })
+			// Only the targeted config notification can wake the child here.
+			recoverGrants.Store(true)
+			if err := conn.WriteJSON(map[string]any{"event": "sync.config", "data": map[string]any{"node_id": 7, "config": map[string]any{"protocol": []int{1, 2}}}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, req := range []chan string{configRequest, rosterRequest} {
+				select {
+				case etag := <-req:
+					if etag != "" {
+						t.Fatalf("conditional recovery request: %q", etag)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("missing immediate full REST request")
+				}
+			}
+			if open() {
+				t.Fatal("new listener started before confirming roster")
+			}
+			close(releaseRoster)
+			wait(open)
+			echo := switchTestListen(t)
+			defer echo.Close()
+			go func() {
+				c, e := echo.Accept()
+				if e == nil {
+					defer c.Close()
+					io.Copy(c, c)
+				}
+			}()
+			live := switchTestStream(t, port, "tcp", echo.Addr().String())
+			switchTestEcho(t, live, "confirmed")
+			t.Log("target=7 periodic=3600s; sync.config -> unconditional config -> blocked unconditional roster (listener stopped) -> new UUID echo confirmed")
 		})
 	}
 }
